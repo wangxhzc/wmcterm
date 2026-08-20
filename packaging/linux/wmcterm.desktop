@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=wmcterm
+GenericName=Terminal Emulator
+GenericName[zh_CN]=终端模拟器
+Comment=GPU terminal workspace for humans and AI agents
+Comment[zh_CN]=面向用户与 AI Agent 的 GPU 终端工作区
+Exec=wmcterm gui
+Icon=wmcterm
+StartupWMClass=wmcterm
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;shell;workspace;agent;
+StartupNotify=true

@@ -1,0 +1,75 @@
+[workspace]
+members = [
+    ".",
+    "crates/wmcterm-core",
+    "crates/wmcterm-terminal",
+    "crates/wmcterm-pty",
+    "crates/wmcterm-renderer",
+    "crates/wmcterm-app",
+    "crates/wmcterm-agent",
+    "crates/wmcterm-config",
+    "crates/wmcterm-codex",
+    "crates/wmcterm-claude",
+    "crates/wmcterm-ipc",
+    "crates/wmcterm-session",
+    "crates/wmcterm-surface",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+rust-version = "1.90"
+
+[workspace.dependencies]
+anyhow = "1.0"
+arboard = "3.6"
+base64 = "0.22"
+bytemuck = { version = "1", features = ["derive"] }
+directories = "6"
+flume = "0.12"
+glyphon = "0.12"
+image = { version = "0.25", default-features = false, features = ["png"] }
+libghostty-vt = { version = "0.2.1", default-features = false }
+pollster = "0.4"
+portable-pty = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sys-locale = "0.3.2"
+thiserror = "2"
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tungstenite = "0.28"
+unicode-width = "0.2"
+unicode-script = "0.5"
+uuid = { version = "1", features = ["v4", "serde"] }
+wgpu = "30"
+winit = "0.30"
+
+[package]
+name = "wmcterm"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+directories.workspace = true
+flume.workspace = true
+wmcterm-core = { path = "crates/wmcterm-core" }
+wmcterm-agent = { path = "crates/wmcterm-agent" }
+wmcterm-config = { path = "crates/wmcterm-config" }
+wmcterm-codex = { path = "crates/wmcterm-codex" }
+wmcterm-claude = { path = "crates/wmcterm-claude" }
+wmcterm-app = { path = "crates/wmcterm-app" }
+wmcterm-ipc = { path = "crates/wmcterm-ipc" }
+wmcterm-pty = { path = "crates/wmcterm-pty" }
+wmcterm-terminal = { path = "crates/wmcterm-terminal" }
+serde_json.workspace = true
+toml.workspace = true
+
+[build-dependencies]
+winresource = "0.1"

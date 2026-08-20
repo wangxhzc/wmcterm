@@ -1,0 +1,28 @@
+[package]
+name = "wmcterm-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arboard.workspace = true
+flume.workspace = true
+image.workspace = true
+serde_json.workspace = true
+sys-locale.workspace = true
+wmcterm-agent = { path = "../wmcterm-agent" }
+wmcterm-core = { path = "../wmcterm-core" }
+wmcterm-config = { path = "../wmcterm-config" }
+wmcterm-ipc = { path = "../wmcterm-ipc" }
+wmcterm-pty = { path = "../wmcterm-pty" }
+wmcterm-renderer = { path = "../wmcterm-renderer" }
+wmcterm-session = { path = "../wmcterm-session" }
+wmcterm-surface = { path = "../wmcterm-surface" }
+wmcterm-terminal = { path = "../wmcterm-terminal" }
+tracing.workspace = true
+toml.workspace = true
+unicode-width.workspace = true
+uuid.workspace = true
+winit.workspace = true

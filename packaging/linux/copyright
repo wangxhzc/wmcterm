@@ -1,0 +1,9 @@
+Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
+Upstream-Name: wmcterm
+Source: https://example.invalid/wmcterm
+
+Files: *
+Copyright: 2026 wmcterm contributors
+License: MIT or Apache-2.0
+ This package is distributed under the terms of either the MIT license or
+ the Apache License, Version 2.0, at the user's option.

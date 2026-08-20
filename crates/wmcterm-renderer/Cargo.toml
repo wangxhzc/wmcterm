@@ -1,0 +1,17 @@
+[package]
+name = "wmcterm-renderer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+bytemuck.workspace = true
+glyphon.workspace = true
+pollster.workspace = true
+sys-locale.workspace = true
+wmcterm-terminal = { path = "../wmcterm-terminal" }
+unicode-script.workspace = true
+wgpu.workspace = true
+winit.workspace = true

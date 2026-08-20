@@ -1,0 +1,24 @@
+# Rust build outputs and release packages
+/target/
+
+# Vendored reference project used for design comparison only
+/example-cmux/
+
+# Machine-generated local Agent integration targets
+/.agents/skills/wmcterm/
+/.codex/hooks.json
+/.codex/skills/wmcterm/
+/.claude/skills/wmcterm/
+
+# Editor and operating-system files
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Local diagnostics
+*.log
+core
+core.*

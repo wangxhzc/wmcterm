@@ -1,0 +1,12716 @@
+mod i18n;
+mod text_edit;
+mod ui;
+
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::env;
+use std::process::Command as ProcessCommand;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, SyncSender};
+use std::sync::{Arc, Mutex};
+use std::thread;
+
+use anyhow::{Context, Result};
+use i18n::Language;
+use serde_json::{Value, json};
+use text_edit::{TextEditor, TextViewport};
+use winit::application::ApplicationHandler;
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
+#[cfg(target_os = "linux")]
+use winit::platform::startup_notify::{
+    EventLoopExtStartupNotify, WindowAttributesExtStartupNotify, reset_activation_token_env,
+};
+use winit::window::{CursorIcon, Icon, ResizeDirection, WindowId};
+use wmcterm_agent::{
+    AgentEvent, AgentKind, AgentProcessIdentity, ClaudeHookEvent, ClaudeHookKind,
+    reduce as reduce_agent, validate_agent_process_identity,
+};
+use wmcterm_config::{
+    BellNotificationMode, Config, ConfigReloader, ResolvedKeybindings, Shortcut, ThemeColor,
+    ThemeConfig,
+};
+use wmcterm_core::{
+    Action, ActionRegistry, AgentActionRequest, AgentKindId, AgentLaunchInfo, AgentLifecycleEvent,
+    AgentLifecyclePhase, AgentRequestKind, AgentSession, AgentSessionEvent, AgentSessionEventKind,
+    AgentTelemetry, AppCommand, AppState, AttentionState, Notification, Pane, PaneCommand, PaneId,
+    PaneNode, SplitAxis, SurfaceId, SurfaceKind, TerminalId, WorkspaceCommand, WorkspaceId,
+};
+use wmcterm_ipc::{
+    AgentInteractionRequest, AgentRequestKind as IpcAgentRequestKind, AgentResolution,
+    CompleteOutcome, PendingAgentRequests, Request, Response, UnixServer, default_socket_path,
+};
+use wmcterm_pty::CommandSpec;
+use wmcterm_renderer::{GpuRenderer, RectBlock, TextBlock, TextSpan, default_window_attributes};
+use wmcterm_session::{
+    AgentResumeInfo, SESSION_VERSION, Session, TerminalResume, WindowState, load as load_session,
+    save as save_session, state_path,
+};
+use wmcterm_surface::{
+    LogFilter, LogLevel, LogSurface, MarkdownBlock, MarkdownDocument, MarkdownSurface,
+    SurfaceBackend,
+};
+use wmcterm_terminal::{
+    CellSnapshot, InputKey, KeyInput, KeyModifiers, MouseActionInput, MouseButtonInput, MouseInput,
+    Rgb, ScreenSnapshot, SearchResult, SelectionPoint, SessionCommand, SessionEvent,
+    TerminalSession, TerminalSize, TerminalTheme,
+};
+
+const TERMINAL_TERM: &str = "xterm-256color";
+const TERMINAL_COLORTERM: &str = "truecolor";
+const TERMINAL_PROGRAM: &str = "wmcterm";
+
+fn terminal_context_ids(
+    state: &AppState,
+    terminal: TerminalId,
+) -> Option<(WorkspaceId, PaneId, SurfaceId)> {
+    let surface = state
+        .surfaces
+        .values()
+        .find(|surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal))?
+        .id;
+    let pane = state
+        .panes
+        .values()
+        .find(|pane| pane.surfaces.contains(&surface))?
+        .id;
+    let workspace = state
+        .workspaces
+        .iter()
+        .find(|workspace| workspace.root.contains(pane))?
+        .id;
+    Some((workspace, pane, surface))
+}
+
+#[derive(Debug)]
+enum UserEvent {
+    TerminalWake,
+    Rpc(Request, SyncSender<Response>),
+    WorkspaceMetadata(Vec<WorkspaceMetadata>),
+}
+
+#[derive(Debug)]
+struct WorkspaceMetadata {
+    id: wmcterm_core::WorkspaceId,
+    git_branch: Option<String>,
+    listening_ports: Vec<u16>,
+}
+
+#[derive(Debug, Clone)]
+struct ClaudeSubagentStatus {
+    surface: SurfaceId,
+    session_id: String,
+}
+
+#[derive(Debug)]
+struct TaggedEvent {
+    terminal: TerminalId,
+    event: SessionEvent,
+}
+
+struct TerminalRuntime {
+    session: TerminalSession,
+    snapshot: ScreenSnapshot,
+    size: TerminalSize,
+    lifecycle_id: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TerminalCreateOptions {
+    command: Option<String>,
+    cwd: Option<std::path::PathBuf>,
+    environment: Vec<(String, String)>,
+    title: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SplitPlacement {
+    axis: SplitAxis,
+    new_first: bool,
+}
+
+#[derive(Clone, Copy)]
+struct Rect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+
+#[derive(Clone)]
+struct SplitDrag {
+    path: Vec<bool>,
+    axis: SplitAxis,
+    container: Rect,
+    center: f32,
+}
+
+#[derive(Clone, Copy)]
+struct ScrollbarDrag {
+    pane: PaneId,
+    terminal: TerminalId,
+    grab_y: f32,
+    last_offset: usize,
+}
+
+#[derive(Clone, Copy)]
+struct MouseSelection {
+    pane: PaneId,
+    terminal: TerminalId,
+    /// Full-screen coordinates, including scrollback, rather than viewport rows.
+    start: (usize, usize),
+    end: (usize, usize),
+}
+
+#[derive(Clone, Copy)]
+struct TerminalClick {
+    at: std::time::Instant,
+    pane: PaneId,
+    terminal: TerminalId,
+    cell: (usize, usize),
+}
+
+#[derive(Clone, Copy)]
+enum PromptKind {
+    RenameWorkspace,
+    DescribeWorkspace,
+    ChangeWorkspaceDirectory,
+    FindDirectory,
+    FilterLogs,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextEditShortcut {
+    SelectAll,
+    Copy,
+    Cut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TextEditTarget {
+    WorkspaceSearch,
+    Prompt,
+    Palette,
+    Search,
+}
+
+struct TextPrompt {
+    kind: PromptKind,
+    editor: TextEditor,
+    error: Option<String>,
+}
+
+#[derive(Clone)]
+enum CloseTarget {
+    Surfaces(Vec<SurfaceId>),
+    Workspace(uuid::Uuid),
+    Application,
+}
+
+struct CloseConfirmation {
+    target: CloseTarget,
+    title: String,
+    message: String,
+}
+
+#[derive(Clone, Copy)]
+struct TabContextMenu {
+    pane: PaneId,
+    surface: SurfaceId,
+    anchor: (f32, f32),
+}
+
+#[derive(Clone, Copy)]
+struct WorkspaceContextMenu {
+    workspace: uuid::Uuid,
+    anchor: (f32, f32),
+}
+
+#[derive(Clone, Copy)]
+struct TerminalContextMenu {
+    pane: PaneId,
+    terminal: TerminalId,
+    anchor: (f32, f32),
+}
+
+#[derive(Clone, Copy)]
+struct NotificationContextMenu {
+    notification: uuid::Uuid,
+    anchor: (f32, f32),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NavigationHover {
+    Workspace(usize),
+    NewWorkspace,
+    Tab(PaneId, usize),
+    TabClose(PaneId, usize),
+    TabNew(PaneId),
+    Notification(usize),
+    NotificationClose(usize),
+    NotificationMarkAllRead,
+    AgentApproval(usize, usize),
+    ContextAction(usize),
+    TitlebarButton(usize),
+    EmptyPaneNew(PaneId),
+    EmptyWorkspaceNew,
+}
+
+#[derive(Clone, Copy)]
+enum TitlebarAction {
+    ToggleSidebar,
+    ToggleNotifications,
+    Minimize,
+    ToggleMaximize,
+    Close,
+}
+
+struct TitlebarButton {
+    action: TitlebarAction,
+    label: String,
+    bounds: ui::Bounds,
+    active: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NotificationDestination {
+    workspace_index: usize,
+    pane: Option<(PaneId, usize)>,
+    surface: SurfaceId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotificationOverlayPress {
+    Inactive,
+    Inside,
+    DismissAndPropagate,
+}
+
+#[derive(Clone, Copy)]
+enum TabContextAction {
+    Close,
+    CloseOthers,
+    NewSurface,
+}
+
+#[derive(Clone, Copy)]
+enum WorkspaceContextAction {
+    NewSurface,
+    Rename,
+    Describe,
+    ChangeDirectory,
+    TogglePin,
+    Close,
+}
+
+#[derive(Clone, Copy)]
+enum TerminalContextAction {
+    Copy,
+    Paste,
+    CopyAll,
+    ClearScrollback,
+}
+
+#[derive(Clone, Copy)]
+enum NotificationContextAction {
+    Open,
+    ToggleRead,
+    Clear,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentApprovalAction {
+    Deny,
+    AllowOnce,
+    AlwaysAllow,
+    AllTools,
+}
+
+const TAB_CONTEXT_ACTIONS: [TabContextAction; 3] = [
+    TabContextAction::Close,
+    TabContextAction::CloseOthers,
+    TabContextAction::NewSurface,
+];
+const TAB_CONTEXT_WIDTH: f32 = 240.0;
+const WORKSPACE_CONTEXT_WIDTH: f32 = 250.0;
+const TERMINAL_CONTEXT_WIDTH: f32 = 220.0;
+const TERMINAL_CONTEXT_ACTIONS: [TerminalContextAction; 4] = [
+    TerminalContextAction::Copy,
+    TerminalContextAction::Paste,
+    TerminalContextAction::CopyAll,
+    TerminalContextAction::ClearScrollback,
+];
+const NOTIFICATION_CONTEXT_ACTIONS: [NotificationContextAction; 3] = [
+    NotificationContextAction::Open,
+    NotificationContextAction::ToggleRead,
+    NotificationContextAction::Clear,
+];
+const NOTIFICATION_CONTEXT_WIDTH: f32 = 210.0;
+
+const WORKSPACE_CONTEXT_ACTIONS: [WorkspaceContextAction; 6] = [
+    WorkspaceContextAction::NewSurface,
+    WorkspaceContextAction::Rename,
+    WorkspaceContextAction::Describe,
+    WorkspaceContextAction::ChangeDirectory,
+    WorkspaceContextAction::TogglePin,
+    WorkspaceContextAction::Close,
+];
+
+#[derive(Debug, Clone)]
+enum TerminalNotice {
+    Exited(String),
+    Error(String),
+    SpawnFailed(String),
+}
+
+pub fn run() -> Result<()> {
+    let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
+    let config = wmcterm_config::load_or_default().context("loading wmcterm configuration")?;
+    let restored = state_path()
+        .filter(|path| path.exists())
+        .and_then(|path| load_session(&path).ok());
+    let restored_commands = restored
+        .as_ref()
+        .map(|session| {
+            session
+                .terminals
+                .iter()
+                .filter_map(|terminal| {
+                    terminal
+                        .command
+                        .clone()
+                        .or_else(|| {
+                            terminal
+                                .agent
+                                .as_ref()
+                                .map(wmcterm_session::AgentResumeInfo::command)
+                        })
+                        .map(|command| (terminal.terminal_id, command))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let restored_history = restored
+        .as_ref()
+        .map(|session| {
+            session
+                .terminals
+                .iter()
+                .filter_map(|terminal| {
+                    terminal
+                        .scrollback
+                        .clone()
+                        .map(|history| (terminal.terminal_id, history))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let restored_window = restored.as_ref().and_then(|session| session.window);
+    let restored_agent_sessions = restored
+        .as_ref()
+        .map(|session| {
+            session
+                .agent_sessions
+                .iter()
+                .cloned()
+                .map(|session| (session.surface_id, session))
+                .collect()
+        })
+        .unwrap_or_default();
+    let restored_state = restored.map(|session| session.app);
+    let mut app = WmctermApplication::new(
+        event_loop.create_proxy(),
+        config,
+        restored_state,
+        restored_commands,
+        restored_history,
+        restored_window,
+        restored_agent_sessions,
+    )?;
+    event_loop.run_app(&mut app)?;
+    if let Some(path) = state_path() {
+        let terminals = app
+            .terminals
+            .iter()
+            .map(|(terminal_id, runtime)| TerminalResume {
+                terminal_id: *terminal_id,
+                cwd: app
+                    .cwd_for_terminal(*terminal_id)
+                    .unwrap_or_else(|| env::current_dir().unwrap_or_default()),
+                command: app.commands.get(terminal_id).cloned(),
+                agent: resume_info(&app.state, *terminal_id),
+                scrollback: runtime.session.export_history(),
+            })
+            .collect();
+        save_session(
+            &path,
+            &Session {
+                version: SESSION_VERSION,
+                app: app.state.clone(),
+                terminals,
+                agent_sessions: app.agent_sessions.into_values().collect(),
+                window: Some(WindowState {
+                    width: app.window_size.width.max(600),
+                    height: app.window_size.height.max(360),
+                }),
+            },
+        )
+        .context("saving wmcterm session")?;
+    }
+    Ok(())
+}
+
+struct WmctermApplication {
+    renderer: Option<GpuRenderer>,
+    state: AppState,
+    terminals: HashMap<TerminalId, TerminalRuntime>,
+    pending: Arc<Mutex<VecDeque<TaggedEvent>>>,
+    wake_pending: Arc<AtomicBool>,
+    proxy: EventLoopProxy<UserEvent>,
+    modifiers: ModifiersState,
+    palette_visible: bool,
+    palette_index: usize,
+    palette_scroll: usize,
+    palette_query: TextEditor,
+    notifications_visible: bool,
+    notification_scroll: usize,
+    notification_selection: usize,
+    agent_request_scroll: usize,
+    agent_request_selection: usize,
+    agent_request_action: usize,
+    agent_request_detail: Option<(String, usize)>,
+    sidebar_visible: bool,
+    sidebar_scroll: usize,
+    workspace_search: TextEditor,
+    workspace_search_focused: bool,
+    window_size: PhysicalSize<u32>,
+    _ipc: Option<UnixServer>,
+    config: Config,
+    cursor_position: (f32, f32),
+    commands: HashMap<TerminalId, String>,
+    clipboard: Option<arboard::Clipboard>,
+    quit_requested: bool,
+    selection: Option<MouseSelection>,
+    last_terminal_click: Option<TerminalClick>,
+    selection_last_redraw: Option<std::time::Instant>,
+    selection_autoscroll_last: Option<std::time::Instant>,
+    split_drag: Option<SplitDrag>,
+    sidebar_drag: bool,
+    scrollbar_drag: Option<ScrollbarDrag>,
+    mouse_pressed: bool,
+    text_edit_drag: Option<TextEditTarget>,
+    terminal_mouse_capture: Option<(PaneId, TerminalId)>,
+    search_visible: bool,
+    search_editor: TextEditor,
+    search_result: Option<SearchResult>,
+    terminal_font_size: f32,
+    prompt: Option<TextPrompt>,
+    close_confirmation: Option<CloseConfirmation>,
+    tab_context_menu: Option<TabContextMenu>,
+    workspace_context_menu: Option<WorkspaceContextMenu>,
+    terminal_context_menu: Option<TerminalContextMenu>,
+    notification_context_menu: Option<NotificationContextMenu>,
+    restored_history: HashMap<TerminalId, String>,
+    keybindings: ResolvedKeybindings,
+    surface_backends: HashMap<SurfaceId, Box<dyn SurfaceBackend>>,
+    config_reloader: Option<ConfigReloader>,
+    last_metadata_refresh: std::time::Instant,
+    language: Language,
+    palette_hover: Option<usize>,
+    navigation_hover: Option<NavigationHover>,
+    notification_hover_started: Option<(usize, std::time::Instant)>,
+    notification_marquee_line: usize,
+    last_titlebar_click: Option<(std::time::Instant, (f32, f32))>,
+    document_scroll: HashMap<SurfaceId, usize>,
+    metadata_refresh_in_flight: bool,
+    terminal_notices: HashMap<TerminalId, TerminalNotice>,
+    terminal_processes: HashMap<TerminalId, Vec<String>>,
+    foreground_agents: HashMap<TerminalId, AgentKind>,
+    automatic_agent_status: HashSet<TerminalId>,
+    window_focused: bool,
+    last_bell_notifications: HashMap<TerminalId, std::time::Instant>,
+    agent_sessions: HashMap<SurfaceId, AgentSession>,
+    pending_agent_requests: PendingAgentRequests,
+    agent_approval_results: HashMap<String, AgentApprovalAction>,
+    agent_approval_result_order: VecDeque<String>,
+    claude_subagents: HashMap<String, ClaudeSubagentStatus>,
+}
+
+impl WmctermApplication {
+    fn new(
+        proxy: EventLoopProxy<UserEvent>,
+        config: Config,
+        restored: Option<AppState>,
+        mut commands: HashMap<TerminalId, String>,
+        restored_history: HashMap<TerminalId, String>,
+        restored_window: Option<WindowState>,
+        restored_agent_sessions: HashMap<SurfaceId, AgentSession>,
+    ) -> Result<Self> {
+        let process_cwd = env::current_dir()?;
+        let cwd = config.workspace.default_cwd.clone().unwrap_or(process_cwd);
+        let name = cwd
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("wmcterm")
+            .to_owned();
+        let mut state = restored.unwrap_or_else(|| AppState::new(name, cwd.clone()));
+        if commands.is_empty()
+            && let Some(project) = wmcterm_config::load_project(&cwd)?
+            && let Some(workspace) = state.workspaces.first_mut()
+        {
+            if let Some(name) = project.workspace.name {
+                workspace.name = name;
+            }
+            let pane_id = workspace.active_pane;
+            for item in project.commands {
+                let surface = wmcterm_core::Surface::terminal(item.name);
+                let terminal = match surface.kind {
+                    SurfaceKind::Terminal(id) => id,
+                    _ => continue,
+                };
+                commands.insert(terminal, item.command);
+                let surface_id = surface.id;
+                state.surfaces.insert(surface_id, surface);
+                if let Some(pane) = state.panes.get_mut(&pane_id) {
+                    pane.surfaces.push(surface_id);
+                }
+            }
+        }
+        let pending = Arc::new(Mutex::new(VecDeque::new()));
+        let wake_pending = Arc::new(AtomicBool::new(false));
+        let ipc = default_socket_path()
+            .map(|path| {
+                let rpc_proxy = proxy.clone();
+                UnixServer::spawn(&path, move |request| {
+                    let id = request.id.clone();
+                    let (tx, rx) = mpsc::sync_channel(1);
+                    if rpc_proxy.send_event(UserEvent::Rpc(request, tx)).is_err() {
+                        return Response::error(id, -32000, "wmcterm event loop is closed");
+                    }
+                    rx.recv_timeout(std::time::Duration::from_secs(3))
+                        .unwrap_or_else(|_| Response::error(id, -32001, "wmcterm RPC timed out"))
+                })
+            })
+            .transpose()?;
+        let terminal_font_size = config.terminal.font_size.clamp(8.0, 40.0);
+        let keybindings = config
+            .resolved_keybindings()
+            .map_err(|error| anyhow::anyhow!("invalid keybindings: {error}"))?;
+        let config_reloader =
+            wmcterm_config::config_path().map(|path| ConfigReloader::new(vec![path]));
+        let language = Language::resolve(config.ui.language);
+        let mut app = Self {
+            renderer: None,
+            state,
+            terminals: HashMap::new(),
+            pending,
+            wake_pending,
+            proxy,
+            modifiers: ModifiersState::empty(),
+            palette_visible: false,
+            palette_index: 0,
+            palette_scroll: 0,
+            palette_query: TextEditor::default(),
+            notifications_visible: false,
+            notification_scroll: 0,
+            notification_selection: 0,
+            agent_request_scroll: 0,
+            agent_request_selection: 0,
+            agent_request_action: 0,
+            agent_request_detail: None,
+            sidebar_visible: true,
+            sidebar_scroll: 0,
+            workspace_search: TextEditor::default(),
+            workspace_search_focused: false,
+            window_size: restored_window
+                .map(|window| PhysicalSize::new(window.width.max(600), window.height.max(360)))
+                .unwrap_or_else(|| PhysicalSize::new(1000, 650)),
+            _ipc: ipc,
+            config,
+            cursor_position: (0.0, 0.0),
+            commands,
+            clipboard: arboard::Clipboard::new().ok(),
+            quit_requested: false,
+            selection: None,
+            last_terminal_click: None,
+            selection_last_redraw: None,
+            selection_autoscroll_last: None,
+            split_drag: None,
+            sidebar_drag: false,
+            scrollbar_drag: None,
+            mouse_pressed: false,
+            text_edit_drag: None,
+            terminal_mouse_capture: None,
+            search_visible: false,
+            search_editor: TextEditor::default(),
+            search_result: None,
+            terminal_font_size,
+            prompt: None,
+            close_confirmation: None,
+            tab_context_menu: None,
+            workspace_context_menu: None,
+            terminal_context_menu: None,
+            notification_context_menu: None,
+            restored_history,
+            keybindings,
+            surface_backends: HashMap::new(),
+            config_reloader,
+            last_metadata_refresh: std::time::Instant::now(),
+            language,
+            palette_hover: None,
+            navigation_hover: None,
+            notification_hover_started: None,
+            notification_marquee_line: 0,
+            last_titlebar_click: None,
+            document_scroll: HashMap::new(),
+            metadata_refresh_in_flight: false,
+            terminal_notices: HashMap::new(),
+            terminal_processes: HashMap::new(),
+            foreground_agents: HashMap::new(),
+            automatic_agent_status: HashSet::new(),
+            window_focused: true,
+            last_bell_notifications: HashMap::new(),
+            agent_sessions: restored_agent_sessions,
+            pending_agent_requests: PendingAgentRequests::new(256)
+                .expect("pending Agent request capacity is non-zero"),
+            agent_approval_results: HashMap::new(),
+            agent_approval_result_order: VecDeque::new(),
+            claude_subagents: HashMap::new(),
+        };
+        for surface in app.state.surfaces.values() {
+            let Some(path) = surface.resource.as_deref().map(std::path::Path::new) else {
+                continue;
+            };
+            let backend: Option<Box<dyn SurfaceBackend>> = match surface.kind {
+                SurfaceKind::Markdown(_) => MarkdownSurface::open(path)
+                    .ok()
+                    .map(|surface| Box::new(surface) as Box<dyn SurfaceBackend>),
+                SurfaceKind::Logs(_) => LogSurface::open(path, 10_000)
+                    .ok()
+                    .map(|surface| Box::new(surface) as Box<dyn SurfaceBackend>),
+                _ => None,
+            };
+            if let Some(backend) = backend {
+                app.surface_backends.insert(surface.id, backend);
+            }
+        }
+        app.refresh_workspace_metadata();
+        let terminal_ids: Vec<_> = app
+            .state
+            .surfaces
+            .values()
+            .filter_map(|surface| {
+                if let SurfaceKind::Terminal(id) = surface.kind {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        for id in terminal_ids {
+            if let Err(error) = app.spawn_terminal(id) {
+                tracing::error!(terminal=%id, %error, "spawning restored terminal failed");
+                app.report_terminal_notice(id, TerminalNotice::SpawnFailed(error.to_string()));
+            }
+        }
+        Ok(app)
+    }
+
+    fn spawn_terminal(&mut self, id: TerminalId) -> Result<()> {
+        self.spawn_terminal_command(id, self.commands.get(&id).cloned())
+    }
+
+    fn spawn_terminal_command(&mut self, id: TerminalId, command: Option<String>) -> Result<()> {
+        self.spawn_terminal_with_options(
+            id,
+            TerminalCreateOptions {
+                command,
+                ..TerminalCreateOptions::default()
+            },
+        )
+    }
+
+    fn spawn_terminal_with_options(
+        &mut self,
+        id: TerminalId,
+        options: TerminalCreateOptions,
+    ) -> Result<()> {
+        if let Some(surface) = self.state.surfaces.values_mut().find(
+            |surface| matches!(surface.kind, SurfaceKind::Terminal(terminal) if terminal == id),
+        ) && matches!(surface.title.as_str(), "Shell" | "终端")
+        {
+            surface.title = self.language.shell().into();
+        }
+        if let Some(title) = &options.title
+            && let Some(surface) = self.state.surfaces.values_mut().find(
+                |surface| matches!(surface.kind, SurfaceKind::Terminal(terminal) if terminal == id),
+            )
+        {
+            surface.title.clone_from(title);
+        }
+        let size = TerminalSize::new(80, 24)?;
+        let lifecycle_id = uuid::Uuid::new_v4().to_string();
+        let shell = env::var_os("SHELL").unwrap_or_else(|| "sh".into());
+        let mut spec = match &options.command {
+            Some(command) => CommandSpec::new(shell).args(["-lc", command.as_str()]),
+            None => CommandSpec::new(shell),
+        }
+        .cwd(
+            options
+                .cwd
+                .clone()
+                .or_else(|| self.cwd_for_terminal(id))
+                .unwrap_or_else(|| env::current_dir().unwrap_or_default()),
+        )
+        .env("TERM", TERMINAL_TERM)
+        .env("COLORTERM", TERMINAL_COLORTERM)
+        .env("TERM_PROGRAM", TERMINAL_PROGRAM)
+        .env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"))
+        .env("WMCTERM", "1")
+        .env("WMCTERM_TERMINAL_LIFECYCLE_ID", &lifecycle_id)
+        .env("WMCTERM_LIFECYCLE_ID", &lifecycle_id)
+        .env(
+            "COLORFGBG",
+            if terminal_background_is_light(self.config.theme.background) {
+                "0;15"
+            } else {
+                "15;0"
+            },
+        );
+        if let Some((workspace, pane, surface)) = terminal_context_ids(&self.state, id) {
+            spec = spec
+                .env("WMCTERM_WORKSPACE_ID", workspace.to_string())
+                .env("WMCTERM_PANE_ID", pane.to_string())
+                .env("WMCTERM_SURFACE_ID", surface.to_string());
+        }
+        if let Some(path) = default_socket_path() {
+            spec = spec
+                .env("WMCTERM_CONTROL_SOCKET", path.as_os_str())
+                .env("WMCTERM_SOCKET", path.as_os_str());
+        }
+        for (key, value) in &options.environment {
+            spec = spec.env(key, value);
+        }
+        let history = self.restored_history.remove(&id);
+        let session = TerminalSession::spawn_with_scrollback_limits_history_and_theme(
+            spec,
+            size,
+            self.config.terminal.scrollback,
+            self.config.terminal.scrollback_lines,
+            history,
+            Some(terminal_theme(&self.config.theme)),
+        )?;
+        self.terminal_notices.remove(&id);
+        self.terminal_processes.remove(&id);
+        self.last_bell_notifications.remove(&id);
+        self.foreground_agents.remove(&id);
+        self.automatic_agent_status.remove(&id);
+        spawn_event_bridge(
+            id,
+            session.events().clone(),
+            Arc::clone(&self.pending),
+            Arc::clone(&self.wake_pending),
+            self.proxy.clone(),
+        );
+        self.terminals.insert(
+            id,
+            TerminalRuntime {
+                session,
+                snapshot: ScreenSnapshot {
+                    cols: 80,
+                    rows: 24,
+                    lines: vec![],
+                    cells: vec![],
+                    cursor: None,
+                    mouse_tracking: false,
+                    scrollback_rows: 0,
+                    viewport_offset: 0,
+                    screen_row_origin: 0,
+                },
+                size,
+                lifecycle_id,
+            },
+        );
+        if let Some(command) = options.command {
+            self.commands.insert(id, command);
+        }
+        Ok(())
+    }
+
+    fn active_terminal_id(&self) -> Option<TerminalId> {
+        let workspace = self.state.active_workspace()?;
+        let pane = self.state.panes.get(&workspace.active_pane)?;
+        let surface = self.state.surfaces.get(&pane.active_surface()?)?;
+        match surface.kind {
+            SurfaceKind::Terminal(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    fn active_surface_id(&self) -> Option<SurfaceId> {
+        let workspace = self.state.active_workspace()?;
+        self.state
+            .panes
+            .get(&workspace.active_pane)?
+            .active_surface()
+    }
+
+    fn cwd_for_terminal(&self, terminal: TerminalId) -> Option<std::path::PathBuf> {
+        let surface = self.surface_for_terminal(terminal)?;
+        let pane = self
+            .state
+            .panes
+            .values()
+            .find(|pane| pane.surfaces.contains(&surface))?
+            .id;
+        self.state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.root.contains(pane))
+            .map(|workspace| workspace.cwd.clone())
+    }
+
+    fn surface_for_terminal(&self, terminal: TerminalId) -> Option<SurfaceId> {
+        self.state
+            .surfaces
+            .values()
+            .find(|surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal))?
+            .id
+            .into()
+    }
+
+    fn workspace_for_terminal(&self, terminal: TerminalId) -> Option<usize> {
+        let surface = self.surface_for_terminal(terminal)?;
+        let pane = self
+            .state
+            .panes
+            .values()
+            .find(|pane| pane.surfaces.contains(&surface))?
+            .id;
+        self.state
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.root.contains(pane))
+    }
+
+    fn terminal_for_params(&self, params: &Value) -> Result<TerminalId, String> {
+        let (requested_terminal, requested_surface) = explicit_terminal_target(params)?;
+        let surface_terminal = requested_surface
+            .map(|id| {
+                let surface = self
+                    .state
+                    .surfaces
+                    .get(&id)
+                    .ok_or_else(|| "target surface not found".to_owned())?;
+                match surface.kind {
+                    SurfaceKind::Terminal(terminal) => Ok(terminal),
+                    _ => Err("target surface is not a terminal".to_owned()),
+                }
+            })
+            .transpose()?;
+        if let (Some(terminal), Some(surface_terminal)) = (requested_terminal, surface_terminal)
+            && terminal != surface_terminal
+        {
+            return Err("target terminal does not match target surface".into());
+        }
+        let terminal = requested_terminal
+            .or(surface_terminal)
+            .ok_or_else(|| "no terminal target".to_owned())?;
+        if !self.terminals.contains_key(&terminal) {
+            return Err("target terminal is not running".into());
+        }
+        Ok(terminal)
+    }
+
+    fn reload_config_if_changed(&mut self) {
+        let Some(reloader) = &mut self.config_reloader else {
+            return;
+        };
+        match reloader.reload_if_changed() {
+            Ok(Some(config)) => match config.resolved_keybindings() {
+                Ok(keybindings) => {
+                    self.terminal_font_size = config.terminal.font_size.clamp(8.0, 40.0);
+                    self.language = Language::resolve(config.ui.language);
+                    self.config = config;
+                    self.keybindings = keybindings;
+                    let theme = terminal_theme(&self.config.theme);
+                    for runtime in self.terminals.values() {
+                        let _ = runtime
+                            .session
+                            .send(SessionCommand::SetTheme(theme.clone()));
+                    }
+                    self.resize_terminals();
+                    self.rebuild_scene();
+                }
+                Err(error) => tracing::warn!(%error, "ignoring invalid reloaded keybindings"),
+            },
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "reloading configuration failed"),
+        }
+    }
+
+    fn drain_terminal_events(&mut self, _event_loop: &ActiveEventLoop) {
+        self.wake_pending.store(false, Ordering::Release);
+        let events: Vec<_> = self
+            .pending
+            .lock()
+            .expect("PTY event queue poisoned")
+            .drain(..)
+            .collect();
+        let mut changed = false;
+        for tagged in events {
+            let terminal_id = tagged.terminal;
+            match tagged.event {
+                SessionEvent::Snapshot(snapshot) => { if let Some(runtime) = self.terminals.get_mut(&terminal_id) { runtime.snapshot = snapshot; changed = true; } }
+                SessionEvent::Exited(status) => {
+                    tracing::info!(terminal=%tagged.terminal, %status, "terminal exited");
+                    self.close_agent_session_for_terminal(terminal_id, status.clone());
+                    self.report_terminal_notice(terminal_id, TerminalNotice::Exited(status));
+                    changed = true;
+                }
+                SessionEvent::Error(error) => {
+                    tracing::error!(terminal=%tagged.terminal, %error, "PTY error");
+                    self.report_terminal_notice(terminal_id, TerminalNotice::Error(error));
+                    changed = true;
+                }
+                SessionEvent::TitleChanged(title) => { if let Some(surface) = self.state.surfaces.values_mut().find(|surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal_id)) { surface.title = title; changed = true; } }
+                SessionEvent::Bell => {
+                    changed |= self.handle_terminal_bell(terminal_id);
+                }
+                SessionEvent::CwdChanged(cwd) => {
+                    if let Some(index) = self.workspace_for_terminal(terminal_id)
+                        && let Some(workspace) = self.state.workspaces.get_mut(index)
+                    {
+                        workspace.cwd = cwd.into();
+                    }
+                    self.refresh_workspace_metadata();
+                    changed = true;
+                }
+                SessionEvent::ForegroundProcess(commands) => {
+                    changed |= self.update_foreground_agent(terminal_id, &commands);
+                }
+                SessionEvent::ChildProcesses(commands) => {
+                    if commands.is_empty() {
+                        changed |= self.terminal_processes.remove(&terminal_id).is_some();
+                    } else if self.terminal_processes.get(&terminal_id) != Some(&commands) {
+                        self.terminal_processes.insert(terminal_id, commands);
+                        changed = true;
+                    }
+                }
+                SessionEvent::Agent(event) => {
+                    let lifecycle = self
+                        .terminals
+                        .get(&terminal_id)
+                        .map(|runtime| runtime.lifecycle_id.clone());
+                    let surface = self.surface_for_terminal(terminal_id);
+                    let params = json!({
+                        "surface": surface,
+                        "lifecycle_id": lifecycle,
+                    });
+                    if self
+                        .record_agent_event(terminal_id, &params, &event)
+                        .unwrap_or(false)
+                    {
+                        self.apply_agent_event(terminal_id, event);
+                    }
+                    changed = true;
+                }
+                SessionEvent::Notification(message) => { self.notify_terminal(terminal_id, &message); changed = true; }
+                SessionEvent::ClipboardText(text) => { if let Some(clipboard) = &mut self.clipboard { let _ = clipboard.set_text(text); } }
+                SessionEvent::SearchResult(result) => { self.search_result = Some(result); changed = true; }
+            }
+        }
+        if changed {
+            self.rebuild_scene();
+        }
+    }
+
+    fn split_active(&mut self, axis: SplitAxis) {
+        self.split_active_command(axis, None);
+    }
+
+    fn split_active_command(&mut self, axis: SplitAxis, command: Option<String>) {
+        match self.state.split_active(axis, 0.5) {
+            Ok(pane) => {
+                let terminal = self
+                    .state
+                    .panes
+                    .get(&pane)
+                    .and_then(|p| p.active_surface())
+                    .and_then(|id| self.state.surfaces.get(&id))
+                    .and_then(|s| match s.kind {
+                        SurfaceKind::Terminal(id) => Some(id),
+                        _ => None,
+                    });
+                if let Some(id) = terminal {
+                    if let Some(command) = command {
+                        self.commands.insert(id, command);
+                    }
+                    if let Err(error) = self.spawn_terminal(id) {
+                        tracing::error!(%error, "spawning split terminal failed");
+                        self.report_terminal_notice(
+                            id,
+                            TerminalNotice::SpawnFailed(error.to_string()),
+                        );
+                    }
+                }
+                self.resize_terminals();
+                self.rebuild_scene();
+            }
+            Err(error) => tracing::error!(%error, "splitting pane failed"),
+        }
+    }
+
+    fn notify_terminal(&mut self, terminal: TerminalId, body: &str) {
+        let Some(surface) = self
+            .state
+            .surfaces
+            .values()
+            .find(|surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal))
+            .map(|surface| surface.id)
+        else {
+            return;
+        };
+        let Some(workspace) = self
+            .workspace_for_terminal(terminal)
+            .and_then(|index| self.state.workspaces.get(index))
+            .map(|workspace| workspace.id)
+        else {
+            return;
+        };
+        let created_at_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_millis() as u64)
+            .unwrap_or_default();
+        let read =
+            notification_arrives_read(self.window_focused, self.active_terminal_id(), terminal);
+        self.state.push_notification(Notification {
+            id: uuid::Uuid::new_v4(),
+            workspace,
+            surface,
+            title: "wmcterm".into(),
+            body: body.into(),
+            attention: AttentionState::NeedsInput,
+            created_at_unix_ms,
+            read,
+        });
+        if read {
+            self.sync_notification_attention(surface);
+        }
+        self.notification_scroll = 0;
+        self.notification_selection = 0;
+        if self.config.agent.notifications && !read {
+            show_native_notification("wmcterm", body);
+        }
+    }
+
+    fn handle_terminal_bell(&mut self, terminal: TerminalId) -> bool {
+        let now = std::time::Instant::now();
+        let since_last = self
+            .last_bell_notifications
+            .get(&terminal)
+            .map(|last| now.saturating_duration_since(*last));
+        if !should_notify_terminal_bell(
+            self.config.terminal.bell_notifications,
+            self.window_focused,
+            self.active_terminal_id() == Some(terminal),
+            since_last,
+            std::time::Duration::from_millis(self.config.terminal.bell_debounce_ms),
+        ) {
+            return false;
+        }
+        self.last_bell_notifications.insert(terminal, now);
+        self.notify_terminal(terminal, self.language.terminal_bell());
+        true
+    }
+
+    fn report_terminal_notice(&mut self, terminal: TerminalId, notice: TerminalNotice) {
+        let attention = match &notice {
+            TerminalNotice::Exited(_) => AttentionState::Activity,
+            TerminalNotice::Error(_) | TerminalNotice::SpawnFailed(_) => AttentionState::Error,
+        };
+        if let Some(surface) = self
+            .state
+            .surfaces
+            .values_mut()
+            .find(|surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal))
+        {
+            surface.attention = attention;
+        }
+        if attention == AttentionState::Error
+            && let Some(index) = self.workspace_for_terminal(terminal)
+            && let Some(workspace) = self.state.workspaces.get_mut(index)
+        {
+            workspace.status = wmcterm_core::WorkspaceStatus::Error;
+        }
+        self.terminal_notices.insert(terminal, notice);
+    }
+
+    fn apply_agent_event(
+        &mut self,
+        terminal: TerminalId,
+        event: AgentEvent,
+    ) -> wmcterm_core::AgentState {
+        self.automatic_agent_status.remove(&terminal);
+        let transition = reduce_agent(&event);
+        let suppress_notification = non_actionable_agent_exit(&event);
+        let announced = match &event {
+            AgentEvent::SessionStart { agent, session_id } => {
+                Some((agent.clone(), session_id.clone()))
+            }
+            _ => None,
+        };
+        if let Some(surface) = self
+            .state
+            .surfaces
+            .values_mut()
+            .find(|surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal))
+        {
+            let (name, session_id) = announced.unwrap_or_else(|| {
+                surface
+                    .agent
+                    .as_ref()
+                    .map(|agent| (agent.name.clone(), agent.session_id.clone()))
+                    .unwrap_or_else(|| ("agent".into(), None))
+            });
+            surface.agent = Some(wmcterm_core::AgentMetadata {
+                name,
+                state: transition.state,
+                session_id,
+            });
+            surface.attention = transition.attention;
+        }
+        if let Some(message) = transition.notification
+            && !suppress_notification
+        {
+            self.notify_terminal(terminal, &message);
+        }
+        if let Some(index) = self.workspace_for_terminal(terminal)
+            && let Some(workspace) = self.state.workspaces.get_mut(index)
+        {
+            workspace.status = match transition.state {
+                wmcterm_core::AgentState::Running => wmcterm_core::WorkspaceStatus::Running,
+                wmcterm_core::AgentState::WaitingForInput
+                | wmcterm_core::AgentState::WaitingForPermission => {
+                    wmcterm_core::WorkspaceStatus::NeedsInput
+                }
+                wmcterm_core::AgentState::Completed => wmcterm_core::WorkspaceStatus::Completed,
+                wmcterm_core::AgentState::Error => wmcterm_core::WorkspaceStatus::Error,
+                _ => wmcterm_core::WorkspaceStatus::Idle,
+            };
+        }
+        if let Some(surface) = self.surface_for_terminal(terminal) {
+            self.sync_surface_agent_request_state(surface);
+        }
+        transition.state
+    }
+
+    fn record_agent_event(
+        &mut self,
+        terminal: TerminalId,
+        params: &Value,
+        event: &AgentEvent,
+    ) -> Result<bool, String> {
+        let surface = self
+            .surface_for_terminal(terminal)
+            .ok_or_else(|| "agent target surface no longer exists".to_owned())?;
+        let runtime_lifecycle = &self
+            .terminals
+            .get(&terminal)
+            .ok_or_else(|| "agent target terminal is not running".to_owned())?
+            .lifecycle_id;
+        let effective_lifecycle = effective_agent_lifecycle(
+            runtime_lifecycle,
+            params.get("lifecycle_id").and_then(Value::as_str),
+        )?;
+        match (
+            params.get("agent_pid").and_then(Value::as_u64),
+            params.get("pid_start_time").and_then(Value::as_u64),
+        ) {
+            (Some(pid), Some(start)) => {
+                let pid = u32::try_from(pid).map_err(|_| "invalid agent pid".to_owned())?;
+                let expected = AgentProcessIdentity::expected(
+                    pid,
+                    start,
+                    surface.to_string(),
+                    effective_lifecycle.clone(),
+                );
+                validate_agent_process_identity(&expected).map_err(|error| error.to_string())?;
+            }
+            (None, None) => {}
+            _ => return Err("incomplete agent process identity".into()),
+        }
+        let sequence = params.get("sequence").and_then(Value::as_u64);
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_millis() as u64)
+            .unwrap_or_default();
+        let terminal_cwd = self.cwd_for_terminal(terminal);
+        let launch_command = self.commands.get(&terminal).cloned();
+        let session = self
+            .agent_sessions
+            .entry(surface)
+            .or_insert_with(|| AgentSession::new(surface));
+        let name = match event {
+            AgentEvent::SessionStart { agent, .. } => agent.clone(),
+            _ if !session.agent_kind.as_str().is_empty() => session.agent_kind.as_str().to_owned(),
+            _ => "agent".into(),
+        };
+        let must_start = session.lifecycle.phase != AgentLifecyclePhase::Running
+            || session.lifecycle.external_id.as_deref() != Some(effective_lifecycle.as_str());
+        if must_start {
+            let generation = session
+                .next_lifecycle_generation()
+                .map_err(|error| error.to_string())?;
+            let (pid, process_started_at_unix_ms) = match (
+                params.get("agent_pid").and_then(Value::as_u64),
+                params.get("pid_start_time").and_then(Value::as_u64),
+            ) {
+                (Some(pid), Some(start)) => (u32::try_from(pid).ok(), Some(start)),
+                _ => (None, None),
+            };
+            let session_id = match event {
+                AgentEvent::SessionStart { session_id, .. } => session_id.clone(),
+                _ => None,
+            };
+            let start = AgentSessionEvent {
+                event_id: format!("{effective_lifecycle}:start:{generation}"),
+                lifecycle_generation: generation,
+                lifecycle_id: Some(effective_lifecycle.clone()),
+                sequence: None,
+                occurred_at_unix_ms: now,
+                kind: AgentSessionEventKind::Lifecycle(AgentLifecycleEvent::Started {
+                    launch: AgentLaunchInfo {
+                        agent_kind: AgentKindId::new(name),
+                        session_id,
+                        pid,
+                        process_started_at_unix_ms,
+                        cwd: terminal_cwd,
+                        transcript: None,
+                        launch_command,
+                    },
+                }),
+            };
+            session
+                .apply_event(&start)
+                .map_err(|error| error.to_string())?;
+        }
+        if matches!(event, AgentEvent::SessionStart { .. }) {
+            return Ok(true);
+        }
+        let generation = session.lifecycle.generation;
+        let suffix = sequence
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        let kind = agent_session_event_kind(event, &suffix)
+            .ok_or_else(|| "session start must be handled before event mapping".to_owned())?;
+        let event = AgentSessionEvent {
+            event_id: format!("{effective_lifecycle}:{suffix}"),
+            lifecycle_generation: generation,
+            lifecycle_id: Some(effective_lifecycle.clone()),
+            sequence,
+            occurred_at_unix_ms: now,
+            kind,
+        };
+        if let AgentSessionEventKind::ActionRequired(request) = &event.kind {
+            let kind = match request.kind {
+                AgentRequestKind::Permission => IpcAgentRequestKind::PERMISSION,
+                AgentRequestKind::Input => IpcAgentRequestKind::INPUT,
+                AgentRequestKind::Confirmation => IpcAgentRequestKind::CONFIRMATION,
+            };
+            self.pending_agent_requests
+                .register(AgentInteractionRequest {
+                    request_id: request.request_id.clone(),
+                    surface_id: surface.to_string(),
+                    lifecycle_id: effective_lifecycle.clone(),
+                    agent_pid: params
+                        .get("agent_pid")
+                        .and_then(Value::as_u64)
+                        .and_then(|value| u32::try_from(value).ok()),
+                    pid_start_time: params.get("pid_start_time").and_then(Value::as_u64),
+                    kind: IpcAgentRequestKind::new(kind),
+                    message: request.message.clone(),
+                    choices: request
+                        .choices
+                        .iter()
+                        .enumerate()
+                        .map(|(index, label)| wmcterm_ipc::AgentChoice {
+                            id: index.to_string(),
+                            label: label.clone(),
+                        })
+                        .collect(),
+                    deadline_unix_ms: params.get("deadline_unix_ms").and_then(Value::as_u64),
+                })
+                .map_err(|error| error.to_string())?;
+        }
+        let actionable = matches!(event.kind, AgentSessionEventKind::ActionRequired(_));
+        let applied = session
+            .apply_event(&event)
+            .map(|outcome| {
+                matches!(
+                    outcome,
+                    wmcterm_core::AgentEventApplyOutcome::Applied { .. }
+                )
+            })
+            .map_err(|error| error.to_string())?;
+        if applied && actionable {
+            self.sync_surface_agent_request_state(surface);
+        }
+        Ok(applied)
+    }
+
+    fn resolve_agent_session_request(&mut self, request_id: &str) -> Result<(), String> {
+        let (_, session) = self
+            .agent_sessions
+            .iter_mut()
+            .find(|(_, session)| {
+                session
+                    .pending_requests
+                    .iter()
+                    .any(|request| request.request_id == request_id)
+            })
+            .ok_or_else(|| "agent session request not found".to_owned())?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_millis() as u64)
+            .unwrap_or_default();
+        let event = AgentSessionEvent {
+            event_id: format!("reply:{request_id}:{}", uuid::Uuid::new_v4()),
+            lifecycle_generation: session.lifecycle.generation,
+            lifecycle_id: session.lifecycle.external_id.clone(),
+            sequence: None,
+            occurred_at_unix_ms: now,
+            kind: AgentSessionEventKind::ActionResolved {
+                request_id: request_id.to_owned(),
+            },
+        };
+        session
+            .apply_event(&event)
+            .map_err(|error| error.to_string())?;
+        Ok(())
+    }
+
+    fn conclude_agent_request_state(&mut self, request: &AgentInteractionRequest) {
+        let _ = self.resolve_agent_session_request(&request.request_id);
+        if let Ok(surface) = uuid::Uuid::parse_str(&request.surface_id) {
+            if let Some(notification) =
+                self.state
+                    .notifications
+                    .iter_mut()
+                    .rev()
+                    .find(|notification| {
+                        notification.surface == surface
+                            && !notification.read
+                            && notification.attention == AttentionState::NeedsInput
+                            && notification.body == request.message
+                    })
+            {
+                notification.read = true;
+            }
+            self.sync_surface_agent_request_state(surface);
+        }
+    }
+
+    fn record_claude_hook(
+        &mut self,
+        terminal: TerminalId,
+        hook: &ClaudeHookEvent,
+    ) -> Result<(), String> {
+        let (_, _, surface) = terminal_context_ids(&self.state, terminal)
+            .ok_or_else(|| "Claude hook terminal context not found".to_owned())?;
+        let metadata = self
+            .state
+            .surfaces
+            .get(&surface)
+            .and_then(|surface| surface.agent.as_ref())
+            .ok_or_else(|| "Claude hook surface has no Agent session".to_owned())?;
+        if !matches!(
+            metadata.name.to_ascii_lowercase().as_str(),
+            "claude" | "claude code"
+        ) {
+            return Err("Claude hook cannot update a non-Claude surface".into());
+        }
+        if metadata.session_id.as_deref() != Some(hook.session_id.as_str()) {
+            return Err("Claude hook session does not match its surface".into());
+        }
+        apply_claude_subagent_status(&mut self.claude_subagents, surface, hook);
+        Ok(())
+    }
+
+    fn expire_agent_requests(&mut self) -> bool {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_millis() as u64)
+            .unwrap_or_default();
+        let requests = self.pending_agent_request_list();
+        let replies = match self.pending_agent_requests.expire(now) {
+            Ok(replies) => replies,
+            Err(error) => {
+                tracing::warn!(%error, "expiring Agent requests failed");
+                return false;
+            }
+        };
+        let changed = !replies.is_empty();
+        for reply in replies {
+            if let Some(request) = requests
+                .iter()
+                .find(|request| request.request_id == reply.request_id)
+            {
+                self.conclude_agent_request_state(request);
+            }
+        }
+        changed
+    }
+
+    fn close_agent_session_for_terminal(&mut self, terminal: TerminalId, message: String) {
+        let Some(surface) = self.surface_for_terminal(terminal) else {
+            return;
+        };
+        let Some(session) = self.agent_sessions.get(&surface) else {
+            return;
+        };
+        let scope = wmcterm_ipc::AgentProcessScope {
+            surface_id: surface.to_string(),
+            lifecycle_id: session.lifecycle.external_id.clone().unwrap_or_default(),
+            agent_pid: session.pid,
+            pid_start_time: session.process_started_at_unix_ms,
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|value| value.as_millis() as u64)
+            .unwrap_or_default();
+        let requests = self.pending_agent_request_list();
+        let replies = self
+            .pending_agent_requests
+            .process_exited(&scope, now)
+            .unwrap_or_default();
+        for reply in replies {
+            if let Some(request) = requests
+                .iter()
+                .find(|request| request.request_id == reply.request_id)
+            {
+                self.conclude_agent_request_state(request);
+            }
+        }
+        let Some(session) = self.agent_sessions.get_mut(&surface) else {
+            return;
+        };
+        if session.lifecycle.phase != AgentLifecyclePhase::Running {
+            self.sync_surface_agent_request_state(surface);
+            return;
+        }
+        let event = AgentSessionEvent {
+            event_id: format!("terminal-exit:{}", uuid::Uuid::new_v4()),
+            lifecycle_generation: session.lifecycle.generation,
+            lifecycle_id: session.lifecycle.external_id.clone(),
+            sequence: None,
+            occurred_at_unix_ms: now,
+            kind: AgentSessionEventKind::Lifecycle(AgentLifecycleEvent::Exited {
+                success: true,
+                message: Some(message),
+            }),
+        };
+        let _ = session.apply_event(&event);
+        self.sync_surface_agent_request_state(surface);
+    }
+
+    fn update_foreground_agent(&mut self, terminal: TerminalId, commands: &[String]) -> bool {
+        let detected = commands
+            .iter()
+            .find_map(|command| AgentKind::from_process_command(command));
+        let previous = self.foreground_agents.get(&terminal).copied();
+        if previous == detected {
+            return false;
+        }
+        match detected {
+            Some(agent) => {
+                self.foreground_agents.insert(terminal, agent);
+                let should_update = self.automatic_agent_status.contains(&terminal)
+                    || self
+                        .state
+                        .surfaces
+                        .values()
+                        .find(|surface| {
+                            matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal)
+                        })
+                        .is_none_or(|surface| surface.agent.is_none());
+                if !should_update {
+                    return false;
+                }
+                self.automatic_agent_status.insert(terminal);
+                if let Some(surface) = self.state.surfaces.values_mut().find(
+                    |surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal),
+                ) {
+                    surface.agent = Some(wmcterm_core::AgentMetadata {
+                        name: agent.as_str().to_owned(),
+                        state: wmcterm_core::AgentState::Running,
+                        session_id: None,
+                    });
+                    surface.attention = AttentionState::None;
+                }
+                if let Some(index) = self.workspace_for_terminal(terminal)
+                    && let Some(workspace) = self.state.workspaces.get_mut(index)
+                {
+                    workspace.status = wmcterm_core::WorkspaceStatus::Running;
+                }
+                if let Some(surface) = self.surface_for_terminal(terminal) {
+                    self.sync_surface_agent_request_state(surface);
+                }
+                true
+            }
+            None => {
+                self.foreground_agents.remove(&terminal);
+                if !self.automatic_agent_status.remove(&terminal) {
+                    return false;
+                }
+                if let Some(surface) = self.state.surfaces.values_mut().find(
+                    |surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal),
+                ) {
+                    surface.agent = None;
+                    surface.attention = AttentionState::None;
+                }
+                if let Some(index) = self.workspace_for_terminal(terminal)
+                    && let Some(workspace) = self.state.workspaces.get_mut(index)
+                {
+                    workspace.status = wmcterm_core::WorkspaceStatus::Idle;
+                }
+                if let Some(surface) = self.surface_for_terminal(terminal) {
+                    self.sync_surface_agent_request_state(surface);
+                }
+                true
+            }
+        }
+    }
+
+    fn mark_foreground_agent_running(&mut self, terminal: TerminalId) {
+        let Some(agent) = self.foreground_agents.get(&terminal).copied() else {
+            return;
+        };
+        self.automatic_agent_status.insert(terminal);
+        if let Some(surface) = self
+            .state
+            .surfaces
+            .values_mut()
+            .find(|surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal))
+        {
+            let session_id = surface
+                .agent
+                .as_ref()
+                .and_then(|metadata| metadata.session_id.clone());
+            surface.agent = Some(wmcterm_core::AgentMetadata {
+                name: agent.as_str().to_owned(),
+                state: wmcterm_core::AgentState::Running,
+                session_id,
+            });
+            surface.attention = AttentionState::None;
+        }
+        if let Some(index) = self.workspace_for_terminal(terminal)
+            && let Some(workspace) = self.state.workspaces.get_mut(index)
+        {
+            workspace.status = wmcterm_core::WorkspaceStatus::Running;
+        }
+        if let Some(surface) = self.surface_for_terminal(terminal) {
+            self.sync_surface_agent_request_state(surface);
+        }
+    }
+
+    fn send_key(&mut self, event: &KeyEvent) {
+        if event.state != ElementState::Pressed {
+            return;
+        }
+        if let Some((_, scroll)) = &mut self.agent_request_detail {
+            match event.logical_key {
+                Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter) => {
+                    self.agent_request_detail = None;
+                }
+                Key::Named(NamedKey::ArrowUp) => *scroll = scroll.saturating_sub(1),
+                Key::Named(NamedKey::ArrowDown) => *scroll = scroll.saturating_add(1),
+                _ => return,
+            }
+            self.rebuild_scene();
+            return;
+        }
+        if self.close_confirmation.is_some() {
+            match event.logical_key {
+                Key::Named(NamedKey::Enter) => self.confirm_close(),
+                Key::Named(NamedKey::Escape) => {
+                    self.close_confirmation = None;
+                    self.rebuild_scene();
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.tab_context_menu.is_some()
+            || self.workspace_context_menu.is_some()
+            || self.terminal_context_menu.is_some()
+            || self.notification_context_menu.is_some()
+        {
+            self.tab_context_menu = None;
+            self.workspace_context_menu = None;
+            self.terminal_context_menu = None;
+            self.notification_context_menu = None;
+            self.rebuild_scene();
+            return;
+        }
+        if self.notifications_visible {
+            let pending = self.pending_agent_request_list();
+            if !pending.is_empty() {
+                match event.logical_key {
+                    Key::Named(NamedKey::Escape) => {
+                        self.notifications_visible = false;
+                        self.agent_request_scroll = 0;
+                        self.agent_request_selection = 0;
+                        self.agent_request_action = 0;
+                    }
+                    Key::Named(NamedKey::ArrowUp) => self.move_agent_request_selection(-1),
+                    Key::Named(NamedKey::ArrowDown) => self.move_agent_request_selection(1),
+                    Key::Named(NamedKey::ArrowLeft) => self.move_agent_request_action(-1),
+                    Key::Named(NamedKey::ArrowRight) => self.move_agent_request_action(1),
+                    Key::Named(NamedKey::Enter) => self.resolve_selected_agent_request(),
+                    _ => return,
+                }
+                self.rebuild_scene();
+                return;
+            }
+            match event.logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.notifications_visible = false;
+                    self.notification_scroll = 0;
+                    self.notification_selection = 0;
+                }
+                Key::Named(NamedKey::ArrowUp) => self.move_notification_selection(-1),
+                Key::Named(NamedKey::ArrowDown) => self.move_notification_selection(1),
+                Key::Named(NamedKey::Enter) => {
+                    if let Some(notification) = self.selected_notification_id() {
+                        self.focus_notification(notification);
+                    }
+                }
+                Key::Named(NamedKey::Delete) | Key::Named(NamedKey::Backspace) => {
+                    if let Some(notification) = self.selected_notification_id() {
+                        self.clear_notification(notification);
+                    }
+                }
+                _ => return,
+            }
+            self.rebuild_scene();
+            return;
+        }
+        if self.workspace_search_focused {
+            if let Some(shortcut) = text_edit_shortcut(event, self.modifiers) {
+                let copied = apply_text_edit_shortcut(&mut self.workspace_search, shortcut);
+                if let (Some(clipboard), Some(text)) = (&mut self.clipboard, copied) {
+                    let _ = clipboard.set_text(text);
+                }
+                self.sidebar_scroll = 0;
+                self.rebuild_scene();
+                return;
+            }
+            let paste = matches!(&event.logical_key, Key::Character(value) if value.eq_ignore_ascii_case("v"))
+                && (self.modifiers.control_key() || self.modifiers.super_key());
+            if paste {
+                if let Some(text) = self
+                    .clipboard
+                    .as_mut()
+                    .and_then(|clipboard| clipboard.get_text().ok())
+                {
+                    self.workspace_search.insert(&text);
+                    self.sidebar_scroll = 0;
+                    self.rebuild_scene();
+                }
+                return;
+            }
+            match &event.logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.workspace_search_focused = false;
+                }
+                Key::Named(NamedKey::Enter) => {
+                    if let Some(index) = self.filtered_workspace_indices().first().copied() {
+                        self.state.active_workspace = index;
+                        self.resize_terminals();
+                    }
+                    self.workspace_search_focused = false;
+                }
+                Key::Named(NamedKey::Backspace) => self.workspace_search.backspace(),
+                Key::Named(NamedKey::Delete) => self.workspace_search.delete(),
+                Key::Named(NamedKey::ArrowLeft) => self
+                    .workspace_search
+                    .move_left_with_selection(self.modifiers.shift_key()),
+                Key::Named(NamedKey::ArrowRight) => self
+                    .workspace_search
+                    .move_right_with_selection(self.modifiers.shift_key()),
+                Key::Named(NamedKey::Home) => self
+                    .workspace_search
+                    .move_home_with_selection(self.modifiers.shift_key()),
+                Key::Named(NamedKey::End) => self
+                    .workspace_search
+                    .move_end_with_selection(self.modifiers.shift_key()),
+                Key::Named(NamedKey::Space)
+                    if !self.modifiers.control_key()
+                        && !self.modifiers.super_key()
+                        && !self.modifiers.alt_key()
+                        && !self.workspace_search.has_preedit() =>
+                {
+                    self.workspace_search.insert(" ");
+                }
+                Key::Character(value)
+                    if !self.modifiers.control_key()
+                        && !self.modifiers.super_key()
+                        && !self.modifiers.alt_key()
+                        && !self.workspace_search.has_preedit() =>
+                {
+                    self.workspace_search.insert(value);
+                }
+                _ => {}
+            }
+            self.sidebar_scroll = 0;
+            self.rebuild_scene();
+            return;
+        }
+        if self.prompt.is_some() {
+            if let Some(shortcut) = text_edit_shortcut(event, self.modifiers) {
+                let copied = self
+                    .prompt
+                    .as_mut()
+                    .and_then(|prompt| apply_text_edit_shortcut(&mut prompt.editor, shortcut));
+                if let (Some(clipboard), Some(text)) = (&mut self.clipboard, copied) {
+                    let _ = clipboard.set_text(text);
+                }
+                self.rebuild_scene();
+                return;
+            }
+            let paste = matches!(&event.logical_key, Key::Character(value) if value.eq_ignore_ascii_case("v"))
+                && (self.modifiers.control_key() || self.modifiers.super_key());
+            if paste {
+                let text = self
+                    .clipboard
+                    .as_mut()
+                    .and_then(|clipboard| clipboard.get_text().ok());
+                if let (Some(prompt), Some(text)) = (&mut self.prompt, text) {
+                    prompt.editor.insert(&text);
+                    prompt.error = None;
+                    self.rebuild_scene();
+                }
+                return;
+            }
+            match &event.logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.prompt = None;
+                    self.rebuild_scene();
+                }
+                Key::Named(NamedKey::Enter) => self.submit_prompt(),
+                Key::Named(NamedKey::Backspace) => {
+                    if let Some(prompt) = &mut self.prompt {
+                        prompt.editor.backspace();
+                        prompt.error = None;
+                    }
+                    self.rebuild_scene();
+                }
+                Key::Named(NamedKey::Delete) => {
+                    if let Some(prompt) = &mut self.prompt {
+                        prompt.editor.delete();
+                        prompt.error = None;
+                    }
+                    self.rebuild_scene();
+                }
+                Key::Named(NamedKey::ArrowLeft) => {
+                    if let Some(prompt) = &mut self.prompt {
+                        prompt
+                            .editor
+                            .move_left_with_selection(self.modifiers.shift_key());
+                    }
+                    self.rebuild_scene();
+                }
+                Key::Named(NamedKey::ArrowRight) => {
+                    if let Some(prompt) = &mut self.prompt {
+                        prompt
+                            .editor
+                            .move_right_with_selection(self.modifiers.shift_key());
+                    }
+                    self.rebuild_scene();
+                }
+                Key::Named(NamedKey::Home) => {
+                    if let Some(prompt) = &mut self.prompt {
+                        prompt
+                            .editor
+                            .move_home_with_selection(self.modifiers.shift_key());
+                    }
+                    self.rebuild_scene();
+                }
+                Key::Named(NamedKey::End) => {
+                    if let Some(prompt) = &mut self.prompt {
+                        prompt
+                            .editor
+                            .move_end_with_selection(self.modifiers.shift_key());
+                    }
+                    self.rebuild_scene();
+                }
+                Key::Named(NamedKey::Space)
+                    if !self.modifiers.control_key()
+                        && !self.modifiers.super_key()
+                        && !self.modifiers.alt_key() =>
+                {
+                    if let Some(prompt) = &mut self.prompt {
+                        if prompt.editor.has_preedit() {
+                            return;
+                        }
+                        prompt.editor.insert(" ");
+                        prompt.error = None;
+                    }
+                    self.rebuild_scene();
+                }
+                Key::Character(value)
+                    if !self.modifiers.control_key()
+                        && !self.modifiers.super_key()
+                        && !self.modifiers.alt_key() =>
+                {
+                    if let Some(prompt) = &mut self.prompt {
+                        // While an IME preedit is active, only Ime::Commit owns
+                        // text insertion. This avoids committing composition twice.
+                        if prompt.editor.has_preedit() {
+                            return;
+                        }
+                        prompt.editor.insert(value);
+                        prompt.error = None;
+                    }
+                    self.rebuild_scene();
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.search_visible {
+            if let Some(shortcut) = text_edit_shortcut(event, self.modifiers) {
+                let copied = apply_text_edit_shortcut(&mut self.search_editor, shortcut);
+                if let (Some(clipboard), Some(text)) = (&mut self.clipboard, copied) {
+                    let _ = clipboard.set_text(text);
+                }
+                self.search_active(1);
+                return;
+            }
+            let paste = matches!(&event.logical_key, Key::Character(value) if value.eq_ignore_ascii_case("v"))
+                && (self.modifiers.control_key() || self.modifiers.super_key());
+            if paste {
+                if let Some(text) = self
+                    .clipboard
+                    .as_mut()
+                    .and_then(|clipboard| clipboard.get_text().ok())
+                {
+                    self.search_editor.insert(&text);
+                    self.search_active(1);
+                }
+                return;
+            }
+            match &event.logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.search_visible = false;
+                    self.rebuild_scene();
+                }
+                Key::Named(NamedKey::Enter) => {
+                    self.search_active(if self.modifiers.shift_key() { -1 } else { 1 });
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    self.search_editor.backspace();
+                    self.search_active(1);
+                }
+                Key::Named(NamedKey::Delete) => {
+                    self.search_editor.delete();
+                    self.search_active(1);
+                }
+                Key::Named(NamedKey::ArrowLeft) => {
+                    self.search_editor
+                        .move_left_with_selection(self.modifiers.shift_key());
+                    self.rebuild_scene();
+                }
+                Key::Named(NamedKey::ArrowRight) => {
+                    self.search_editor
+                        .move_right_with_selection(self.modifiers.shift_key());
+                    self.rebuild_scene();
+                }
+                Key::Named(NamedKey::Home) => {
+                    self.search_editor
+                        .move_home_with_selection(self.modifiers.shift_key());
+                    self.rebuild_scene();
+                }
+                Key::Named(NamedKey::End) => {
+                    self.search_editor
+                        .move_end_with_selection(self.modifiers.shift_key());
+                    self.rebuild_scene();
+                }
+                Key::Named(NamedKey::Space)
+                    if !self.modifiers.control_key()
+                        && !self.modifiers.super_key()
+                        && !self.modifiers.alt_key() =>
+                {
+                    if self.search_editor.has_preedit() {
+                        return;
+                    }
+                    self.search_editor.insert(" ");
+                    self.search_active(1);
+                }
+                Key::Character(value)
+                    if !self.modifiers.control_key()
+                        && !self.modifiers.super_key()
+                        && !self.modifiers.alt_key() =>
+                {
+                    if self.search_editor.has_preedit() {
+                        return;
+                    }
+                    self.search_editor.insert(value);
+                    self.search_active(1);
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.palette_visible {
+            if let Some(shortcut) = text_edit_shortcut(event, self.modifiers) {
+                let copied = apply_text_edit_shortcut(&mut self.palette_query, shortcut);
+                if let (Some(clipboard), Some(text)) = (&mut self.clipboard, copied) {
+                    let _ = clipboard.set_text(text);
+                }
+                self.palette_index = 0;
+                self.palette_scroll = 0;
+                self.palette_hover = None;
+                self.rebuild_scene();
+                return;
+            }
+            let paste = matches!(&event.logical_key, Key::Character(value) if value.eq_ignore_ascii_case("v"))
+                && (self.modifiers.control_key() || self.modifiers.super_key());
+            if paste {
+                if let Some(text) = self
+                    .clipboard
+                    .as_mut()
+                    .and_then(|clipboard| clipboard.get_text().ok())
+                {
+                    self.palette_query.insert(&text);
+                    self.palette_index = 0;
+                    self.palette_scroll = 0;
+                    self.palette_hover = None;
+                    self.rebuild_scene();
+                }
+                return;
+            }
+            match event.logical_key {
+                Key::Named(NamedKey::ArrowUp) => {
+                    self.palette_hover = None;
+                    self.palette_index = self.palette_index.saturating_sub(1);
+                    let registry = ActionRegistry::default();
+                    let count = self.palette_actions(&registry).len();
+                    self.ensure_palette_selection_visible(count);
+                    self.rebuild_scene();
+                    return;
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    self.palette_hover = None;
+                    let registry = ActionRegistry::default();
+                    let count = self.palette_actions(&registry).len();
+                    self.palette_index = (self.palette_index + 1).min(count.saturating_sub(1));
+                    self.ensure_palette_selection_visible(count);
+                    self.rebuild_scene();
+                    return;
+                }
+                Key::Named(NamedKey::Enter) => {
+                    self.execute_palette_action();
+                    return;
+                }
+                Key::Named(NamedKey::Escape) => {
+                    self.palette_visible = false;
+                    self.palette_hover = None;
+                    self.rebuild_scene();
+                    return;
+                }
+                Key::Named(NamedKey::Backspace) => {
+                    self.palette_query.backspace();
+                    self.palette_index = 0;
+                    self.palette_scroll = 0;
+                    self.palette_hover = None;
+                    self.rebuild_scene();
+                    return;
+                }
+                Key::Named(NamedKey::Delete) => {
+                    self.palette_query.delete();
+                    self.palette_index = 0;
+                    self.palette_scroll = 0;
+                    self.palette_hover = None;
+                    self.rebuild_scene();
+                    return;
+                }
+                Key::Named(NamedKey::ArrowLeft) => {
+                    self.palette_query
+                        .move_left_with_selection(self.modifiers.shift_key());
+                    self.rebuild_scene();
+                    return;
+                }
+                Key::Named(NamedKey::ArrowRight) => {
+                    self.palette_query
+                        .move_right_with_selection(self.modifiers.shift_key());
+                    self.rebuild_scene();
+                    return;
+                }
+                Key::Named(NamedKey::Home) => {
+                    self.palette_query
+                        .move_home_with_selection(self.modifiers.shift_key());
+                    self.rebuild_scene();
+                    return;
+                }
+                Key::Named(NamedKey::End) => {
+                    self.palette_query
+                        .move_end_with_selection(self.modifiers.shift_key());
+                    self.rebuild_scene();
+                    return;
+                }
+                Key::Named(NamedKey::Space)
+                    if !self.modifiers.control_key()
+                        && !self.modifiers.super_key()
+                        && !self.modifiers.alt_key() =>
+                {
+                    if self.palette_query.has_preedit() {
+                        return;
+                    }
+                    self.palette_query.insert(" ");
+                    self.palette_index = 0;
+                    self.palette_scroll = 0;
+                    self.palette_hover = None;
+                    self.rebuild_scene();
+                    return;
+                }
+                Key::Character(ref value)
+                    if !self.modifiers.control_key()
+                        && !self.modifiers.super_key()
+                        && !self.modifiers.alt_key() =>
+                {
+                    if self.palette_query.has_preedit() {
+                        return;
+                    }
+                    self.palette_query.insert(value);
+                    self.palette_index = 0;
+                    self.palette_scroll = 0;
+                    self.palette_hover = None;
+                    self.rebuild_scene();
+                    return;
+                }
+                _ => {}
+            }
+            return;
+        }
+        if self.handle_exited_terminal_key(event) {
+            return;
+        }
+        if let Some(shortcut) = shortcut_for_event(event, self.modifiers)
+            && let Some(action) = self.keybindings.action_for(&shortcut).map(str::to_owned)
+        {
+            self.execute_action(&action);
+            return;
+        }
+        if self.config.ui.legacy_shortcuts {
+            if matches!(event.logical_key, Key::Named(NamedKey::F2))
+                && !self.modifiers.control_key()
+                && !self.modifiers.alt_key()
+                && !self.modifiers.super_key()
+            {
+                self.open_workspace_prompt(PromptKind::RenameWorkspace);
+                return;
+            }
+            if self.modifiers.control_key() && self.modifiers.shift_key() {
+                match &event.logical_key {
+                    Key::Character(value) if value.eq_ignore_ascii_case("d") => {
+                        self.split_active(SplitAxis::Vertical);
+                        return;
+                    }
+                    Key::Character(value) if value.eq_ignore_ascii_case("e") => {
+                        self.split_active(SplitAxis::Horizontal);
+                        return;
+                    }
+                    Key::Character(value) if value.eq_ignore_ascii_case("p") => {
+                        self.palette_visible = !self.palette_visible;
+                        self.palette_query.clear();
+                        self.palette_index = 0;
+                        self.palette_scroll = 0;
+                        self.palette_hover = None;
+                        self.rebuild_scene();
+                        return;
+                    }
+                    Key::Character(value) if value.eq_ignore_ascii_case("w") => {
+                        self.close_active_pane();
+                        return;
+                    }
+                    Key::Character(value) if value.eq_ignore_ascii_case("x") => {
+                        self.request_close_active_surface();
+                        return;
+                    }
+                    Key::Character(value) if value.eq_ignore_ascii_case("t") => {
+                        self.new_surface();
+                        return;
+                    }
+                    Key::Character(value) if value.eq_ignore_ascii_case("a") => {
+                        self.new_workspace();
+                        return;
+                    }
+                    Key::Character(value) if value.eq_ignore_ascii_case("b") => {
+                        self.sidebar_visible = !self.sidebar_visible;
+                        self.resize_terminals();
+                        self.rebuild_scene();
+                        return;
+                    }
+                    Key::Character(value) if value.eq_ignore_ascii_case("n") => {
+                        self.notifications_visible = !self.notifications_visible;
+                        if self.notifications_visible {
+                            self.notification_scroll = 0;
+                            self.notification_selection = 0;
+                        }
+                        self.rebuild_scene();
+                        return;
+                    }
+                    Key::Character(value) if value.eq_ignore_ascii_case("k") => {
+                        self.clear_scrollback();
+                        return;
+                    }
+                    Key::Character(value) if value.eq_ignore_ascii_case("z") => {
+                        self.toggle_pane_zoom();
+                        return;
+                    }
+                    Key::Character(value) if value.eq_ignore_ascii_case("r") => {
+                        self.open_workspace_prompt(PromptKind::RenameWorkspace);
+                        return;
+                    }
+                    Key::Character(value) if value.eq_ignore_ascii_case("u") => {
+                        self.jump_latest_unread();
+                        return;
+                    }
+                    Key::Character(value) if value.eq_ignore_ascii_case("l") => {
+                        self.open_log_filter_prompt();
+                        return;
+                    }
+                    Key::Named(NamedKey::PageUp) => {
+                        self.move_workspace(-1);
+                        return;
+                    }
+                    Key::Named(NamedKey::PageDown) => {
+                        self.move_workspace(1);
+                        return;
+                    }
+                    Key::Character(value) if value.eq_ignore_ascii_case("c") => {
+                        if !self.copy_selection_to_clipboard()
+                            && let Some(runtime) = self
+                                .active_terminal_id()
+                                .and_then(|id| self.terminals.get(&id))
+                        {
+                            let _ = runtime.session.send(SessionCommand::CopyAll);
+                        }
+                        return;
+                    }
+                    Key::Character(value) if value.eq_ignore_ascii_case("v") => {
+                        self.paste_clipboard();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            if self.modifiers.control_key() && !self.modifiers.shift_key() {
+                match &event.logical_key {
+                    Key::Character(value) if value.eq_ignore_ascii_case("f") => {
+                        self.search_visible = true;
+                        self.search_editor = TextEditor::default();
+                        self.search_result = None;
+                        self.rebuild_scene();
+                        return;
+                    }
+                    Key::Character(value) if value.eq_ignore_ascii_case("g") => {
+                        if !self.search_editor.text().is_empty() {
+                            self.search_active(1);
+                        }
+                        return;
+                    }
+                    Key::Character(value) if value.as_str() == "+" || value.as_str() == "=" => {
+                        self.adjust_font_size(1.0);
+                        return;
+                    }
+                    Key::Character(value) if value.as_str() == "-" => {
+                        self.adjust_font_size(-1.0);
+                        return;
+                    }
+                    Key::Character(value) if value.as_str() == "0" => {
+                        self.reset_font_size();
+                        return;
+                    }
+                    _ => {}
+                }
+            }
+            if self.modifiers.alt_key() {
+                let direction = match event.logical_key {
+                    Key::Named(NamedKey::ArrowLeft) => Some((-1.0, 0.0)),
+                    Key::Named(NamedKey::ArrowRight) => Some((1.0, 0.0)),
+                    Key::Named(NamedKey::ArrowUp) => Some((0.0, -1.0)),
+                    Key::Named(NamedKey::ArrowDown) => Some((0.0, 1.0)),
+                    _ => None,
+                };
+                if let Some(direction) = direction {
+                    self.focus_pane_direction(direction);
+                    return;
+                }
+                if let Key::Character(value) = &event.logical_key
+                    && let Ok(number) = value.parse::<usize>()
+                    && (1..=9).contains(&number)
+                {
+                    self.activate_surface_number(number - 1);
+                    return;
+                }
+            }
+            if self.modifiers.control_key()
+                && !self.modifiers.shift_key()
+                && let Key::Character(value) = &event.logical_key
+                && let Ok(number) = value.parse::<usize>()
+                && (1..=9).contains(&number)
+            {
+                if number <= self.state.workspaces.len() {
+                    self.state.active_workspace = number - 1;
+                    self.resize_terminals();
+                    self.rebuild_scene();
+                }
+                return;
+            }
+            if self.modifiers.control_key()
+                && matches!(event.logical_key, Key::Named(NamedKey::Tab))
+            {
+                self.cycle_surface(if self.modifiers.shift_key() { -1 } else { 1 });
+                return;
+            }
+        }
+        // Window managers commonly deliver the Tab press to the currently
+        // focused window before Alt+Tab or Super+Tab transfers focus.  Do not
+        // leak that system shortcut into the PTY, where interactive programs
+        // may interpret it as completion or submission.
+        if is_window_switch_shortcut(&event.logical_key, self.modifiers) {
+            return;
+        }
+        let physical_character = physical_ascii_character(event.physical_key);
+        let key = terminal_input_key(&event.logical_key, physical_character);
+        if let (Some(id), Some(key)) = (self.active_terminal_id(), key) {
+            let notifications_changed = self.mark_terminal_notifications_read(id);
+            if matches!(key, InputKey::Enter)
+                && !self.modifiers.control_key()
+                && !self.modifiers.alt_key()
+                && !self.modifiers.super_key()
+            {
+                self.mark_foreground_agent_running(id);
+                self.rebuild_scene();
+            } else if notifications_changed {
+                self.rebuild_scene();
+            }
+            let Some(runtime) = self.terminals.get_mut(&id) else {
+                return;
+            };
+            let text = event
+                .text
+                .as_ref()
+                .filter(|text| !text.chars().any(char::is_control))
+                .map(ToString::to_string)
+                .or_else(|| match event.logical_key.clone() {
+                    Key::Character(value) if !value.chars().any(char::is_control) => {
+                        Some(value.to_string())
+                    }
+                    Key::Named(NamedKey::Space) => Some(" ".into()),
+                    _ => physical_character.map(|character| character.to_string()),
+                });
+            let input = KeyInput {
+                key,
+                text,
+                modifiers: KeyModifiers {
+                    shift: self.modifiers.shift_key(),
+                    alt: self.modifiers.alt_key(),
+                    control: self.modifiers.control_key(),
+                    super_key: self.modifiers.super_key(),
+                },
+                repeat: event.repeat,
+            };
+            let _ = runtime.session.send(SessionCommand::Key(input));
+        }
+    }
+
+    fn commit_ime_text(&mut self, text: String) {
+        if text.is_empty() || self.close_confirmation.is_some() {
+            return;
+        }
+        if self.workspace_search_focused {
+            self.workspace_search.insert(&text);
+            self.sidebar_scroll = 0;
+            self.rebuild_scene();
+        } else if let Some(prompt) = &mut self.prompt {
+            prompt.editor.insert(&text);
+            prompt.error = None;
+            self.rebuild_scene();
+        } else if self.search_visible {
+            self.search_editor.insert(&text);
+            self.search_active(1);
+        } else if self.palette_visible {
+            self.palette_query.insert(&text);
+            self.palette_index = 0;
+            self.palette_scroll = 0;
+            self.palette_hover = None;
+            self.rebuild_scene();
+        } else if let Some(terminal) = self.active_terminal_id() {
+            let notifications_changed = self.mark_terminal_notifications_read(terminal);
+            if let Some(runtime) = self.terminals.get(&terminal) {
+                let _ = runtime
+                    .session
+                    .send(SessionCommand::Input(text.into_bytes()));
+            }
+            if notifications_changed {
+                self.rebuild_scene();
+            }
+        }
+    }
+
+    fn update_ime_preedit(&mut self, text: &str) {
+        if self.close_confirmation.is_some() {
+            return;
+        }
+        if self.workspace_search_focused {
+            self.workspace_search.set_preedit(text);
+            self.rebuild_scene();
+        } else if let Some(prompt) = &mut self.prompt {
+            prompt.editor.set_preedit(text);
+            self.rebuild_scene();
+        } else if self.search_visible {
+            self.search_editor.set_preedit(text);
+            self.rebuild_scene();
+        } else if self.palette_visible {
+            self.palette_query.set_preedit(text);
+            self.rebuild_scene();
+        }
+    }
+
+    fn execute_palette_action(&mut self) {
+        let registry = ActionRegistry::default();
+        let actions = self.palette_actions(&registry);
+        let index = self.palette_hover.unwrap_or(self.palette_index);
+        let Some(action) = actions.get(index) else {
+            return;
+        };
+        let action_id = action.id().to_owned();
+        self.palette_visible = false;
+        self.palette_hover = None;
+        self.execute_action(&action_id);
+    }
+
+    fn palette_actions<'a>(
+        &self,
+        registry: &'a ActionRegistry,
+    ) -> Vec<&'a wmcterm_core::BuiltinAction> {
+        let query = self.palette_query.text().to_lowercase();
+        registry
+            .actions()
+            .iter()
+            .filter(|action| {
+                query.is_empty()
+                    || action.id().to_lowercase().contains(&query)
+                    || action.title().to_lowercase().contains(&query)
+                    || self
+                        .language
+                        .action_title(action.id(), action.title())
+                        .to_lowercase()
+                        .contains(&query)
+            })
+            .collect()
+    }
+
+    fn shortcut_for_action(&self, action_id: &str) -> Option<String> {
+        if let Some(configured) = self.keybindings.iter().find_map(|(shortcut, action)| {
+            (action == action_id).then(|| format_shortcut_hint(shortcut))
+        }) {
+            return Some(configured);
+        }
+        if !self.config.ui.legacy_shortcuts {
+            return None;
+        }
+        Some(
+            match action_id {
+                "pane.split_right" => "Ctrl+Shift+D",
+                "pane.split_down" => "Ctrl+Shift+E",
+                "pane.close" => "Ctrl+Shift+W",
+                "surface.close" => "Ctrl+Shift+X",
+                "surface.new" => "Ctrl+Shift+T",
+                "workspace.new" => "Ctrl+Shift+A",
+                "workspace.rename" => "F2",
+                "sidebar.toggle" => "Ctrl+Shift+B",
+                "notifications.toggle" => "Ctrl+Shift+N",
+                "notifications.latest_unread" => "Ctrl+Shift+U",
+                "surface.filter_logs" => "Ctrl+Shift+L",
+                "terminal.clear_scrollback" => "Ctrl+Shift+K",
+                "pane.zoom" => "Ctrl+Shift+Z",
+                "terminal.find" => "Ctrl+F",
+                "terminal.font_increase" => "Ctrl++",
+                "terminal.font_decrease" => "Ctrl+-",
+                "terminal.font_reset" => "Ctrl+0",
+                _ => return None,
+            }
+            .to_owned(),
+        )
+    }
+
+    fn execute_action(&mut self, action_id: &str) {
+        match action_id {
+            "command.palette" => {
+                self.palette_visible = !self.palette_visible;
+                self.palette_query.clear();
+                self.palette_index = 0;
+                self.palette_scroll = 0;
+                self.palette_hover = None;
+                self.rebuild_scene();
+            }
+            "workspace.new" => self.new_workspace(),
+            "workspace.close" => self.request_close_workspace(),
+            "workspace.rename" => self.open_workspace_prompt(PromptKind::RenameWorkspace),
+            "workspace.describe" => self.open_workspace_prompt(PromptKind::DescribeWorkspace),
+            "workspace.change_directory" => {
+                self.open_workspace_prompt(PromptKind::ChangeWorkspaceDirectory)
+            }
+            "workspace.pin" => {
+                if let Some(workspace) = self.state.active_workspace() {
+                    let _ = self
+                        .state
+                        .execute(AppCommand::Workspace(WorkspaceCommand::Pin {
+                            id: workspace.id,
+                            pinned: !workspace.pinned,
+                        }));
+                    self.rebuild_scene();
+                }
+            }
+            "pane.split_right" => self.split_active(SplitAxis::Vertical),
+            "pane.split_down" => self.split_active(SplitAxis::Horizontal),
+            "surface.new" => self.new_surface(),
+            "surface.close" => {
+                self.request_close_active_surface();
+            }
+            "surface.filter_logs" => self.open_log_filter_prompt(),
+            "agent.claude" => {
+                self.new_surface_command(Some("claude".into()));
+            }
+            "agent.codex" => {
+                self.new_surface_command(Some(codex_teams_command()));
+            }
+            "agent.gemini" => {
+                self.new_surface_command(Some("gemini".into()));
+            }
+            "agent.opencode" => {
+                self.new_surface_command(Some("opencode".into()));
+            }
+            "pane.close" => self.close_active_pane(),
+            "pane.zoom" => self.toggle_pane_zoom(),
+            "terminal.find" => {
+                self.search_visible = true;
+                self.search_editor = TextEditor::default();
+                self.search_result = None;
+                self.rebuild_scene();
+            }
+            "terminal.find_directory" => self.open_workspace_prompt(PromptKind::FindDirectory),
+            "terminal.clear_scrollback" => self.clear_scrollback(),
+            "terminal.font_increase" => self.adjust_font_size(1.0),
+            "terminal.font_decrease" => self.adjust_font_size(-1.0),
+            "terminal.font_reset" => self.reset_font_size(),
+            "sidebar.toggle" => {
+                self.sidebar_visible = !self.sidebar_visible;
+                self.resize_terminals();
+                self.rebuild_scene();
+            }
+            "notifications.toggle" => {
+                self.notifications_visible = !self.notifications_visible;
+                if self.notifications_visible {
+                    self.notification_scroll = 0;
+                    self.notification_selection = 0;
+                }
+                self.rebuild_scene();
+            }
+            "notifications.latest_unread" => self.jump_latest_unread(),
+            "notifications.toggle_unread" => self.toggle_current_notification_unread(),
+            "settings.open" => self.open_settings(),
+            "window.new" => match env::current_exe()
+                .and_then(|binary| ProcessCommand::new(binary).arg("gui").spawn().map(|_| ()))
+            {
+                Ok(()) => {}
+                Err(error) => tracing::error!(%error, "creating a new window failed"),
+            },
+            "app.quit" => self.request_application_close(),
+            _ => {}
+        }
+    }
+
+    fn open_settings(&mut self) {
+        let Some(path) = wmcterm_config::config_path() else {
+            return;
+        };
+        let result = (|| -> Result<()> {
+            if !path.exists() {
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(&path, toml::to_string_pretty(&Config::default())?)?;
+            }
+            #[cfg(target_os = "linux")]
+            ProcessCommand::new("xdg-open").arg(&path).spawn()?;
+            #[cfg(target_os = "macos")]
+            ProcessCommand::new("open").arg(&path).spawn()?;
+            #[cfg(windows)]
+            ProcessCommand::new("notepad.exe").arg(&path).spawn()?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            tracing::error!(%error, "opening settings failed");
+        }
+    }
+
+    fn pane_rects(&self) -> Vec<(PaneId, Rect)> {
+        let mut output = Vec::new();
+        if let Some(workspace) = self.state.active_workspace() {
+            let area = terminal_workspace_area(
+                self.window_size.width as f32,
+                self.window_size.height as f32,
+                self.sidebar_width(),
+            );
+            if self
+                .state
+                .panes
+                .get(&workspace.active_pane)
+                .is_some_and(|pane| pane.zoomed)
+            {
+                output.push((workspace.active_pane, area));
+            } else {
+                layout(&workspace.root, area, &mut output);
+            }
+        }
+        output
+    }
+
+    fn new_surface(&mut self) {
+        self.new_surface_command(None);
+    }
+
+    fn sidebar_width(&self) -> f32 {
+        if !self.sidebar_visible {
+            return 0.0;
+        }
+        let window_width = self.window_size.width as f32;
+        let maximum = (window_width - 320.0).max(0.0);
+        if maximum >= 160.0 {
+            (self.config.sidebar.width as f32).clamp(160.0, maximum)
+        } else {
+            (window_width * 0.35).min(maximum)
+        }
+    }
+
+    fn sidebar_resize_hit(&self, x: f32, y: f32) -> bool {
+        self.sidebar_visible
+            && (x - self.sidebar_width()).abs() <= 5.0
+            && y >= 0.0
+            && y < self.window_size.height as f32
+    }
+
+    fn window_resize_direction(&self, x: f32, y: f32) -> Option<ResizeDirection> {
+        if self
+            .renderer
+            .as_ref()
+            .is_some_and(|renderer| renderer.window().is_maximized())
+        {
+            return None;
+        }
+        let edge = 5.0;
+        let west = x < edge;
+        let east = x >= self.window_size.width as f32 - edge;
+        let north = y < edge;
+        let south = y >= self.window_size.height as f32 - edge;
+        match (west, east, north, south) {
+            (true, _, true, _) => Some(ResizeDirection::NorthWest),
+            (_, true, true, _) => Some(ResizeDirection::NorthEast),
+            (true, _, _, true) => Some(ResizeDirection::SouthWest),
+            (_, true, _, true) => Some(ResizeDirection::SouthEast),
+            (true, _, _, _) => Some(ResizeDirection::West),
+            (_, true, _, _) => Some(ResizeDirection::East),
+            (_, _, true, _) => Some(ResizeDirection::North),
+            (_, _, _, true) => Some(ResizeDirection::South),
+            _ => None,
+        }
+    }
+
+    fn sidebar_layout(&self) -> ui::SidebarLayout {
+        let indices = self.filtered_workspace_indices();
+        let heights: Vec<_> = indices
+            .iter()
+            .map(|index| {
+                workspace_sidebar_row_height(
+                    self.workspace_agent_priority(*index) > 0,
+                    self.state.workspaces[*index].git_branch.is_some(),
+                )
+            })
+            .collect();
+        let mut layout = ui::sidebar_layout(
+            self.sidebar_width(),
+            self.window_size.height as f32,
+            &heights,
+            self.sidebar_scroll,
+        );
+        for row in &mut layout.rows {
+            row.index = indices[row.index];
+        }
+        layout
+    }
+
+    fn workspace_agent_priority(&self, workspace_index: usize) -> u8 {
+        let Some(workspace) = self.state.workspaces.get(workspace_index) else {
+            return 0;
+        };
+        let mut pane_ids = Vec::new();
+        workspace.root.leaves(&mut pane_ids);
+        aggregate_agent_priority(
+            pane_ids
+                .iter()
+                .filter_map(|id| self.state.panes.get(id))
+                .flat_map(|pane| pane.surfaces.iter())
+                .filter_map(|surface| self.state.surfaces.get(surface))
+                .filter_map(|surface| surface.agent.as_ref())
+                .map(|agent| agent.state),
+        )
+    }
+
+    fn workspace_claude_subagent_count(&self, workspace_index: usize) -> usize {
+        let Some(workspace) = self.state.workspaces.get(workspace_index) else {
+            return 0;
+        };
+        self.claude_subagents
+            .values()
+            .filter(|subagent| {
+                self.state.panes.values().any(|pane| {
+                    workspace.root.contains(pane.id) && pane.surfaces.contains(&subagent.surface)
+                })
+            })
+            .count()
+    }
+
+    fn agent_state_text(&self, priority: u8) -> &'static str {
+        match priority {
+            5 => self.language.error(),
+            4 => self.language.waiting(),
+            3 => self.language.running(),
+            2 => self.language.completed(),
+            _ => self.language.idle(),
+        }
+    }
+
+    fn filtered_workspace_indices(&self) -> Vec<usize> {
+        let query = self.workspace_search.text().trim().to_lowercase();
+        self.state
+            .workspaces
+            .iter()
+            .enumerate()
+            .filter(|(_, workspace)| {
+                query.is_empty()
+                    || workspace.name.to_lowercase().contains(&query)
+                    || workspace.description.to_lowercase().contains(&query)
+                    || workspace
+                        .cwd
+                        .to_string_lossy()
+                        .to_lowercase()
+                        .contains(&query)
+                    || workspace
+                        .git_branch
+                        .as_deref()
+                        .is_some_and(|branch| branch.to_lowercase().contains(&query))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
+    fn workspace_search_bounds(&self) -> ui::Bounds {
+        ui::Bounds {
+            x: 8.0,
+            y: 49.0,
+            width: (self.sidebar_width() - 56.0).max(1.0),
+            height: 30.0,
+        }
+    }
+
+    fn titlebar_command_bounds(&self) -> ui::Bounds {
+        let width = 456.0_f32.min((self.window_size.width as f32 - 420.0).max(180.0));
+        ui::Bounds {
+            x: ((self.window_size.width as f32 - width) / 2.0).max(8.0),
+            y: 5.0,
+            width,
+            height: 30.0,
+        }
+    }
+
+    fn command_palette_panel(&self, action_count: usize) -> ui::Bounds {
+        let capacity = (((self.window_size.height as f32 - 150.0) / 25.0) as usize).clamp(3, 12);
+        let visible = action_count.min(capacity);
+        let command = self.titlebar_command_bounds();
+        ui::Bounds {
+            x: command.x,
+            y: 38.0,
+            width: command.width,
+            height: (visible.max(1) as f32 * 25.0 + 16.0)
+                .max(66.0)
+                .min((self.window_size.height as f32 - 48.0).max(66.0)),
+        }
+    }
+
+    fn prompt_panel(&self) -> ui::Bounds {
+        ui::centered_panel(
+            self.window_size.width as f32,
+            self.window_size.height as f32,
+            520.0,
+            132.0,
+            16.0,
+        )
+    }
+
+    fn confirmation_panel(&self) -> ui::Bounds {
+        ui::centered_panel(
+            self.window_size.width as f32,
+            self.window_size.height as f32,
+            540.0,
+            168.0,
+            16.0,
+        )
+    }
+
+    fn confirmation_buttons(&self) -> (ui::Bounds, ui::Bounds) {
+        let panel = self.confirmation_panel();
+        let width = 116.0;
+        let height = 34.0;
+        let top = panel.y + panel.height - height - 16.0;
+        let confirm = ui::Bounds {
+            x: panel.x + panel.width - width - 16.0,
+            y: top,
+            width,
+            height,
+        };
+        let cancel = ui::Bounds {
+            x: confirm.x - width - 10.0,
+            y: top,
+            width,
+            height,
+        };
+        (cancel, confirm)
+    }
+
+    fn prompt_input_bounds(&self) -> ui::Bounds {
+        let panel = self.prompt_panel();
+        ui::Bounds {
+            x: panel.x + 18.0,
+            y: panel.y + 48.0,
+            width: panel.width - 36.0,
+            height: 36.0,
+        }
+    }
+
+    fn titlebar_buttons(&self) -> Vec<TitlebarButton> {
+        let notification_label = unread_badge_label(
+            self.state
+                .notifications
+                .iter()
+                .filter(|notification| !notification.read)
+                .count()
+                + self.pending_agent_requests.len().unwrap_or_default(),
+        )
+        .unwrap_or_else(|| "●".to_owned());
+        let actions = [
+            (
+                TitlebarAction::ToggleSidebar,
+                "☰".to_owned(),
+                self.sidebar_visible,
+            ),
+            (
+                TitlebarAction::ToggleNotifications,
+                notification_label,
+                self.notifications_visible,
+            ),
+            (TitlebarAction::Minimize, "—".to_owned(), false),
+            (TitlebarAction::ToggleMaximize, "□".to_owned(), false),
+            (TitlebarAction::Close, "×".to_owned(), false),
+        ];
+        actions
+            .into_iter()
+            .zip(ui::titlebar_chrome_layout(self.window_size.width as f32))
+            .map(|((action, label, active), bounds)| TitlebarButton {
+                action,
+                label,
+                bounds,
+                active,
+            })
+            .collect()
+    }
+
+    fn execute_titlebar_action(&mut self, action: TitlebarAction) {
+        match action {
+            TitlebarAction::ToggleSidebar => self.execute_action("sidebar.toggle"),
+            TitlebarAction::ToggleNotifications => self.execute_action("notifications.toggle"),
+            TitlebarAction::Minimize => {
+                if let Some(renderer) = &self.renderer {
+                    renderer.window().set_minimized(true);
+                }
+            }
+            TitlebarAction::ToggleMaximize => {
+                if let Some(renderer) = &self.renderer {
+                    let window = renderer.window();
+                    window.set_maximized(!window.is_maximized());
+                }
+            }
+            TitlebarAction::Close => self.request_application_close(),
+        }
+    }
+
+    fn empty_workspace_button(&self) -> ui::Bounds {
+        let content_left = self.sidebar_width();
+        let content_width = (self.window_size.width as f32 - content_left).max(1.0);
+        let width = 220.0_f32.min((content_width - 32.0).max(1.0));
+        ui::Bounds {
+            x: content_left + (content_width - width) / 2.0,
+            y: (self.window_size.height as f32 - 38.0) / 2.0 + 18.0,
+            width,
+            height: 38.0,
+        }
+    }
+
+    fn notification_panel(&self) -> ui::Bounds {
+        let width = 350.0_f32
+            .min((self.window_size.width as f32 - 32.0).max(1.0))
+            .max(220.0_f32.min(self.window_size.width as f32));
+        ui::Bounds {
+            x: (self.window_size.width as f32 - width - 16.0).max(0.0),
+            y: 48.0,
+            width,
+            height: (self.window_size.height as f32 - 90.0).max(1.0),
+        }
+    }
+
+    fn agent_approval_region(&self, pending_count: usize) -> ui::Bounds {
+        let panel = self.notification_panel();
+        if pending_count == 0 {
+            return ui::Bounds {
+                x: panel.x,
+                y: panel.y + 42.0,
+                width: panel.width,
+                height: 0.0,
+            };
+        }
+        let desired = 16.0 + pending_count.min(3) as f32 * 120.0;
+        let maximum = (panel.height * 0.62).max(128.0);
+        ui::Bounds {
+            x: panel.x,
+            y: panel.y + 42.0,
+            width: panel.width,
+            height: desired.min(maximum).min((panel.height - 50.0).max(1.0)),
+        }
+    }
+
+    fn notification_list_panel(&self, pending_count: usize) -> ui::Bounds {
+        let panel = self.notification_panel();
+        if pending_count == 0 {
+            return panel;
+        }
+        let approvals = self.agent_approval_region(pending_count);
+        let y = approvals.y + approvals.height;
+        ui::Bounds {
+            x: panel.x,
+            y,
+            width: panel.width,
+            height: (panel.y + panel.height - y).max(1.0),
+        }
+    }
+
+    fn pending_agent_request_list(&self) -> Vec<AgentInteractionRequest> {
+        self.pending_agent_requests.list().unwrap_or_default()
+    }
+
+    fn agent_request_source(&self, request: &AgentInteractionRequest) -> String {
+        let Some(surface_id) = uuid::Uuid::parse_str(&request.surface_id).ok() else {
+            return "Agent".into();
+        };
+        let agent = self
+            .state
+            .surfaces
+            .get(&surface_id)
+            .and_then(|surface| surface.agent.as_ref())
+            .map(|agent| agent.name.as_str())
+            .unwrap_or("Agent");
+        let workspace = self.state.workspaces.iter().find(|workspace| {
+            self.state
+                .panes
+                .values()
+                .any(|pane| workspace.root.contains(pane.id) && pane.surfaces.contains(&surface_id))
+        });
+        workspace.map_or_else(
+            || agent.to_owned(),
+            |workspace| format!("{agent} · {}", workspace.name),
+        )
+    }
+
+    fn agent_request_range(&self, count: usize) -> std::ops::Range<usize> {
+        let region = self.agent_approval_region(count);
+        let capacity = (((region.height - 16.0) / 120.0) as usize).max(1);
+        ui::scrolled_range(count, self.agent_request_scroll, capacity)
+    }
+
+    fn move_agent_request_selection(&mut self, direction: isize) {
+        let requests = self.pending_agent_request_list();
+        if requests.is_empty() {
+            self.agent_request_selection = 0;
+            self.agent_request_scroll = 0;
+            return;
+        }
+        self.agent_request_selection = self
+            .agent_request_selection
+            .saturating_add_signed(direction.signum())
+            .min(requests.len() - 1);
+        self.agent_request_action = self.agent_request_action.min(
+            agent_approval_actions(&requests[self.agent_request_selection])
+                .len()
+                .saturating_sub(1),
+        );
+        let capacity = self.agent_request_range(requests.len()).len().max(1);
+        if self.agent_request_selection < self.agent_request_scroll {
+            self.agent_request_scroll = self.agent_request_selection;
+        } else if self.agent_request_selection >= self.agent_request_scroll + capacity {
+            self.agent_request_scroll = self.agent_request_selection + 1 - capacity;
+        }
+    }
+
+    fn scroll_agent_requests(&mut self, direction: isize) {
+        let count = self.pending_agent_requests.len().unwrap_or_default();
+        let capacity = self.agent_request_range(count).len().max(1);
+        self.agent_request_scroll = self
+            .agent_request_scroll
+            .saturating_add_signed(direction.signum())
+            .min(count.saturating_sub(capacity));
+        self.agent_request_selection = self.agent_request_selection.clamp(
+            self.agent_request_scroll,
+            (self.agent_request_scroll + capacity.saturating_sub(1)).min(count.saturating_sub(1)),
+        );
+        self.update_navigation_hover();
+    }
+
+    fn move_agent_request_action(&mut self, direction: isize) {
+        let requests = self.pending_agent_request_list();
+        let Some(request) = requests.get(self.agent_request_selection) else {
+            self.agent_request_action = 0;
+            return;
+        };
+        let count = agent_approval_actions(request).len();
+        if count > 0 {
+            self.agent_request_action = self
+                .agent_request_action
+                .saturating_add_signed(direction.signum())
+                .min(count - 1);
+        }
+    }
+
+    fn resolve_selected_agent_request(&mut self) {
+        let requests = self.pending_agent_request_list();
+        let Some(request) = requests.get(self.agent_request_selection) else {
+            return;
+        };
+        let Some(action) = agent_approval_actions(request)
+            .get(self.agent_request_action)
+            .copied()
+        else {
+            return;
+        };
+        self.resolve_agent_request_from_ui(request.request_id.clone(), action);
+    }
+
+    fn resolve_agent_request_from_ui(&mut self, request_id: String, action: AgentApprovalAction) {
+        let Ok(Some(request)) = self.pending_agent_requests.get(&request_id) else {
+            return;
+        };
+        let resolution = agent_approval_resolution(&request, action);
+        let result = self
+            .pending_agent_requests
+            .resolve(&request_id, resolution, unix_time_ms());
+        if matches!(result, Ok(CompleteOutcome::Completed(_))) {
+            self.remember_agent_approval_result(request_id.clone(), action);
+            self.conclude_agent_request_state(&request);
+        }
+        let remaining = self.pending_agent_requests.len().unwrap_or_default();
+        self.agent_request_selection = self
+            .agent_request_selection
+            .min(remaining.saturating_sub(1));
+        self.agent_request_scroll = self.agent_request_scroll.min(remaining.saturating_sub(1));
+        self.agent_request_action = 0;
+        self.rebuild_scene();
+    }
+
+    fn remember_agent_approval_result(&mut self, request_id: String, action: AgentApprovalAction) {
+        remember_bounded_approval_result(
+            &mut self.agent_approval_results,
+            &mut self.agent_approval_result_order,
+            request_id,
+            action,
+            512,
+        );
+    }
+
+    fn notification_range(&self) -> std::ops::Range<usize> {
+        let pending_count = self.pending_agent_requests.len().unwrap_or_default();
+        let capacity = ui::notification_rows(
+            self.notification_list_panel(pending_count),
+            self.state.notifications.len(),
+        )
+        .len()
+        .min(12);
+        ui::scrolled_range(
+            self.state.notifications.len(),
+            self.notification_scroll,
+            capacity,
+        )
+    }
+
+    fn scroll_notifications(&mut self, direction: isize) {
+        let capacity = self.notification_range().len();
+        let max_scroll = self.state.notifications.len().saturating_sub(capacity);
+        self.notification_scroll = self
+            .notification_scroll
+            .saturating_add_signed(direction.signum())
+            .min(max_scroll);
+        self.notification_selection = self.notification_selection.clamp(
+            self.notification_scroll,
+            self.notification_scroll + capacity.saturating_sub(1),
+        );
+        self.navigation_hover = None;
+        self.notification_hover_started = None;
+        self.notification_marquee_line = 0;
+        self.update_navigation_hover();
+    }
+
+    fn selected_notification_id(&self) -> Option<uuid::Uuid> {
+        self.state
+            .notifications
+            .iter()
+            .rev()
+            .nth(self.notification_selection)
+            .map(|notification| notification.id)
+    }
+
+    fn move_notification_selection(&mut self, direction: isize) {
+        let count = self.state.notifications.len();
+        if count == 0 {
+            self.notification_selection = 0;
+            return;
+        }
+        self.notification_selection = self
+            .notification_selection
+            .saturating_add_signed(direction.signum())
+            .min(count - 1);
+        let pending_count = self.pending_agent_requests.len().unwrap_or_default();
+        let capacity = ui::notification_rows(self.notification_list_panel(pending_count), count)
+            .len()
+            .clamp(1, 12);
+        if self.notification_selection < self.notification_scroll {
+            self.notification_scroll = self.notification_selection;
+        } else if self.notification_selection >= self.notification_scroll + capacity {
+            self.notification_scroll = self.notification_selection + 1 - capacity;
+        }
+    }
+
+    fn surface_tabs_layout(&self, pane: PaneId, rect: Rect) -> Vec<ui::SurfaceTab> {
+        let Some(pane) = self.state.panes.get(&pane) else {
+            return Vec::new();
+        };
+        let cell_width = self.terminal_font_size.min(12.0) * 0.6;
+        let widths: Vec<_> = pane
+            .surfaces
+            .iter()
+            .enumerate()
+            .map(|(index, surface)| {
+                self.state
+                    .surfaces
+                    .get(surface)
+                    .map(|surface| ui::surface_tab_width_at(&surface.title, index, cell_width))
+                    .unwrap_or(64.0)
+            })
+            .collect();
+        ui::surface_tabs_layout(
+            ui::Bounds {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+            },
+            &widths,
+            pane.active_surface,
+        )
+    }
+
+    fn surface_new_tab_bounds(&self, rect: Rect) -> ui::Bounds {
+        ui::Bounds {
+            x: (rect.x + rect.width - 28.0).max(rect.x),
+            y: rect.y,
+            width: 28.0_f32.min(rect.width),
+            height: 25.0,
+        }
+    }
+
+    fn scroll_sidebar(&mut self, direction: isize) {
+        let layout = self.sidebar_layout();
+        self.sidebar_scroll = self
+            .sidebar_scroll
+            .saturating_add_signed(direction.signum())
+            .min(layout.max_scroll);
+        self.rebuild_scene();
+    }
+
+    fn scroll_palette(&mut self, direction: isize) {
+        let registry = ActionRegistry::default();
+        let len = self.palette_actions(&registry).len();
+        let capacity = (((self.window_size.height as f32 - 150.0) / 25.0) as usize).clamp(3, 12);
+        self.palette_scroll = self
+            .palette_scroll
+            .saturating_add_signed(direction)
+            .min(len.saturating_sub(capacity));
+        self.palette_hover = None;
+        self.rebuild_scene();
+    }
+
+    fn ensure_palette_selection_visible(&mut self, count: usize) {
+        let capacity = (((self.window_size.height as f32 - 150.0) / 25.0) as usize).clamp(3, 12);
+        if self.palette_index < self.palette_scroll {
+            self.palette_scroll = self.palette_index;
+        } else if self.palette_index >= self.palette_scroll.saturating_add(capacity) {
+            self.palette_scroll = self.palette_index + 1 - capacity;
+        }
+        self.palette_scroll = self.palette_scroll.min(count.saturating_sub(capacity));
+    }
+
+    fn scroll_tabs_at_cursor(&mut self, direction: isize) -> bool {
+        let (x, y) = self.cursor_position;
+        let Some((pane_id, _)) = self.pane_rects().into_iter().find(|(_, rect)| {
+            x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + 25.0
+        }) else {
+            return false;
+        };
+        let Some(pane) = self.state.panes.get_mut(&pane_id) else {
+            return true;
+        };
+        if pane.surfaces.is_empty() {
+            return true;
+        }
+        pane.active_surface =
+            ui::scroll_selection(pane.active_surface, pane.surfaces.len(), direction);
+        if let Some(workspace) = self.state.workspaces.get_mut(self.state.active_workspace) {
+            workspace.active_pane = pane_id;
+        }
+        self.resize_terminals();
+        self.rebuild_scene();
+        true
+    }
+
+    fn cell_width(&self) -> f32 {
+        self.terminal_font_size * 0.6
+    }
+
+    fn cell_height(&self) -> f32 {
+        self.terminal_font_size * 1.4
+    }
+
+    fn adjust_font_size(&mut self, delta: f32) {
+        self.terminal_font_size = (self.terminal_font_size + delta).clamp(8.0, 40.0);
+        self.resize_terminals();
+        self.rebuild_scene();
+    }
+
+    fn reset_font_size(&mut self) {
+        self.terminal_font_size = self.config.terminal.font_size.clamp(8.0, 40.0);
+        self.resize_terminals();
+        self.rebuild_scene();
+    }
+
+    fn search_active(&mut self, direction: isize) {
+        if let Some(runtime) = self
+            .active_terminal_id()
+            .and_then(|id| self.terminals.get(&id))
+        {
+            let _ = runtime.session.send(SessionCommand::Search {
+                query: self.search_editor.text().to_owned(),
+                direction,
+            });
+            return;
+        }
+        let Some(surface) = self.active_surface_id() else {
+            return;
+        };
+        let Some(backend) = self.surface_backends.get(&surface) else {
+            return;
+        };
+        let offsets = document_search_offsets(backend.as_ref(), self.search_editor.text());
+        if offsets.is_empty() {
+            self.search_result = Some(SearchResult {
+                query: self.search_editor.text().to_owned(),
+                current: 0,
+                total: 0,
+            });
+        } else {
+            let same_query = self.search_result.as_ref().is_some_and(|result| {
+                result.query == self.search_editor.text() && result.total == offsets.len()
+            });
+            let index = if !same_query {
+                if direction < 0 { offsets.len() - 1 } else { 0 }
+            } else {
+                let current = self
+                    .search_result
+                    .as_ref()
+                    .map(|result| result.current)
+                    .unwrap_or(1);
+                if direction < 0 {
+                    (current + offsets.len() - 2) % offsets.len()
+                } else {
+                    current.wrapping_rem(offsets.len())
+                }
+            };
+            self.document_scroll.insert(surface, offsets[index]);
+            self.search_result = Some(SearchResult {
+                query: self.search_editor.text().to_owned(),
+                current: index + 1,
+                total: offsets.len(),
+            });
+        }
+        self.rebuild_scene();
+    }
+
+    fn clear_scrollback(&mut self) {
+        if let Some(runtime) = self
+            .active_terminal_id()
+            .and_then(|id| self.terminals.get(&id))
+        {
+            let _ = runtime.session.send(SessionCommand::ClearScrollback);
+        }
+    }
+
+    fn toggle_pane_zoom(&mut self) {
+        let Some(pane) = self
+            .state
+            .active_workspace()
+            .map(|workspace| workspace.active_pane)
+        else {
+            return;
+        };
+        if let Some(pane) = self.state.panes.get_mut(&pane) {
+            pane.zoomed = !pane.zoomed;
+        }
+        self.resize_terminals();
+        self.rebuild_scene();
+    }
+
+    fn activate_surface_number(&mut self, index: usize) {
+        let Some(pane) = self
+            .state
+            .active_workspace()
+            .map(|workspace| workspace.active_pane)
+        else {
+            return;
+        };
+        if let Some(pane) = self.state.panes.get_mut(&pane)
+            && index < pane.surfaces.len()
+        {
+            pane.active_surface = index;
+            self.resize_terminals();
+            self.rebuild_scene();
+        }
+    }
+
+    fn new_workspace(&mut self) {
+        let name = format!(
+            "{} {}",
+            self.language.workspace_default(),
+            self.state.workspaces.len() + 1
+        );
+        let process_cwd = env::current_dir().unwrap_or_default();
+        let cwd = select_new_workspace_cwd(
+            self.config.workspace.inherit_cwd,
+            self.state
+                .active_workspace()
+                .map(|workspace| workspace.cwd.as_path()),
+            self.config.workspace.default_cwd.as_deref(),
+            &process_cwd,
+        );
+        if self
+            .state
+            .execute(AppCommand::Workspace(WorkspaceCommand::Create {
+                name,
+                cwd,
+            }))
+            .is_err()
+        {
+            return;
+        }
+        let missing: Vec<_> = self
+            .state
+            .surfaces
+            .values()
+            .filter_map(|surface| match surface.kind {
+                SurfaceKind::Terminal(id) if !self.terminals.contains_key(&id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        for terminal in missing {
+            if let Err(error) = self.spawn_terminal(terminal) {
+                tracing::error!(%error, "spawning workspace terminal failed");
+                self.report_terminal_notice(
+                    terminal,
+                    TerminalNotice::SpawnFailed(error.to_string()),
+                );
+            }
+        }
+        self.refresh_workspace_metadata();
+        self.resize_terminals();
+        self.rebuild_scene();
+    }
+
+    fn open_workspace_prompt(&mut self, kind: PromptKind) {
+        let Some(workspace) = self.state.active_workspace() else {
+            return;
+        };
+        let input = match kind {
+            PromptKind::RenameWorkspace => workspace.name.clone(),
+            PromptKind::DescribeWorkspace => workspace.description.clone(),
+            PromptKind::ChangeWorkspaceDirectory => workspace.cwd.display().to_string(),
+            PromptKind::FindDirectory => String::new(),
+            PromptKind::FilterLogs => String::new(),
+        };
+        self.prompt = Some(TextPrompt {
+            kind,
+            editor: TextEditor::new(input),
+            error: None,
+        });
+        self.rebuild_scene();
+    }
+
+    fn open_log_filter_prompt(&mut self) {
+        let Some(surface) = self.active_surface_id() else {
+            return;
+        };
+        let Some(logs) = self
+            .surface_backends
+            .get(&surface)
+            .and_then(|backend| backend.as_any().downcast_ref::<LogSurface>())
+        else {
+            return;
+        };
+        self.prompt = Some(TextPrompt {
+            kind: PromptKind::FilterLogs,
+            editor: TextEditor::new(format_log_filter(logs.filter())),
+            error: None,
+        });
+        self.rebuild_scene();
+    }
+
+    fn submit_prompt(&mut self) {
+        let Some(prompt) = self.prompt.take() else {
+            return;
+        };
+        let Some(workspace_id) = self.state.active_workspace().map(|workspace| workspace.id) else {
+            return;
+        };
+        let input = prompt.editor.text().trim().to_owned();
+        let changes_directory = matches!(prompt.kind, PromptKind::ChangeWorkspaceDirectory);
+        if matches!(prompt.kind, PromptKind::RenameWorkspace) && input.is_empty() {
+            self.prompt = Some(TextPrompt {
+                error: Some(self.language.name_required().into()),
+                ..prompt
+            });
+            self.rebuild_scene();
+            return;
+        }
+        let command = match prompt.kind {
+            PromptKind::RenameWorkspace => AppCommand::Workspace(WorkspaceCommand::Rename {
+                id: workspace_id,
+                name: input,
+            }),
+            PromptKind::DescribeWorkspace => AppCommand::Workspace(WorkspaceCommand::Describe {
+                id: workspace_id,
+                description: input,
+            }),
+            PromptKind::ChangeWorkspaceDirectory => {
+                let current = self
+                    .state
+                    .active_workspace()
+                    .map(|workspace| workspace.cwd.as_path())
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                let cwd = match resolve_existing_directory(&input, current) {
+                    Ok(cwd) => cwd,
+                    Err(error) => {
+                        self.prompt = Some(TextPrompt {
+                            error: Some(self.language.invalid_workspace_directory(&error)),
+                            ..prompt
+                        });
+                        self.rebuild_scene();
+                        return;
+                    }
+                };
+                AppCommand::Workspace(WorkspaceCommand::ChangeDirectory {
+                    id: workspace_id,
+                    cwd,
+                })
+            }
+            PromptKind::FindDirectory => {
+                if !input.is_empty() {
+                    self.new_surface_command(Some(format!(
+                        "rg --line-number --color=always -- {} .",
+                        shell_quote_command(&input)
+                    )));
+                }
+                return;
+            }
+            PromptKind::FilterLogs => {
+                let Some(surface) = self.active_surface_id() else {
+                    return;
+                };
+                if let Some(logs) = self
+                    .surface_backends
+                    .get_mut(&surface)
+                    .and_then(|backend| backend.as_any_mut().downcast_mut::<LogSurface>())
+                {
+                    logs.set_filter(parse_log_filter(&input));
+                    self.document_scroll.insert(surface, 0);
+                }
+                self.rebuild_scene();
+                return;
+            }
+        };
+        let _ = self.state.execute(command);
+        if changes_directory {
+            self.refresh_workspace_metadata();
+        }
+        self.rebuild_scene();
+    }
+
+    fn move_workspace(&mut self, offset: isize) {
+        let Some(id) = self.state.active_workspace().map(|workspace| workspace.id) else {
+            return;
+        };
+        let _ = self
+            .state
+            .execute(AppCommand::Workspace(WorkspaceCommand::Move { id, offset }));
+        self.rebuild_scene();
+    }
+
+    fn refresh_workspace_metadata(&mut self) {
+        if self.metadata_refresh_in_flight {
+            return;
+        }
+        self.metadata_refresh_in_flight = true;
+        let workspaces: Vec<_> = self
+            .state
+            .workspaces
+            .iter()
+            .map(|workspace| (workspace.id, workspace.cwd.clone()))
+            .collect();
+        let proxy = self.proxy.clone();
+        thread::spawn(move || {
+            let metadata = workspaces
+                .into_iter()
+                .map(|(id, cwd)| WorkspaceMetadata {
+                    id,
+                    git_branch: ProcessCommand::new("git")
+                        .args(["-C"])
+                        .arg(&cwd)
+                        .args(["branch", "--show-current"])
+                        .output()
+                        .ok()
+                        .filter(|output| output.status.success())
+                        .and_then(|output| String::from_utf8(output.stdout).ok())
+                        .map(|branch| branch.trim().to_owned())
+                        .filter(|branch| !branch.is_empty()),
+                    listening_ports: listening_ports_for(&cwd),
+                })
+                .collect();
+            let _ = proxy.send_event(UserEvent::WorkspaceMetadata(metadata));
+        });
+    }
+
+    fn terminal_activity_count(&self, terminal: TerminalId) -> usize {
+        let processes = self.terminal_processes.get(&terminal).map_or(0, Vec::len);
+        if processes > 0 {
+            return processes;
+        }
+        let agent_active = self.state.surfaces.values().any(|surface| {
+            matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal)
+                && surface.agent.as_ref().is_some_and(|agent| {
+                    matches!(
+                        agent.state,
+                        wmcterm_core::AgentState::Running
+                            | wmcterm_core::AgentState::WaitingForInput
+                            | wmcterm_core::AgentState::WaitingForPermission
+                    )
+                })
+        });
+        usize::from(agent_active)
+    }
+
+    fn confirm_close(&mut self) {
+        let Some(confirmation) = self.close_confirmation.take() else {
+            return;
+        };
+        match confirmation.target {
+            CloseTarget::Surfaces(surfaces) => {
+                for surface in surfaces {
+                    self.remove_surface_by_id(surface);
+                }
+                self.resize_terminals();
+            }
+            CloseTarget::Workspace(workspace) => {
+                self.remove_workspace_by_id(workspace);
+            }
+            CloseTarget::Application => self.quit_requested = true,
+        }
+        self.rebuild_scene();
+    }
+
+    fn request_application_close(&mut self) {
+        let terminal_count = self.terminals.len();
+        let process_count = self
+            .terminals
+            .keys()
+            .map(|terminal| self.terminal_activity_count(*terminal))
+            .sum();
+        let pending_request_count = self.pending_agent_requests.len().unwrap_or_default();
+        if application_requires_close_confirmation(process_count, pending_request_count) {
+            self.close_confirmation = Some(CloseConfirmation {
+                target: CloseTarget::Application,
+                title: self.language.close_application_title().to_owned(),
+                message: self.language.close_application_warning(
+                    terminal_count,
+                    process_count,
+                    pending_request_count,
+                ),
+            });
+            self.rebuild_scene();
+        } else {
+            self.quit_requested = true;
+        }
+    }
+
+    fn request_close_workspace(&mut self) {
+        let Some(workspace) = self.state.active_workspace().map(|workspace| workspace.id) else {
+            return;
+        };
+        let _ = self.request_close_workspace_by_id(workspace);
+    }
+
+    fn request_close_workspace_by_id(&mut self, workspace_id: uuid::Uuid) -> Result<bool, String> {
+        let workspace = self
+            .state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .ok_or_else(|| "workspace not found".to_owned())?;
+        let mut pane_ids = Vec::new();
+        workspace.root.leaves(&mut pane_ids);
+        let terminal_ids: Vec<_> = pane_ids
+            .iter()
+            .filter_map(|pane| self.state.panes.get(pane))
+            .flat_map(|pane| pane.surfaces.iter())
+            .filter_map(|surface| self.state.surfaces.get(surface))
+            .filter_map(|surface| match surface.kind {
+                SurfaceKind::Terminal(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        let process_count = terminal_ids
+            .iter()
+            .map(|terminal| self.terminal_activity_count(*terminal))
+            .sum();
+        if workspace_requires_close_confirmation(terminal_ids.len(), process_count) {
+            self.close_confirmation = Some(CloseConfirmation {
+                target: CloseTarget::Workspace(workspace.id),
+                title: self.language.close_workspace_title().to_owned(),
+                message: self
+                    .language
+                    .close_workspace_warning(terminal_ids.len(), process_count),
+            });
+            self.rebuild_scene();
+            return Ok(false);
+        }
+        Ok(self.remove_workspace_by_id(workspace_id))
+    }
+
+    fn remove_workspace_by_id(&mut self, workspace_id: uuid::Uuid) -> bool {
+        let Some(workspace) = self
+            .state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .cloned()
+        else {
+            return false;
+        };
+        let previously_active = self.state.active_workspace().map(|workspace| workspace.id);
+        let mut pane_ids = Vec::new();
+        workspace.root.leaves(&mut pane_ids);
+        let surface_ids: Vec<_> = pane_ids
+            .iter()
+            .filter_map(|pane| self.state.panes.get(pane))
+            .flat_map(|pane| pane.surfaces.iter().copied())
+            .collect();
+        let terminal_ids: Vec<_> = surface_ids
+            .iter()
+            .filter_map(|surface| self.state.surfaces.get(surface))
+            .filter_map(|surface| match surface.kind {
+                SurfaceKind::Terminal(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        if self
+            .state
+            .execute(AppCommand::Workspace(WorkspaceCommand::Close {
+                id: workspace_id,
+            }))
+            .is_ok()
+        {
+            if previously_active != Some(workspace_id)
+                && let Some(active) = previously_active
+                && let Some(index) = self
+                    .state
+                    .workspaces
+                    .iter()
+                    .position(|workspace| workspace.id == active)
+            {
+                self.state.active_workspace = index;
+            }
+            for surface in surface_ids {
+                self.surface_backends.remove(&surface);
+                self.document_scroll.remove(&surface);
+                self.agent_sessions.remove(&surface);
+                self.claude_subagents
+                    .retain(|_, subagent| subagent.surface != surface);
+            }
+            for terminal in terminal_ids {
+                self.terminals.remove(&terminal);
+                self.commands.remove(&terminal);
+                self.terminal_notices.remove(&terminal);
+                self.terminal_processes.remove(&terminal);
+                self.last_bell_notifications.remove(&terminal);
+                self.foreground_agents.remove(&terminal);
+                self.automatic_agent_status.remove(&terminal);
+            }
+            self.resize_terminals();
+            self.rebuild_scene();
+            return true;
+        }
+        false
+    }
+
+    fn new_surface_command(&mut self, command: Option<String>) -> Option<wmcterm_core::SurfaceId> {
+        let pane_id = self
+            .state
+            .active_workspace()
+            .map(|workspace| workspace.active_pane)?;
+        let surface = wmcterm_core::Surface::terminal("Shell");
+        let terminal = match surface.kind {
+            SurfaceKind::Terminal(id) => id,
+            _ => return None,
+        };
+        let surface_id = surface.id;
+        self.state.surfaces.insert(surface_id, surface);
+        if let Some(pane) = self.state.panes.get_mut(&pane_id) {
+            pane.surfaces.push(surface_id);
+            pane.active_surface = pane.surfaces.len() - 1;
+        }
+        if let Err(error) = self.spawn_terminal_command(terminal, command) {
+            tracing::error!(%error, "spawning surface failed");
+            self.report_terminal_notice(terminal, TerminalNotice::SpawnFailed(error.to_string()));
+        }
+        self.resize_terminals();
+        self.rebuild_scene();
+        Some(surface_id)
+    }
+
+    fn rpc_target_pane(&self, params: &Value) -> Result<(usize, PaneId), String> {
+        rpc_target_pane_in_state(&self.state, params)
+    }
+
+    fn rpc_create_surface(
+        &mut self,
+        workspace_index: usize,
+        pane_id: PaneId,
+        options: TerminalCreateOptions,
+        focus: bool,
+    ) -> Result<Value, String> {
+        let workspace_id = self.state.workspaces[workspace_index].id;
+        let mut surface = wmcterm_core::Surface::terminal(
+            options
+                .title
+                .as_deref()
+                .unwrap_or_else(|| self.language.shell()),
+        );
+        let SurfaceKind::Terminal(terminal_id) = surface.kind else {
+            return Err("terminal surface creation failed".into());
+        };
+        let surface_id = surface.id;
+        if let Some(title) = &options.title {
+            surface.title.clone_from(title);
+        }
+        self.state.surfaces.insert(surface_id, surface);
+        self.state
+            .panes
+            .get_mut(&pane_id)
+            .ok_or_else(|| "target pane not found".to_owned())?
+            .surfaces
+            .push(surface_id);
+        if let Err(error) = self.spawn_terminal_with_options(terminal_id, options) {
+            self.state.surfaces.remove(&surface_id);
+            if let Some(pane) = self.state.panes.get_mut(&pane_id) {
+                pane.surfaces.retain(|id| *id != surface_id);
+                pane.active_surface = pane
+                    .active_surface
+                    .min(pane.surfaces.len().saturating_sub(1));
+            }
+            return Err(error.to_string());
+        }
+        focus_created_surface(
+            &mut self.state,
+            workspace_index,
+            pane_id,
+            Some(surface_id),
+            focus,
+        );
+        self.resize_terminals();
+        self.rebuild_scene();
+        Ok(json!({
+            "workspace_id": workspace_id,
+            "pane_id": pane_id,
+            "surface_id": surface_id,
+            "terminal_id": terminal_id,
+        }))
+    }
+
+    fn rpc_split_pane(
+        &mut self,
+        workspace_index: usize,
+        target_pane: PaneId,
+        placement: SplitPlacement,
+        options: TerminalCreateOptions,
+        focus: bool,
+    ) -> Result<Value, String> {
+        let workspace_id = self.state.workspaces[workspace_index].id;
+        let pane_id = PaneId::new_v4();
+        let mut surface = wmcterm_core::Surface::terminal(
+            options
+                .title
+                .as_deref()
+                .unwrap_or_else(|| self.language.shell()),
+        );
+        let SurfaceKind::Terminal(terminal_id) = surface.kind else {
+            return Err("terminal surface creation failed".into());
+        };
+        let surface_id = surface.id;
+        if let Some(title) = &options.title {
+            surface.title.clone_from(title);
+        }
+        self.state.workspaces[workspace_index]
+            .root
+            .split(target_pane, pane_id, placement.axis, 0.5)
+            .map_err(|error| error.to_string())?;
+        if placement.new_first {
+            place_new_split_first(
+                &mut self.state.workspaces[workspace_index].root,
+                target_pane,
+                pane_id,
+            );
+        }
+        self.state.surfaces.insert(surface_id, surface);
+        self.state.panes.insert(
+            pane_id,
+            Pane {
+                id: pane_id,
+                surfaces: vec![surface_id],
+                active_surface: 0,
+                zoomed: false,
+            },
+        );
+        if let Err(error) = self.spawn_terminal_with_options(terminal_id, options) {
+            if let Ok(root) = self.state.workspaces[workspace_index]
+                .root
+                .clone()
+                .remove(pane_id)
+            {
+                self.state.workspaces[workspace_index].root = root;
+            }
+            self.state.panes.remove(&pane_id);
+            self.state.surfaces.remove(&surface_id);
+            return Err(error.to_string());
+        }
+        focus_created_surface(
+            &mut self.state,
+            workspace_index,
+            pane_id,
+            Some(surface_id),
+            focus,
+        );
+        self.resize_terminals();
+        self.rebuild_scene();
+        Ok(json!({
+            "workspace_id": workspace_id,
+            "pane_id": pane_id,
+            "surface_id": surface_id,
+            "terminal_id": terminal_id,
+        }))
+    }
+
+    fn rpc_open_text_surface(
+        &mut self,
+        workspace_index: usize,
+        pane_id: PaneId,
+        path: &std::path::Path,
+        logs: bool,
+        focus: bool,
+    ) -> Result<Value, String> {
+        let workspace_id = self.state.workspaces[workspace_index].id;
+        let backend: Box<dyn SurfaceBackend> = if logs {
+            Box::new(LogSurface::open(path, 10_000).map_err(|error| error.to_string())?)
+        } else {
+            Box::new(MarkdownSurface::open(path).map_err(|error| error.to_string())?)
+        };
+        let surface_id = SurfaceId::new_v4();
+        let kind_id = uuid::Uuid::new_v4();
+        let surface = wmcterm_core::Surface {
+            id: surface_id,
+            title: path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("Document")
+                .to_owned(),
+            kind: if logs {
+                SurfaceKind::Logs(kind_id)
+            } else {
+                SurfaceKind::Markdown(kind_id)
+            },
+            attention: AttentionState::None,
+            agent: None,
+            resource: Some(path.display().to_string()),
+        };
+        self.state.surfaces.insert(surface_id, surface);
+        self.surface_backends.insert(surface_id, backend);
+        self.state
+            .panes
+            .get_mut(&pane_id)
+            .ok_or_else(|| "target pane not found".to_owned())?
+            .surfaces
+            .push(surface_id);
+        focus_created_surface(
+            &mut self.state,
+            workspace_index,
+            pane_id,
+            Some(surface_id),
+            focus,
+        );
+        self.resize_terminals();
+        self.rebuild_scene();
+        Ok(json!({
+            "workspace_id": workspace_id,
+            "pane_id": pane_id,
+            "surface_id": surface_id,
+        }))
+    }
+
+    fn request_close_active_surface(&mut self) -> bool {
+        let Some(surface_id) = self.active_surface_id() else {
+            return false;
+        };
+        self.request_close_surfaces(vec![surface_id])
+    }
+
+    fn request_close_surfaces(&mut self, surfaces: Vec<SurfaceId>) -> bool {
+        let terminals: Vec<_> = surfaces
+            .iter()
+            .filter_map(|surface| self.state.surfaces.get(surface))
+            .filter_map(|surface| match surface.kind {
+                SurfaceKind::Terminal(terminal) => Some(terminal),
+                _ => None,
+            })
+            .collect();
+        let process_count = terminals
+            .iter()
+            .map(|terminal| self.terminal_activity_count(*terminal))
+            .sum();
+        if process_count == 0 {
+            for surface in surfaces {
+                self.remove_surface_by_id(surface);
+            }
+            self.resize_terminals();
+            self.rebuild_scene();
+            return true;
+        }
+        self.close_confirmation = Some(CloseConfirmation {
+            target: CloseTarget::Surfaces(surfaces),
+            title: self.language.close_terminal_title().to_owned(),
+            message: self
+                .language
+                .close_terminal_warning(terminals.len(), process_count),
+        });
+        self.rebuild_scene();
+        false
+    }
+
+    /// Remove one surface without changing the user's active workspace, pane,
+    /// or tab merely to address the target.
+    fn remove_surface_by_id(&mut self, surface_id: SurfaceId) -> bool {
+        let Some(pane_id) = self
+            .state
+            .panes
+            .iter()
+            .find(|(_, pane)| pane.surfaces.contains(&surface_id))
+            .map(|(id, _)| *id)
+        else {
+            return false;
+        };
+        let Some(pane) = self.state.panes.get_mut(&pane_id) else {
+            return false;
+        };
+        let Some(index) = pane.surfaces.iter().position(|id| *id == surface_id) else {
+            return false;
+        };
+        pane.surfaces.remove(index);
+        if index < pane.active_surface {
+            pane.active_surface -= 1;
+        } else {
+            pane.active_surface = pane
+                .active_surface
+                .min(pane.surfaces.len().saturating_sub(1));
+        }
+        self.cleanup_surface_runtime(surface_id);
+        true
+    }
+
+    fn cleanup_surface_runtime(&mut self, surface_id: SurfaceId) {
+        self.surface_backends.remove(&surface_id);
+        self.document_scroll.remove(&surface_id);
+        self.agent_sessions.remove(&surface_id);
+        self.claude_subagents
+            .retain(|_, subagent| subagent.surface != surface_id);
+        if let Some(surface) = self.state.surfaces.remove(&surface_id)
+            && let SurfaceKind::Terminal(terminal) = surface.kind
+        {
+            self.terminals.remove(&terminal);
+            self.commands.remove(&terminal);
+            self.terminal_notices.remove(&terminal);
+            self.terminal_processes.remove(&terminal);
+            self.last_bell_notifications.remove(&terminal);
+            self.foreground_agents.remove(&terminal);
+            self.automatic_agent_status.remove(&terminal);
+        }
+    }
+
+    /// Remove one pane directly. Target lookup never mutates UI focus.
+    fn remove_pane_by_id(&mut self, pane_id: PaneId) -> bool {
+        let Some(workspace_index) = self
+            .state
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.root.contains(pane_id))
+        else {
+            return false;
+        };
+        let mut leaves = Vec::new();
+        self.state.workspaces[workspace_index]
+            .root
+            .leaves(&mut leaves);
+        if leaves.len() <= 1 {
+            return false;
+        }
+        let next = leaves
+            .iter()
+            .copied()
+            .find(|candidate| *candidate != pane_id)
+            .expect("multiple leaves include a survivor");
+        let Ok(root) = self.state.workspaces[workspace_index]
+            .root
+            .clone()
+            .remove(pane_id)
+        else {
+            return false;
+        };
+        self.state.workspaces[workspace_index].root = root;
+        if self.state.workspaces[workspace_index].active_pane == pane_id {
+            self.state.workspaces[workspace_index].active_pane = next;
+        }
+        if let Some(pane) = self.state.panes.remove(&pane_id) {
+            for surface in pane.surfaces {
+                self.cleanup_surface_runtime(surface);
+            }
+        }
+        true
+    }
+
+    fn close_active_surface_now(&mut self) -> bool {
+        let Some(pane_id) = self
+            .state
+            .active_workspace()
+            .map(|workspace| workspace.active_pane)
+        else {
+            return false;
+        };
+        let Some(pane) = self.state.panes.get_mut(&pane_id) else {
+            return false;
+        };
+        if pane.surfaces.is_empty() {
+            return false;
+        }
+        let surface_id = pane.surfaces.remove(pane.active_surface);
+        pane.active_surface = pane
+            .active_surface
+            .min(pane.surfaces.len().saturating_sub(1));
+        self.surface_backends.remove(&surface_id);
+        self.document_scroll.remove(&surface_id);
+        self.agent_sessions.remove(&surface_id);
+        self.claude_subagents
+            .retain(|_, subagent| subagent.surface != surface_id);
+        if let Some(surface) = self.state.surfaces.remove(&surface_id)
+            && let SurfaceKind::Terminal(terminal) = surface.kind
+        {
+            self.terminals.remove(&terminal);
+            self.commands.remove(&terminal);
+            self.terminal_notices.remove(&terminal);
+            self.terminal_processes.remove(&terminal);
+            self.last_bell_notifications.remove(&terminal);
+            self.foreground_agents.remove(&terminal);
+            self.automatic_agent_status.remove(&terminal);
+        }
+        self.resize_terminals();
+        self.rebuild_scene();
+        true
+    }
+
+    fn handle_exited_terminal_key(&mut self, event: &KeyEvent) -> bool {
+        let Some(terminal) = self.active_terminal_id().filter(|terminal| {
+            matches!(
+                self.terminal_notices.get(terminal),
+                Some(TerminalNotice::Exited(_))
+            )
+        }) else {
+            return false;
+        };
+        let reconnect = matches!(event.logical_key, Key::Named(NamedKey::Enter))
+            && !self.modifiers.control_key()
+            && !self.modifiers.shift_key()
+            && !self.modifiers.alt_key()
+            && !self.modifiers.super_key();
+        let close = matches!(&event.logical_key, Key::Character(value) if value.eq_ignore_ascii_case("d"))
+            && self.modifiers.control_key()
+            && !self.modifiers.shift_key()
+            && !self.modifiers.alt_key()
+            && !self.modifiers.super_key();
+        if close {
+            self.close_active_surface_now();
+            return true;
+        }
+        if !reconnect {
+            return false;
+        }
+        self.terminals.remove(&terminal);
+        match self.spawn_terminal(terminal) {
+            Ok(()) => {
+                if let Some(surface) = self.state.surfaces.values_mut().find(
+                    |surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal),
+                ) {
+                    surface.attention = AttentionState::None;
+                }
+                if let Some(index) = self.workspace_for_terminal(terminal)
+                    && let Some(workspace) = self.state.workspaces.get_mut(index)
+                {
+                    workspace.status = wmcterm_core::WorkspaceStatus::Idle;
+                }
+                self.resize_terminals();
+            }
+            Err(error) => {
+                tracing::error!(terminal=%terminal, %error, "reconnecting terminal failed");
+                self.report_terminal_notice(
+                    terminal,
+                    TerminalNotice::SpawnFailed(error.to_string()),
+                );
+            }
+        }
+        self.rebuild_scene();
+        true
+    }
+
+    fn cycle_surface(&mut self, direction: isize) {
+        let Some(pane_id) = self
+            .state
+            .active_workspace()
+            .map(|workspace| workspace.active_pane)
+        else {
+            return;
+        };
+        if let Some(pane) = self.state.panes.get_mut(&pane_id)
+            && !pane.surfaces.is_empty()
+        {
+            pane.active_surface =
+                pane.active_surface.wrapping_add_signed(direction) % pane.surfaces.len();
+        }
+        self.resize_terminals();
+        self.rebuild_scene();
+    }
+
+    fn activate_surface_id(&mut self, surface: SurfaceId) -> Result<()> {
+        let pane = self
+            .state
+            .panes
+            .values()
+            .find(|pane| pane.surfaces.contains(&surface))
+            .map(|pane| pane.id)
+            .context("surface does not belong to a pane")?;
+        let workspace_index = self
+            .state
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.root.contains(pane))
+            .context("surface does not belong to a workspace")?;
+        self.state.active_workspace = workspace_index;
+        self.state
+            .execute(AppCommand::Pane(PaneCommand::Focus { id: pane }))?;
+        self.state.execute(AppCommand::Surface(
+            wmcterm_core::SurfaceCommand::Activate { pane, surface },
+        ))?;
+        self.resize_terminals();
+        self.rebuild_scene();
+        Ok(())
+    }
+
+    fn focus_pane_direction(&mut self, direction: (f32, f32)) {
+        let Some(active) = self
+            .state
+            .active_workspace()
+            .map(|workspace| workspace.active_pane)
+        else {
+            return;
+        };
+        let rects = self.pane_rects();
+        let Some((_, current)) = rects.iter().find(|(pane, _)| *pane == active) else {
+            return;
+        };
+        let center = (
+            current.x + current.width / 2.0,
+            current.y + current.height / 2.0,
+        );
+        let target = rects
+            .iter()
+            .filter(|(pane, _)| *pane != active)
+            .filter_map(|(pane, rect)| {
+                let candidate = (rect.x + rect.width / 2.0, rect.y + rect.height / 2.0);
+                let delta = (candidate.0 - center.0, candidate.1 - center.1);
+                let forward = delta.0 * direction.0 + delta.1 * direction.1;
+                (forward > 0.0).then_some((*pane, forward + delta.0.abs() + delta.1.abs()))
+            })
+            .min_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|item| item.0);
+        if let Some(target) = target
+            && let Some(workspace) = self.state.workspaces.get_mut(self.state.active_workspace)
+        {
+            workspace.active_pane = target;
+            self.resize_terminals();
+            self.rebuild_scene();
+        }
+    }
+
+    fn close_active_pane(&mut self) {
+        let Some(workspace_index) = self
+            .state
+            .workspaces
+            .get(self.state.active_workspace)
+            .map(|_| self.state.active_workspace)
+        else {
+            return;
+        };
+        let pane_id = self.state.workspaces[workspace_index].active_pane;
+        let mut leaves = Vec::new();
+        self.state.workspaces[workspace_index]
+            .root
+            .leaves(&mut leaves);
+        if leaves.len() <= 1 {
+            return;
+        }
+        let next = leaves
+            .iter()
+            .copied()
+            .find(|id| *id != pane_id)
+            .unwrap_or(pane_id);
+        if let Ok(root) = self.state.workspaces[workspace_index]
+            .root
+            .clone()
+            .remove(pane_id)
+        {
+            self.state.workspaces[workspace_index].root = root;
+            self.state.workspaces[workspace_index].active_pane = next;
+            if let Some(pane) = self.state.panes.remove(&pane_id) {
+                for surface_id in pane.surfaces {
+                    self.surface_backends.remove(&surface_id);
+                    self.agent_sessions.remove(&surface_id);
+                    self.claude_subagents
+                        .retain(|_, subagent| subagent.surface != surface_id);
+                    if let Some(surface) = self.state.surfaces.remove(&surface_id)
+                        && let SurfaceKind::Terminal(terminal) = surface.kind
+                    {
+                        self.terminals.remove(&terminal);
+                        self.commands.remove(&terminal);
+                        self.terminal_notices.remove(&terminal);
+                        self.terminal_processes.remove(&terminal);
+                        self.last_bell_notifications.remove(&terminal);
+                        self.foreground_agents.remove(&terminal);
+                        self.automatic_agent_status.remove(&terminal);
+                    }
+                }
+            }
+            self.resize_terminals();
+            self.rebuild_scene();
+        }
+    }
+
+    /// Apply non-terminal navigation at the pointer. Returns true when a UI
+    /// control consumed the click and the terminal must not also receive it.
+    fn focus_at_cursor(&mut self) -> bool {
+        let (x, y) = self.cursor_position;
+        if self.titlebar_command_bounds().contains(x, y) {
+            self.palette_visible = true;
+            self.palette_index = 0;
+            self.palette_scroll = 0;
+            self.palette_hover = None;
+            self.rebuild_scene();
+            return true;
+        }
+        if let Some(action) = self
+            .titlebar_buttons()
+            .into_iter()
+            .find(|button| button.bounds.contains(x, y))
+            .map(|button| button.action)
+        {
+            self.execute_titlebar_action(action);
+            return true;
+        }
+        if self.sidebar_visible && self.workspace_search_bounds().contains(x, y) {
+            self.workspace_search_focused = true;
+            let bounds = self.workspace_search_bounds();
+            let character_width = 14.0 * 0.6;
+            let viewport = self.workspace_search.viewport(editor_columns(
+                bounds.width - 18.0 - 2.0 * character_width,
+                character_width,
+            ));
+            let column = viewport.start_column
+                + ((x - bounds.x - 26.0).max(0.0) / character_width).round() as usize;
+            self.workspace_search
+                .begin_pointer_selection(column, self.modifiers.shift_key());
+            self.text_edit_drag = Some(TextEditTarget::WorkspaceSearch);
+            self.mouse_pressed = true;
+            self.rebuild_scene();
+            return true;
+        }
+        if self.workspace_search_focused {
+            self.workspace_search_focused = false;
+            self.workspace_search.clear_preedit();
+        }
+        if self.state.workspaces.is_empty() && self.empty_workspace_button().contains(x, y) {
+            self.new_workspace();
+            return true;
+        }
+        if let Some(pane) = self.pane_rects().into_iter().find_map(|(pane, rect)| {
+            (self
+                .state
+                .panes
+                .get(&pane)
+                .is_some_and(|pane| pane.surfaces.is_empty())
+                && empty_pane_button(rect).contains(x, y))
+            .then_some(pane)
+        }) {
+            let _ = self
+                .state
+                .execute(AppCommand::Pane(PaneCommand::Focus { id: pane }));
+            self.new_surface_command(None);
+            return true;
+        }
+        let pending_requests = self.pending_agent_request_list();
+        let pending_count = pending_requests.len();
+        if self.notifications_visible && pending_count > 0 {
+            let visible = self.agent_request_range(pending_count);
+            let action_counts = pending_requests[visible.clone()]
+                .iter()
+                .map(|request| agent_approval_actions(request).len())
+                .collect::<Vec<_>>();
+            if let Some(hit) = ui::agent_approval_hit(
+                self.agent_approval_region(pending_count),
+                &action_counts,
+                x,
+                y,
+            ) {
+                let absolute = visible.start + hit.card;
+                if let Some(request) = pending_requests.get(absolute)
+                    && let Some(action) = agent_approval_actions(request).get(hit.action).copied()
+                {
+                    self.agent_request_selection = absolute;
+                    self.agent_request_action = hit.action;
+                    self.resolve_agent_request_from_ui(request.request_id.clone(), action);
+                }
+                return true;
+            }
+            let cards =
+                ui::agent_approval_cards(self.agent_approval_region(pending_count), &action_counts);
+            if let Some(card) = cards.iter().position(|card| card.content.contains(x, y)) {
+                let absolute = visible.start + card;
+                if let Some(request) = pending_requests.get(absolute) {
+                    self.agent_request_detail = Some((request.request_id.clone(), 0));
+                    self.rebuild_scene();
+                    return true;
+                }
+            }
+        }
+        let notification_panel = self.notification_list_panel(pending_count);
+        let notification_range = self.notification_range();
+        if self.notifications_visible
+            && notification_panel.contains(x, y)
+            && let Some(hit) =
+                ui::notification_row_at(notification_panel, notification_range.len(), x, y)
+        {
+            let index = match hit {
+                ui::NotificationRowHit::Open(index) | ui::NotificationRowHit::Close(index) => index,
+            };
+            let target = self
+                .state
+                .notifications
+                .iter()
+                .rev()
+                .nth(notification_range.start + index)
+                .map(|item| item.id);
+            if let Some(notification) = target {
+                match hit {
+                    ui::NotificationRowHit::Open(_) => self.focus_notification(notification),
+                    ui::NotificationRowHit::Close(_) => self.clear_notification(notification),
+                }
+                return true;
+            }
+        }
+        if self.sidebar_visible && x < self.sidebar_width() {
+            let layout = self.sidebar_layout();
+            if let Some(index) = layout
+                .rows
+                .iter()
+                .find(|row| row.bounds.contains(x, y))
+                .map(|row| row.index)
+            {
+                self.state.active_workspace = index;
+                self.resize_terminals();
+                self.rebuild_scene();
+                return true;
+            }
+            if layout.new_workspace.contains(x, y) {
+                self.new_workspace();
+                return true;
+            }
+        }
+        if let Some((pane, rect)) = self.pane_rects().into_iter().find(|(_, rect)| {
+            x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+        }) {
+            let _ = self
+                .state
+                .execute(AppCommand::Pane(PaneCommand::Focus { id: pane }));
+            if y < rect.y + 25.0 {
+                if self.surface_new_tab_bounds(rect).contains(x, y) {
+                    self.new_surface_command(None);
+                    return true;
+                }
+                let tabs = self.surface_tabs_layout(pane, rect);
+                if let Some(index) = tabs
+                    .iter()
+                    .find(|tab| tab.close.is_some_and(|close| close.contains(x, y)))
+                    .map(|tab| tab.index)
+                {
+                    if let Some(pane_state) = self.state.panes.get_mut(&pane) {
+                        pane_state.active_surface = index;
+                    }
+                    self.request_close_active_surface();
+                    return true;
+                }
+                if let Some(index) = tabs
+                    .iter()
+                    .find(|tab| tab.bounds.contains(x, y))
+                    .map(|tab| tab.index)
+                    && let Some(pane_state) = self.state.panes.get_mut(&pane)
+                {
+                    pane_state.active_surface = index;
+                }
+                self.resize_terminals();
+                self.rebuild_scene();
+                return true;
+            }
+            self.resize_terminals();
+            self.rebuild_scene();
+        }
+        false
+    }
+
+    fn jump_latest_unread(&mut self) {
+        if let Some(notification) = self
+            .state
+            .notifications
+            .iter()
+            .rev()
+            .find(|item| !item.read)
+            .map(|item| item.id)
+        {
+            self.focus_notification(notification);
+        }
+    }
+
+    fn toggle_current_notification_unread(&mut self) {
+        let Some(workspace) = self.state.active_workspace() else {
+            return;
+        };
+        let Some(surface) = self
+            .state
+            .panes
+            .get(&workspace.active_pane)
+            .and_then(|pane| pane.active_surface())
+        else {
+            return;
+        };
+        if let Some(notification) = self
+            .state
+            .notifications
+            .iter_mut()
+            .rev()
+            .find(|notification| notification.surface == surface)
+        {
+            notification.read = !notification.read;
+            self.sync_notification_attention(surface);
+            self.rebuild_scene();
+        }
+    }
+
+    fn focus_notification(&mut self, notification: uuid::Uuid) {
+        let Some(destination) = notification_destination(&self.state, notification) else {
+            return;
+        };
+        self.state.active_workspace = destination.workspace_index;
+        if let Some((pane_id, surface_index)) = destination.pane {
+            if let Some(workspace) = self.state.workspaces.get_mut(destination.workspace_index) {
+                workspace.active_pane = pane_id;
+            }
+            if let Some(pane) = self.state.panes.get_mut(&pane_id) {
+                pane.active_surface = surface_index;
+            }
+        }
+        if let Some(item) = self
+            .state
+            .notifications
+            .iter_mut()
+            .find(|item| item.id == notification)
+        {
+            item.read = true;
+        }
+        self.sync_notification_attention(destination.surface);
+        self.resize_terminals();
+        self.rebuild_scene();
+    }
+
+    fn set_notification_read(&mut self, notification: uuid::Uuid, read: bool) {
+        let surface = self
+            .state
+            .notifications
+            .iter_mut()
+            .find(|item| item.id == notification)
+            .map(|item| {
+                item.read = read;
+                item.surface
+            });
+        if let Some(surface) = surface {
+            self.sync_notification_attention(surface);
+        }
+    }
+
+    fn mark_all_notifications_read(&mut self) {
+        let mut surfaces = self
+            .state
+            .notifications
+            .iter_mut()
+            .filter(|notification| !notification.read)
+            .map(|notification| {
+                notification.read = true;
+                notification.surface
+            })
+            .collect::<Vec<_>>();
+        surfaces.sort_unstable();
+        surfaces.dedup();
+        for surface in surfaces {
+            self.sync_notification_attention(surface);
+        }
+        if self.navigation_hover == Some(NavigationHover::NotificationMarkAllRead) {
+            self.navigation_hover = None;
+            self.update_cursor_icon();
+        }
+        self.rebuild_scene();
+    }
+
+    fn has_unread_notifications(&self) -> bool {
+        self.state
+            .notifications
+            .iter()
+            .any(|notification| !notification.read)
+    }
+
+    fn mark_terminal_notifications_read(&mut self, terminal: TerminalId) -> bool {
+        let Some(surface) = self.surface_for_terminal(terminal) else {
+            return false;
+        };
+        if !mark_surface_notifications_read(&mut self.state.notifications, surface) {
+            return false;
+        }
+        self.sync_notification_attention(surface);
+        true
+    }
+
+    fn clear_notification(&mut self, notification: uuid::Uuid) {
+        let surface = self
+            .state
+            .notifications
+            .iter()
+            .find(|item| item.id == notification)
+            .map(|item| item.surface);
+        self.state
+            .notifications
+            .retain(|item| item.id != notification);
+        if let Some(surface) = surface {
+            self.sync_notification_attention(surface);
+        }
+        let last = self.state.notifications.len().saturating_sub(1);
+        self.notification_selection = self.notification_selection.min(last);
+        self.notification_scroll = self.notification_scroll.min(last);
+        self.rebuild_scene();
+    }
+
+    fn sync_notification_attention(&mut self, surface: SurfaceId) {
+        self.sync_surface_agent_request_state(surface);
+    }
+
+    fn sync_surface_agent_request_state(&mut self, surface_id: SurfaceId) {
+        let requests = self.pending_agent_request_list();
+        let pending_state = pending_agent_state_for_surface(&requests, surface_id);
+        let session_state = self
+            .agent_sessions
+            .get(&surface_id)
+            .map(|session| session.state);
+        let current_state = self
+            .state
+            .surfaces
+            .get(&surface_id)
+            .and_then(|surface| surface.agent.as_ref())
+            .map(|agent| agent.state);
+        let preserved_attention = self
+            .state
+            .surfaces
+            .get(&surface_id)
+            .map(|surface| surface.attention)
+            .filter(|attention| {
+                matches!(attention, AttentionState::Activity | AttentionState::Error)
+            });
+        let agent_state = effective_agent_state(pending_state, session_state, current_state);
+
+        let notification_attention = self
+            .state
+            .notifications
+            .iter()
+            .rev()
+            .filter(|item| item.surface == surface_id && !item.read)
+            .map(|item| item.attention)
+            .max_by_key(|attention| attention_priority(*attention));
+        let terminal_attention = self
+            .state
+            .surfaces
+            .get(&surface_id)
+            .and_then(|surface| match surface.kind {
+                SurfaceKind::Terminal(terminal) => self.terminal_notices.get(&terminal),
+                _ => None,
+            })
+            .map(|notice| match notice {
+                TerminalNotice::Exited(_) => AttentionState::Activity,
+                TerminalNotice::Error(_) | TerminalNotice::SpawnFailed(_) => AttentionState::Error,
+            });
+        let attention = [
+            pending_state.map(|_| AttentionState::NeedsInput),
+            notification_attention,
+            agent_state.map(agent_state_attention),
+            terminal_attention,
+            preserved_attention,
+        ]
+        .into_iter()
+        .flatten()
+        .max_by_key(|attention| attention_priority(*attention))
+        .unwrap_or_default();
+
+        if let Some(surface) = self.state.surfaces.get_mut(&surface_id) {
+            if let (Some(agent), Some(state)) = (&mut surface.agent, agent_state) {
+                agent.state = state;
+            }
+            surface.attention = attention;
+        }
+        if let Some(workspace_index) = self.workspace_for_surface(surface_id) {
+            self.sync_workspace_agent_status(workspace_index);
+        }
+    }
+
+    fn workspace_for_surface(&self, surface: SurfaceId) -> Option<usize> {
+        let pane = self
+            .state
+            .panes
+            .values()
+            .find(|pane| pane.surfaces.contains(&surface))?
+            .id;
+        self.state
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.root.contains(pane))
+    }
+
+    fn sync_workspace_agent_status(&mut self, workspace_index: usize) {
+        let priority = self.workspace_agent_priority(workspace_index);
+        let has_terminal_error =
+            self.state
+                .workspaces
+                .get(workspace_index)
+                .is_some_and(|workspace| {
+                    let mut pane_ids = Vec::new();
+                    workspace.root.leaves(&mut pane_ids);
+                    pane_ids
+                        .iter()
+                        .filter_map(|pane| self.state.panes.get(pane))
+                        .flat_map(|pane| pane.surfaces.iter())
+                        .filter_map(|surface| self.state.surfaces.get(surface))
+                        .filter_map(|surface| match surface.kind {
+                            SurfaceKind::Terminal(terminal) => Some(terminal),
+                            _ => None,
+                        })
+                        .any(|terminal| {
+                            matches!(
+                                self.terminal_notices.get(&terminal),
+                                Some(TerminalNotice::Error(_) | TerminalNotice::SpawnFailed(_))
+                            )
+                        })
+                });
+        if let Some(workspace) = self.state.workspaces.get_mut(workspace_index) {
+            workspace.status = if has_terminal_error {
+                wmcterm_core::WorkspaceStatus::Error
+            } else {
+                workspace_status_for_agent_priority(priority)
+            };
+        }
+    }
+
+    fn tab_at_cursor(&self) -> Option<(PaneId, SurfaceId)> {
+        let (x, y) = self.cursor_position;
+        let (pane, rect) = self.pane_rects().into_iter().find(|(_, rect)| {
+            x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + 25.0
+        })?;
+        let index = self
+            .surface_tabs_layout(pane, rect)
+            .iter()
+            .find(|tab| tab.bounds.contains(x, y))?
+            .index;
+        let surface = *self.state.panes.get(&pane)?.surfaces.get(index)?;
+        Some((pane, surface))
+    }
+
+    fn open_tab_context_menu(&mut self) -> bool {
+        let Some((pane, surface)) = self.tab_at_cursor() else {
+            return false;
+        };
+        self.tab_context_menu = Some(TabContextMenu {
+            pane,
+            surface,
+            anchor: self.cursor_position,
+        });
+        self.workspace_context_menu = None;
+        self.terminal_context_menu = None;
+        self.notification_context_menu = None;
+        self.rebuild_scene();
+        true
+    }
+
+    fn open_workspace_context_menu(&mut self) -> bool {
+        let (x, y) = self.cursor_position;
+        if !self.sidebar_visible || x >= self.sidebar_width() {
+            return false;
+        }
+        let layout = self.sidebar_layout();
+        let Some(index) = layout
+            .rows
+            .iter()
+            .find(|row| row.bounds.contains(x, y))
+            .map(|row| row.index)
+        else {
+            return false;
+        };
+        let Some(workspace) = self.state.workspaces.get(index) else {
+            return false;
+        };
+        self.state.active_workspace = index;
+        self.workspace_context_menu = Some(WorkspaceContextMenu {
+            workspace: workspace.id,
+            anchor: self.cursor_position,
+        });
+        self.tab_context_menu = None;
+        self.terminal_context_menu = None;
+        self.notification_context_menu = None;
+        self.resize_terminals();
+        self.rebuild_scene();
+        true
+    }
+
+    fn open_terminal_context_menu(&mut self) -> bool {
+        let Some((pane, terminal)) = self.terminal_at_cursor() else {
+            return false;
+        };
+        if let Some(workspace) = self.state.workspaces.get_mut(self.state.active_workspace) {
+            workspace.active_pane = pane;
+        }
+        self.terminal_context_menu = Some(TerminalContextMenu {
+            pane,
+            terminal,
+            anchor: self.cursor_position,
+        });
+        self.tab_context_menu = None;
+        self.workspace_context_menu = None;
+        self.notification_context_menu = None;
+        self.mark_terminal_notifications_read(terminal);
+        self.rebuild_scene();
+        true
+    }
+
+    fn notification_at_cursor(&self) -> Option<uuid::Uuid> {
+        if !self.notifications_visible {
+            return None;
+        }
+        let (x, y) = self.cursor_position;
+        let pending_count = self.pending_agent_requests.len().unwrap_or_default();
+        let panel = self.notification_list_panel(pending_count);
+        let visible = self.notification_range();
+        let hit = ui::notification_row_at(panel, visible.len(), x, y)?;
+        let row = match hit {
+            ui::NotificationRowHit::Open(row) | ui::NotificationRowHit::Close(row) => row,
+        };
+        self.state
+            .notifications
+            .iter()
+            .rev()
+            .nth(visible.start + row)
+            .map(|item| item.id)
+    }
+
+    fn open_notification_context_menu(&mut self) -> bool {
+        let Some(notification) = self.notification_at_cursor() else {
+            return false;
+        };
+        self.notification_context_menu = Some(NotificationContextMenu {
+            notification,
+            anchor: self.cursor_position,
+        });
+        self.tab_context_menu = None;
+        self.workspace_context_menu = None;
+        self.terminal_context_menu = None;
+        self.rebuild_scene();
+        true
+    }
+
+    fn execute_notification_context_action(&mut self, action: NotificationContextAction) {
+        let Some(menu) = self.notification_context_menu.take() else {
+            return;
+        };
+        match action {
+            NotificationContextAction::Open => self.focus_notification(menu.notification),
+            NotificationContextAction::ToggleRead => {
+                if let Some(read) = self
+                    .state
+                    .notifications
+                    .iter()
+                    .find(|item| item.id == menu.notification)
+                    .map(|item| item.read)
+                {
+                    self.set_notification_read(menu.notification, !read);
+                }
+                self.rebuild_scene();
+            }
+            NotificationContextAction::Clear => self.clear_notification(menu.notification),
+        }
+    }
+
+    fn execute_terminal_context_action(&mut self, action: TerminalContextAction) {
+        let Some(menu) = self.terminal_context_menu.take() else {
+            return;
+        };
+        if !terminal_context_action_enabled(action, self.selection, menu.pane) {
+            self.rebuild_scene();
+            return;
+        }
+        match action {
+            TerminalContextAction::Copy => {
+                self.copy_selection_to_clipboard();
+            }
+            TerminalContextAction::Paste => {
+                if let Some(text) = self
+                    .clipboard
+                    .as_mut()
+                    .and_then(|clipboard| clipboard.get_text().ok())
+                {
+                    let notifications_changed =
+                        self.mark_terminal_notifications_read(menu.terminal);
+                    if let Some(runtime) = self.terminals.get(&menu.terminal) {
+                        let _ = runtime.session.send(SessionCommand::Paste(text));
+                    }
+                    if notifications_changed {
+                        self.rebuild_scene();
+                    }
+                }
+            }
+            TerminalContextAction::CopyAll => {
+                if let Some(runtime) = self.terminals.get(&menu.terminal) {
+                    let _ = runtime.session.send(SessionCommand::CopyAll);
+                }
+            }
+            TerminalContextAction::ClearScrollback => {
+                if let Some(runtime) = self.terminals.get(&menu.terminal) {
+                    let _ = runtime.session.send(SessionCommand::ClearScrollback);
+                }
+            }
+        }
+        self.rebuild_scene();
+    }
+
+    fn execute_tab_context_action(&mut self, action: TabContextAction) {
+        let Some(menu) = self.tab_context_menu.take() else {
+            return;
+        };
+        let Some(index) = self
+            .state
+            .panes
+            .get(&menu.pane)
+            .and_then(|pane| pane.surfaces.iter().position(|id| *id == menu.surface))
+        else {
+            self.rebuild_scene();
+            return;
+        };
+        if let Some(workspace) = self.state.workspaces.get_mut(self.state.active_workspace) {
+            workspace.active_pane = menu.pane;
+        }
+        if let Some(pane) = self.state.panes.get_mut(&menu.pane) {
+            pane.active_surface = index;
+        }
+        let tab_count = self
+            .state
+            .panes
+            .get(&menu.pane)
+            .map(|pane| pane.surfaces.len())
+            .unwrap_or(0);
+        if !tab_context_action_enabled(action, tab_count) {
+            self.rebuild_scene();
+            return;
+        }
+        match action {
+            TabContextAction::Close => {
+                self.request_close_active_surface();
+            }
+            TabContextAction::CloseOthers => {
+                let others = self
+                    .state
+                    .panes
+                    .get(&menu.pane)
+                    .map(|pane| {
+                        pane.surfaces
+                            .iter()
+                            .copied()
+                            .filter(|surface| *surface != menu.surface)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                self.request_close_surfaces(others);
+                if let Some(pane) = self.state.panes.get_mut(&menu.pane) {
+                    pane.active_surface = pane
+                        .surfaces
+                        .iter()
+                        .position(|id| *id == menu.surface)
+                        .unwrap_or(0);
+                }
+                self.resize_terminals();
+                self.rebuild_scene();
+            }
+            TabContextAction::NewSurface => {
+                self.new_surface_command(None);
+            }
+        }
+    }
+
+    fn execute_workspace_context_action(&mut self, action: WorkspaceContextAction) {
+        let Some(menu) = self.workspace_context_menu.take() else {
+            return;
+        };
+        let Some(index) = self
+            .state
+            .workspaces
+            .iter()
+            .position(|workspace| workspace.id == menu.workspace)
+        else {
+            self.rebuild_scene();
+            return;
+        };
+        self.state.active_workspace = index;
+        if !workspace_context_action_enabled(action, self.state.workspaces.len()) {
+            self.rebuild_scene();
+            return;
+        }
+        match action {
+            WorkspaceContextAction::NewSurface => {
+                self.new_surface_command(None);
+            }
+            WorkspaceContextAction::Rename => {
+                self.open_workspace_prompt(PromptKind::RenameWorkspace);
+            }
+            WorkspaceContextAction::Describe => {
+                self.open_workspace_prompt(PromptKind::DescribeWorkspace);
+            }
+            WorkspaceContextAction::ChangeDirectory => {
+                self.open_workspace_prompt(PromptKind::ChangeWorkspaceDirectory);
+            }
+            WorkspaceContextAction::TogglePin => {
+                let pinned = self.state.workspaces[index].pinned;
+                let _ = self
+                    .state
+                    .execute(AppCommand::Workspace(WorkspaceCommand::Pin {
+                        id: menu.workspace,
+                        pinned: !pinned,
+                    }));
+                self.rebuild_scene();
+            }
+            WorkspaceContextAction::Close => self.request_close_workspace(),
+        }
+    }
+
+    fn begin_mouse_action(&mut self) {
+        if self.workspace_search_focused
+            && !self
+                .workspace_search_bounds()
+                .contains(self.cursor_position.0, self.cursor_position.1)
+        {
+            self.workspace_search_focused = false;
+            self.workspace_search.clear_preedit();
+            self.rebuild_scene();
+        }
+        if self.handle_overlay_click() {
+            return;
+        }
+        if let Some(direction) =
+            self.window_resize_direction(self.cursor_position.0, self.cursor_position.1)
+        {
+            if let Some(renderer) = &self.renderer {
+                let _ = renderer.window().drag_resize_window(direction);
+            }
+            return;
+        }
+        self.mouse_pressed = true;
+        let (x, y) = self.cursor_position;
+        if self.sidebar_resize_hit(x, y) {
+            self.sidebar_drag = true;
+            return;
+        }
+        if self.begin_scrollbar_action() {
+            return;
+        }
+        if let Some(workspace) = self.state.active_workspace() {
+            let zoomed = self
+                .state
+                .panes
+                .get(&workspace.active_pane)
+                .is_some_and(|pane| pane.zoomed);
+            let area = terminal_workspace_area(
+                self.window_size.width as f32,
+                self.window_size.height as f32,
+                self.sidebar_width(),
+            );
+            if !zoomed && let Some(drag) = divider_at(&workspace.root, area, x, y, &mut Vec::new())
+            {
+                self.split_drag = Some(drag);
+                return;
+            }
+        }
+        if self.focus_at_cursor() {
+            if self.text_edit_drag.is_none() {
+                self.mouse_pressed = false;
+            }
+            return;
+        }
+        if y < 40.0 {
+            if let Some(renderer) = &self.renderer {
+                let now = std::time::Instant::now();
+                if self
+                    .last_titlebar_click
+                    .is_some_and(|(previous, position)| {
+                        titlebar_double_click(previous, position, now, (x, y))
+                    })
+                {
+                    let window = renderer.window();
+                    window.set_maximized(!window.is_maximized());
+                    self.last_titlebar_click = None;
+                } else {
+                    self.last_titlebar_click = Some((now, (x, y)));
+                    let _ = renderer.window().drag_window();
+                }
+            }
+            self.mouse_pressed = false;
+            return;
+        }
+        if let Some((_, terminal)) = self.terminal_at_cursor()
+            && self.mark_terminal_notifications_read(terminal)
+        {
+            self.rebuild_scene();
+        }
+        if !self.modifiers.shift_key()
+            && self.send_terminal_mouse(MouseActionInput::Press, Some(MouseButtonInput::Left))
+        {
+            self.terminal_mouse_capture = self.terminal_at_cursor();
+            self.selection = None;
+            return;
+        }
+        if let Some((pane, terminal, cell)) = self.cell_at_cursor() {
+            let now = std::time::Instant::now();
+            let word_bounds = self.terminal_word_bounds(terminal, cell);
+            let click_cell = word_bounds.map_or(cell, |(start, _)| start);
+            let double_click = self.last_terminal_click.is_some_and(|previous| {
+                previous.pane == pane
+                    && previous.terminal == terminal
+                    && previous.cell == click_cell
+                    && terminal_double_click(previous.at, now)
+            });
+            self.last_terminal_click = Some(TerminalClick {
+                at: now,
+                pane,
+                terminal,
+                cell: click_cell,
+            });
+            if double_click && let Some((start, end)) = word_bounds {
+                self.selection = Some(MouseSelection {
+                    pane,
+                    terminal,
+                    start,
+                    end,
+                });
+                // Keep the word boundary stable if a queued pointer-motion event
+                // arrives before the second button release.
+                self.mouse_pressed = false;
+                self.last_terminal_click = None;
+                self.rebuild_scene();
+                return;
+            }
+            self.selection = Some(MouseSelection {
+                pane,
+                terminal,
+                start: cell,
+                end: cell,
+            });
+            self.selection_last_redraw = None;
+            self.selection_autoscroll_last = None;
+        } else {
+            self.selection = None;
+            self.selection_last_redraw = None;
+            self.selection_autoscroll_last = None;
+        }
+    }
+
+    fn terminal_word_bounds(
+        &self,
+        terminal: TerminalId,
+        cell: (usize, usize),
+    ) -> Option<((usize, usize), (usize, usize))> {
+        let snapshot = &self.terminals.get(&terminal)?.snapshot;
+        let viewport_row = cell.1.checked_sub(snapshot.screen_row_origin)?;
+        let row = snapshot.cells.get(viewport_row)?;
+        let (start, end) = word_cell_bounds(row, cell.0)?;
+        Some(((start, cell.1), (end, cell.1)))
+    }
+
+    fn scrollbar_at_cursor(&self) -> Option<(PaneId, TerminalId, ui::ScrollbarLayout)> {
+        let (x, y) = self.cursor_position;
+        let (pane, rect) = self.pane_rects().into_iter().find(|(_, rect)| {
+            x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
+        })?;
+        let terminal = self
+            .state
+            .panes
+            .get(&pane)
+            .and_then(|pane| pane.active_surface())
+            .and_then(|surface| self.state.surfaces.get(&surface))
+            .and_then(|surface| match surface.kind {
+                SurfaceKind::Terminal(terminal) => Some(terminal),
+                _ => None,
+            })?;
+        let snapshot = &self.terminals.get(&terminal)?.snapshot;
+        let layout = ui::terminal_scrollbar_layout(
+            ui::Bounds {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+            },
+            snapshot.rows as usize,
+            snapshot.scrollback_rows,
+            snapshot.viewport_offset,
+        )?;
+        layout
+            .track
+            .contains(x, y)
+            .then_some((pane, terminal, layout))
+    }
+
+    fn begin_scrollbar_action(&mut self) -> bool {
+        let Some((pane, terminal, layout)) = self.scrollbar_at_cursor() else {
+            return false;
+        };
+        let (x, y) = self.cursor_position;
+        let _ = self
+            .state
+            .execute(AppCommand::Pane(PaneCommand::Focus { id: pane }));
+        if layout.thumb.contains(x, y) {
+            let last_offset = self
+                .terminals
+                .get(&terminal)
+                .map(|runtime| runtime.snapshot.viewport_offset)
+                .unwrap_or_default()
+                .min(layout.max_offset);
+            self.scrollbar_drag = Some(ScrollbarDrag {
+                pane,
+                terminal,
+                grab_y: y - layout.thumb.y,
+                last_offset,
+            });
+        } else if let Some(delta) = layout.page_delta_at(y) {
+            if let Some(runtime) = self.terminals.get(&terminal) {
+                let _ = runtime.session.send(SessionCommand::Scroll(delta));
+            }
+            self.mouse_pressed = false;
+        }
+        self.rebuild_scene();
+        true
+    }
+
+    fn update_scrollbar_drag(&mut self) -> bool {
+        let Some(mut drag) = self.scrollbar_drag else {
+            return false;
+        };
+        let Some((_, rect)) = self
+            .pane_rects()
+            .into_iter()
+            .find(|(pane, _)| *pane == drag.pane)
+        else {
+            self.scrollbar_drag = None;
+            return true;
+        };
+        let Some(runtime) = self.terminals.get(&drag.terminal) else {
+            self.scrollbar_drag = None;
+            return true;
+        };
+        let Some(layout) = ui::terminal_scrollbar_layout(
+            ui::Bounds {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+            },
+            runtime.snapshot.rows as usize,
+            runtime.snapshot.scrollback_rows,
+            drag.last_offset,
+        ) else {
+            self.scrollbar_drag = None;
+            return true;
+        };
+        let target = layout.offset_for_pointer(self.cursor_position.1, drag.grab_y);
+        if target != drag.last_offset {
+            let delta = drag.last_offset as isize - target as isize;
+            let _ = runtime.session.send(SessionCommand::Scroll(delta));
+            drag.last_offset = target;
+            self.scrollbar_drag = Some(drag);
+        }
+        true
+    }
+
+    fn handle_overlay_click(&mut self) -> bool {
+        let (x, y) = self.cursor_position;
+        if self.close_confirmation.is_some() {
+            let (cancel, confirm) = self.confirmation_buttons();
+            if confirm.contains(x, y) {
+                self.confirm_close();
+            } else if cancel.contains(x, y) {
+                self.close_confirmation = None;
+                self.rebuild_scene();
+            }
+            return true;
+        }
+        if self.agent_request_detail.is_some() {
+            self.agent_request_detail = None;
+            self.rebuild_scene();
+            return true;
+        }
+        if let Some(menu) = self.notification_context_menu {
+            let bounds = ui::popup_menu(
+                menu.anchor.0,
+                menu.anchor.1,
+                self.window_size.width as f32,
+                self.window_size.height as f32,
+                NOTIFICATION_CONTEXT_WIDTH,
+                30.0,
+                NOTIFICATION_CONTEXT_ACTIONS.len(),
+            );
+            let action = ui::menu_row_at(bounds, x, y, 30.0, NOTIFICATION_CONTEXT_ACTIONS.len())
+                .and_then(|index| NOTIFICATION_CONTEXT_ACTIONS.get(index).copied());
+            if let Some(action) = action {
+                self.execute_notification_context_action(action);
+            } else {
+                self.notification_context_menu = None;
+                if !self.notification_panel().contains(x, y) {
+                    self.notifications_visible = false;
+                    self.notification_scroll = 0;
+                    self.notification_selection = 0;
+                }
+                self.rebuild_scene();
+            }
+            return true;
+        }
+        if let Some(menu) = self.terminal_context_menu {
+            let bounds = ui::popup_menu(
+                menu.anchor.0,
+                menu.anchor.1,
+                self.window_size.width as f32,
+                self.window_size.height as f32,
+                TERMINAL_CONTEXT_WIDTH,
+                30.0,
+                TERMINAL_CONTEXT_ACTIONS.len(),
+            );
+            let action = ui::menu_row_at(bounds, x, y, 30.0, TERMINAL_CONTEXT_ACTIONS.len())
+                .and_then(|index| TERMINAL_CONTEXT_ACTIONS.get(index).copied());
+            if let Some(action) = action {
+                self.execute_terminal_context_action(action);
+            } else {
+                self.terminal_context_menu = None;
+                self.rebuild_scene();
+            }
+            return true;
+        }
+        if let Some(menu) = self.tab_context_menu {
+            let bounds = ui::popup_menu(
+                menu.anchor.0,
+                menu.anchor.1,
+                self.window_size.width as f32,
+                self.window_size.height as f32,
+                TAB_CONTEXT_WIDTH,
+                30.0,
+                TAB_CONTEXT_ACTIONS.len(),
+            );
+            let action = ui::menu_row_at(bounds, x, y, 30.0, TAB_CONTEXT_ACTIONS.len())
+                .and_then(|index| TAB_CONTEXT_ACTIONS.get(index).copied());
+            if let Some(action) = action {
+                self.execute_tab_context_action(action);
+            } else {
+                self.tab_context_menu = None;
+                self.rebuild_scene();
+            }
+            return true;
+        }
+        if let Some(menu) = self.workspace_context_menu {
+            let bounds = ui::popup_menu(
+                menu.anchor.0,
+                menu.anchor.1,
+                self.window_size.width as f32,
+                self.window_size.height as f32,
+                WORKSPACE_CONTEXT_WIDTH,
+                30.0,
+                WORKSPACE_CONTEXT_ACTIONS.len(),
+            );
+            let action = ui::menu_row_at(bounds, x, y, 30.0, WORKSPACE_CONTEXT_ACTIONS.len())
+                .and_then(|index| WORKSPACE_CONTEXT_ACTIONS.get(index).copied());
+            if let Some(action) = action {
+                self.execute_workspace_context_action(action);
+            } else {
+                self.workspace_context_menu = None;
+                self.rebuild_scene();
+            }
+            return true;
+        }
+        if self.prompt.is_some() {
+            let input = self.prompt_input_bounds();
+            if input.contains(x, y)
+                && let Some(prompt) = &mut self.prompt
+            {
+                let character_width = 15.0 * 0.6;
+                let text_x = input.x + 10.0 + 2.0 * character_width;
+                let viewport = prompt.editor.viewport(editor_columns(
+                    input.width - 20.0 - 2.0 * character_width,
+                    character_width,
+                ));
+                let column = viewport.start_column
+                    + ((x - text_x).max(0.0) / character_width).round() as usize;
+                prompt
+                    .editor
+                    .begin_pointer_selection(column, self.modifiers.shift_key());
+                self.text_edit_drag = Some(TextEditTarget::Prompt);
+                self.mouse_pressed = true;
+                prompt.error = None;
+                self.rebuild_scene();
+            }
+            return true;
+        }
+        if self.palette_visible {
+            let registry = ActionRegistry::default();
+            let actions = self.palette_actions(&registry);
+            let capacity =
+                (((self.window_size.height as f32 - 150.0) / 25.0) as usize).clamp(3, 12);
+            let visible = ui::scrolled_range(actions.len(), self.palette_scroll, capacity);
+            let panel = self.command_palette_panel(actions.len());
+            let command = self.titlebar_command_bounds();
+            if command.contains(x, y) {
+                let prefix = format!("{}  > ", self.language.command_palette());
+                let query_left = command.x + 12.0 + ui::display_width(&prefix) as f32 * 14.0 * 0.6;
+                let character_width = 14.0 * 0.6;
+                let viewport = self.palette_query.viewport(editor_columns(
+                    command.width - 24.0 - ui::display_width(&prefix) as f32 * character_width,
+                    character_width,
+                ));
+                let column = viewport.start_column
+                    + ((x - query_left).max(0.0) / character_width).round() as usize;
+                self.palette_query
+                    .begin_pointer_selection(column, self.modifiers.shift_key());
+                self.text_edit_drag = Some(TextEditTarget::Palette);
+                self.mouse_pressed = true;
+                self.rebuild_scene();
+                return true;
+            }
+            if !panel.contains(x, y) {
+                self.palette_visible = false;
+                self.palette_hover = None;
+                self.palette_query.clear_preedit();
+                self.rebuild_scene();
+                return true;
+            }
+            if panel.contains(x, y)
+                && let Some(row) = ui::palette_row_at(panel, visible.len(), x, y)
+            {
+                self.palette_index = visible.start + row;
+                self.palette_hover = Some(self.palette_index);
+                self.execute_palette_action();
+            }
+            return true;
+        }
+        if self.search_visible {
+            let width = 430.0_f32
+                .min(self.window_size.width as f32 - 32.0)
+                .max(220.0);
+            let left = (self.window_size.width as f32 - width - 16.0).max(16.0);
+            if (ui::Bounds {
+                x: left,
+                y: 8.0,
+                width,
+                height: 30.0,
+            })
+            .contains(x, y)
+            {
+                let character_width = 14.0 * 0.6;
+                let label_columns = ui::display_width(self.language.find()) + 2;
+                let text_x = left + 10.0 + label_columns as f32 * character_width;
+                let viewport = self.search_editor.viewport(editor_columns(
+                    width - 20.0 - label_columns as f32 * character_width,
+                    character_width,
+                ));
+                let column = viewport.start_column
+                    + ((x - text_x).max(0.0) / character_width).round() as usize;
+                self.search_editor
+                    .begin_pointer_selection(column, self.modifiers.shift_key());
+                self.text_edit_drag = Some(TextEditTarget::Search);
+                self.mouse_pressed = true;
+                self.rebuild_scene();
+                return true;
+            }
+        }
+        match notification_overlay_press(
+            self.notifications_visible,
+            self.notification_panel(),
+            x,
+            y,
+        ) {
+            NotificationOverlayPress::Inside => {
+                if ui::notification_mark_all_read_hit(
+                    self.notification_panel(),
+                    self.has_unread_notifications(),
+                    x,
+                    y,
+                ) {
+                    self.mark_all_notifications_read();
+                    return true;
+                }
+                self.focus_at_cursor();
+                return true;
+            }
+            NotificationOverlayPress::DismissAndPropagate => {
+                self.notifications_visible = false;
+                self.notification_scroll = 0;
+                self.notification_selection = 0;
+                self.notification_context_menu = None;
+                self.rebuild_scene();
+                // Losing focus dismisses the floating panel, while the same
+                // press continues to the terminal or other target underneath.
+            }
+            NotificationOverlayPress::Inactive => {}
+        }
+        false
+    }
+
+    fn dismiss_notifications_outside_cursor(&mut self) -> bool {
+        let (x, y) = self.cursor_position;
+        if notification_overlay_press(self.notifications_visible, self.notification_panel(), x, y)
+            != NotificationOverlayPress::DismissAndPropagate
+        {
+            return false;
+        }
+        self.notifications_visible = false;
+        self.notification_scroll = 0;
+        self.notification_selection = 0;
+        self.notification_context_menu = None;
+        self.rebuild_scene();
+        true
+    }
+
+    fn update_palette_hover(&mut self) {
+        if !self.palette_visible {
+            if self.palette_hover.take().is_some() {
+                self.rebuild_scene();
+            }
+            return;
+        }
+        let registry = ActionRegistry::default();
+        let actions = self.palette_actions(&registry);
+        let capacity = (((self.window_size.height as f32 - 150.0) / 25.0) as usize).clamp(3, 12);
+        let visible = ui::scrolled_range(actions.len(), self.palette_scroll, capacity);
+        let panel = self.command_palette_panel(actions.len());
+        let (x, y) = self.cursor_position;
+        let hovered = ui::palette_row_at(panel, visible.len(), x, y).map(|row| visible.start + row);
+        if hovered != self.palette_hover {
+            self.palette_hover = hovered;
+            self.rebuild_scene();
+        }
+    }
+
+    fn navigation_hover_at_cursor(&self) -> Option<NavigationHover> {
+        let (x, y) = self.cursor_position;
+        if let Some(menu) = self.notification_context_menu {
+            let panel = ui::popup_menu(
+                menu.anchor.0,
+                menu.anchor.1,
+                self.window_size.width as f32,
+                self.window_size.height as f32,
+                NOTIFICATION_CONTEXT_WIDTH,
+                30.0,
+                NOTIFICATION_CONTEXT_ACTIONS.len(),
+            );
+            let index = ui::menu_row_at(panel, x, y, 30.0, NOTIFICATION_CONTEXT_ACTIONS.len())?;
+            return Some(NavigationHover::ContextAction(index));
+        }
+        if let Some(menu) = self.terminal_context_menu {
+            let panel = ui::popup_menu(
+                menu.anchor.0,
+                menu.anchor.1,
+                self.window_size.width as f32,
+                self.window_size.height as f32,
+                TERMINAL_CONTEXT_WIDTH,
+                30.0,
+                TERMINAL_CONTEXT_ACTIONS.len(),
+            );
+            let index = ui::menu_row_at(panel, x, y, 30.0, TERMINAL_CONTEXT_ACTIONS.len())?;
+            return terminal_context_action_enabled(
+                TERMINAL_CONTEXT_ACTIONS[index],
+                self.selection,
+                menu.pane,
+            )
+            .then_some(NavigationHover::ContextAction(index));
+        }
+        if let Some(menu) = self.tab_context_menu {
+            let panel = ui::popup_menu(
+                menu.anchor.0,
+                menu.anchor.1,
+                self.window_size.width as f32,
+                self.window_size.height as f32,
+                TAB_CONTEXT_WIDTH,
+                30.0,
+                TAB_CONTEXT_ACTIONS.len(),
+            );
+            let index = ui::menu_row_at(panel, x, y, 30.0, TAB_CONTEXT_ACTIONS.len())?;
+            let tab_count = self.state.panes.get(&menu.pane)?.surfaces.len();
+            return tab_context_action_enabled(TAB_CONTEXT_ACTIONS[index], tab_count)
+                .then_some(NavigationHover::ContextAction(index));
+        }
+        if let Some(menu) = self.workspace_context_menu {
+            let panel = ui::popup_menu(
+                menu.anchor.0,
+                menu.anchor.1,
+                self.window_size.width as f32,
+                self.window_size.height as f32,
+                WORKSPACE_CONTEXT_WIDTH,
+                30.0,
+                WORKSPACE_CONTEXT_ACTIONS.len(),
+            );
+            let index = ui::menu_row_at(panel, x, y, 30.0, WORKSPACE_CONTEXT_ACTIONS.len())?;
+            return workspace_context_action_enabled(
+                WORKSPACE_CONTEXT_ACTIONS[index],
+                self.state.workspaces.len(),
+            )
+            .then_some(NavigationHover::ContextAction(index));
+        }
+        if self.prompt.is_some() || self.palette_visible {
+            return None;
+        }
+        if let Some(index) = self
+            .titlebar_buttons()
+            .iter()
+            .position(|button| button.bounds.contains(x, y))
+        {
+            return Some(NavigationHover::TitlebarButton(index));
+        }
+        if self.state.workspaces.is_empty() && self.empty_workspace_button().contains(x, y) {
+            return Some(NavigationHover::EmptyWorkspaceNew);
+        }
+        if let Some(pane) = self.pane_rects().into_iter().find_map(|(pane, rect)| {
+            (self
+                .state
+                .panes
+                .get(&pane)
+                .is_some_and(|pane| pane.surfaces.is_empty())
+                && empty_pane_button(rect).contains(x, y))
+            .then_some(pane)
+        }) {
+            return Some(NavigationHover::EmptyPaneNew(pane));
+        }
+        if self.notifications_visible && self.notification_panel().contains(x, y) {
+            if ui::notification_mark_all_read_hit(
+                self.notification_panel(),
+                self.has_unread_notifications(),
+                x,
+                y,
+            ) {
+                return Some(NavigationHover::NotificationMarkAllRead);
+            }
+            let requests = self.pending_agent_request_list();
+            if !requests.is_empty() {
+                let visible_requests = self.agent_request_range(requests.len());
+                let action_counts = requests[visible_requests.clone()]
+                    .iter()
+                    .map(|request| agent_approval_actions(request).len())
+                    .collect::<Vec<_>>();
+                if let Some(hit) = ui::agent_approval_hit(
+                    self.agent_approval_region(requests.len()),
+                    &action_counts,
+                    x,
+                    y,
+                ) {
+                    return Some(NavigationHover::AgentApproval(
+                        visible_requests.start + hit.card,
+                        hit.action,
+                    ));
+                }
+            }
+            let visible = self.notification_range();
+            let pending_count = requests.len();
+            let panel = self.notification_list_panel(pending_count);
+            return ui::notification_row_at(panel, visible.len(), x, y).map(|hit| match hit {
+                ui::NotificationRowHit::Open(row) => {
+                    NavigationHover::Notification(visible.start + row)
+                }
+                ui::NotificationRowHit::Close(row) => {
+                    NavigationHover::NotificationClose(visible.start + row)
+                }
+            });
+        }
+        if self.sidebar_visible && x < self.sidebar_width() {
+            let layout = self.sidebar_layout();
+            if let Some(row) = layout.rows.iter().find(|row| row.bounds.contains(x, y)) {
+                return Some(NavigationHover::Workspace(row.index));
+            }
+            return layout
+                .new_workspace
+                .contains(x, y)
+                .then_some(NavigationHover::NewWorkspace);
+        }
+        for (pane, rect) in self.pane_rects() {
+            if y < rect.y || y >= rect.y + 25.0 || x < rect.x || x >= rect.x + rect.width {
+                continue;
+            }
+            if self.surface_new_tab_bounds(rect).contains(x, y) {
+                return Some(NavigationHover::TabNew(pane));
+            }
+            for tab in self.surface_tabs_layout(pane, rect) {
+                if tab.close.is_some_and(|close| close.contains(x, y)) {
+                    return Some(NavigationHover::TabClose(pane, tab.index));
+                }
+                if tab.bounds.contains(x, y) {
+                    return Some(NavigationHover::Tab(pane, tab.index));
+                }
+            }
+        }
+        None
+    }
+
+    fn update_navigation_hover(&mut self) {
+        let hover = self.navigation_hover_at_cursor();
+        if hover != self.navigation_hover {
+            let previous_notification = match self.navigation_hover {
+                Some(
+                    NavigationHover::Notification(index)
+                    | NavigationHover::NotificationClose(index),
+                ) => Some(index),
+                _ => None,
+            };
+            let next_notification = match hover {
+                Some(
+                    NavigationHover::Notification(index)
+                    | NavigationHover::NotificationClose(index),
+                ) => Some(index),
+                _ => None,
+            };
+            if next_notification != previous_notification {
+                self.notification_hover_started =
+                    next_notification.map(|index| (index, std::time::Instant::now()));
+                self.notification_marquee_line = 0;
+            }
+            self.navigation_hover = hover;
+            self.rebuild_scene();
+        }
+    }
+
+    fn update_cursor_icon(&self) {
+        let (x, y) = self.cursor_position;
+        let icon = if let Some(direction) = self.window_resize_direction(x, y) {
+            match direction {
+                ResizeDirection::East | ResizeDirection::West => CursorIcon::EwResize,
+                ResizeDirection::North | ResizeDirection::South => CursorIcon::NsResize,
+                ResizeDirection::NorthEast | ResizeDirection::SouthWest => CursorIcon::NeswResize,
+                ResizeDirection::NorthWest | ResizeDirection::SouthEast => CursorIcon::NwseResize,
+            }
+        } else if self.sidebar_drag || self.sidebar_resize_hit(x, y) {
+            CursorIcon::ColResize
+        } else if let Some(drag) = &self.split_drag {
+            match drag.axis {
+                SplitAxis::Vertical => CursorIcon::ColResize,
+                SplitAxis::Horizontal => CursorIcon::RowResize,
+            }
+        } else if self.scrollbar_drag.is_some() || self.scrollbar_at_cursor().is_some() {
+            CursorIcon::NsResize
+        } else if self.titlebar_command_bounds().contains(x, y) {
+            if self.palette_visible {
+                CursorIcon::Text
+            } else {
+                CursorIcon::Pointer
+            }
+        } else if self.sidebar_visible && self.workspace_search_bounds().contains(x, y) {
+            CursorIcon::Text
+        } else if self.prompt.is_some() {
+            let input = self.prompt_input_bounds();
+            if input.contains(x, y) {
+                CursorIcon::Text
+            } else {
+                CursorIcon::Default
+            }
+        } else if self.palette_visible {
+            if self.palette_hover.is_some() {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Default
+            }
+        } else if self.search_visible
+            && (ui::Bounds {
+                x: (self.window_size.width as f32
+                    - 430.0_f32
+                        .min(self.window_size.width as f32 - 32.0)
+                        .max(220.0)
+                    - 16.0)
+                    .max(16.0),
+                y: 8.0,
+                width: 430.0_f32
+                    .min(self.window_size.width as f32 - 32.0)
+                    .max(220.0),
+                height: 30.0,
+            })
+            .contains(x, y)
+        {
+            CursorIcon::Text
+        } else if self.navigation_hover.is_some() {
+            CursorIcon::Pointer
+        } else if let Some(workspace) = self.state.active_workspace() {
+            let area = terminal_workspace_area(
+                self.window_size.width as f32,
+                self.window_size.height as f32,
+                self.sidebar_width(),
+            );
+            if !self
+                .state
+                .panes
+                .get(&workspace.active_pane)
+                .is_some_and(|pane| pane.zoomed)
+                && let Some(divider) = divider_at(&workspace.root, area, x, y, &mut Vec::new())
+            {
+                match divider.axis {
+                    SplitAxis::Vertical => CursorIcon::ColResize,
+                    SplitAxis::Horizontal => CursorIcon::RowResize,
+                }
+            } else if self.terminal_at_cursor().is_some() {
+                CursorIcon::Text
+            } else {
+                CursorIcon::Default
+            }
+        } else {
+            CursorIcon::Default
+        };
+        if let Some(renderer) = &self.renderer {
+            renderer.window().set_cursor(icon);
+        }
+    }
+
+    fn update_ime_cursor_area(&self) {
+        let Some(renderer) = &self.renderer else {
+            return;
+        };
+        let (x, y, height) = if self.workspace_search_focused {
+            let bounds = self.workspace_search_bounds();
+            let character_width = 14.0 * 0.6;
+            let viewport = self.workspace_search.viewport(editor_columns(
+                bounds.width - 18.0 - 2.0 * character_width,
+                character_width,
+            ));
+            (
+                bounds.x
+                    + 26.0
+                    + (self.workspace_search.cursor_display_column() - viewport.start_column)
+                        as f32
+                        * character_width,
+                bounds.y + 2.0,
+                bounds.height - 4.0,
+            )
+        } else if let Some(prompt) = &self.prompt {
+            let input = self.prompt_input_bounds();
+            let character_width = 15.0 * 0.6;
+            let viewport = prompt.editor.viewport(editor_columns(
+                input.width - 20.0 - 2.0 * character_width,
+                character_width,
+            ));
+            (
+                input.x
+                    + 10.0
+                    + 2.0 * character_width
+                    + (prompt.editor.cursor_display_column() - viewport.start_column) as f32
+                        * character_width,
+                input.y + 4.0,
+                input.height - 8.0,
+            )
+        } else if self.palette_visible {
+            let command = self.titlebar_command_bounds();
+            let prefix = format!("{}  > ", self.language.command_palette());
+            let character_width = 14.0 * 0.6;
+            let viewport = self.palette_query.viewport(editor_columns(
+                command.width - 24.0 - ui::display_width(&prefix) as f32 * character_width,
+                character_width,
+            ));
+            (
+                command.x
+                    + 12.0
+                    + ui::display_width(&prefix) as f32 * character_width
+                    + (self.palette_query.cursor_display_column() - viewport.start_column) as f32
+                        * character_width,
+                command.y + 3.0,
+                24.0,
+            )
+        } else if self.search_visible {
+            let width = 430.0_f32
+                .min(self.window_size.width as f32 - 32.0)
+                .max(220.0);
+            let left = (self.window_size.width as f32 - width - 16.0).max(16.0);
+            let character_width = 14.0 * 0.6;
+            let prefix_columns = ui::display_width(self.language.find()) + 2;
+            let viewport = self.search_editor.viewport(editor_columns(
+                width - 20.0 - prefix_columns as f32 * character_width,
+                character_width,
+            ));
+            (
+                left + 10.0
+                    + prefix_columns as f32 * character_width
+                    + (self.search_editor.cursor_display_column() - viewport.start_column) as f32
+                        * character_width,
+                10.0,
+                25.0,
+            )
+        } else if let Some((rect, cursor)) = self.active_terminal_id().and_then(|active| {
+            self.pane_rects().into_iter().find_map(|(pane, rect)| {
+                let terminal = self.terminal_in_pane(pane)?.1;
+                if terminal != active {
+                    return None;
+                }
+                self.terminals
+                    .get(&terminal)
+                    .and_then(|runtime| runtime.snapshot.cursor)
+                    .map(|cursor| (rect, cursor))
+            })
+        }) {
+            (
+                rect.x + 8.0 + cursor.x as f32 * self.cell_width(),
+                rect.y + 25.0 + cursor.y as f32 * self.cell_height(),
+                self.cell_height(),
+            )
+        } else {
+            (
+                self.cursor_position.0,
+                self.cursor_position.1,
+                self.cell_height(),
+            )
+        };
+        renderer.window().set_ime_cursor_area(
+            PhysicalPosition::new(x.max(0.0) as i32, y.max(0.0) as i32),
+            PhysicalSize::new(2, height.max(1.0) as u32),
+        );
+    }
+
+    fn pointer_over_overlay(&self) -> bool {
+        if self.close_confirmation.is_some() {
+            return true;
+        }
+        if self.tab_context_menu.is_some()
+            || self.workspace_context_menu.is_some()
+            || self.terminal_context_menu.is_some()
+            || self.notification_context_menu.is_some()
+        {
+            return true;
+        }
+        if self.prompt.is_some() || self.palette_visible {
+            return true;
+        }
+        let (x, y) = self.cursor_position;
+        if self.search_visible {
+            let width = 430.0_f32
+                .min(self.window_size.width as f32 - 32.0)
+                .max(220.0);
+            let left = (self.window_size.width as f32 - width - 16.0).max(16.0);
+            if (ui::Bounds {
+                x: left,
+                y: 8.0,
+                width,
+                height: 30.0,
+            })
+            .contains(x, y)
+            {
+                return true;
+            }
+        }
+        if self.notifications_visible {
+            return self.notification_panel().contains(x, y);
+        }
+        false
+    }
+
+    fn update_mouse_action(&mut self) {
+        if self.update_text_edit_drag() {
+            return;
+        }
+        if self.sidebar_drag {
+            let maximum = (self.window_size.width as f32 - 320.0).max(160.0);
+            self.config.sidebar.width = self.cursor_position.0.clamp(160.0, maximum) as u16;
+            self.resize_terminals();
+            self.rebuild_scene();
+            return;
+        }
+        if self.update_scrollbar_drag() {
+            return;
+        }
+        if self.terminal_mouse_capture.is_some() {
+            self.send_captured_terminal_mouse(
+                MouseActionInput::Motion,
+                Some(MouseButtonInput::Left),
+            );
+            return;
+        }
+        if let Some(drag) = self.split_drag.clone() {
+            let (x, y) = self.cursor_position;
+            let ratio = match drag.axis {
+                SplitAxis::Vertical => (x - drag.container.x) / drag.container.width,
+                SplitAxis::Horizontal => (y - drag.container.y) / drag.container.height,
+            }
+            .clamp(0.1, 0.9);
+            if let Some(workspace) = self.state.workspaces.get_mut(self.state.active_workspace) {
+                set_split_ratio(&mut workspace.root, &drag.path, ratio);
+            }
+            self.resize_terminals();
+            self.rebuild_scene();
+            return;
+        }
+        let Some(mut selection) = self.selection else {
+            return;
+        };
+        if let Some((pane, terminal, cell)) = self.cell_at_cursor()
+            && pane == selection.pane
+            && terminal == selection.terminal
+            && cell != selection.end
+        {
+            self.selection_autoscroll_last = None;
+            selection.end = cell;
+            self.selection = Some(selection);
+            let now = std::time::Instant::now();
+            if selection_redraw_due(self.selection_last_redraw, now) {
+                self.rebuild_scene();
+                // Measure the quiet interval after the expensive text layout,
+                // so queued pointer events cannot immediately trigger another.
+                self.selection_last_redraw = Some(std::time::Instant::now());
+            }
+        }
+    }
+
+    fn update_selection_autoscroll(&mut self) -> bool {
+        const INTERVAL: std::time::Duration = std::time::Duration::from_millis(32);
+
+        let Some(mut selection) = self.selection.filter(|_| self.mouse_pressed) else {
+            self.selection_autoscroll_last = None;
+            return false;
+        };
+        if self.text_edit_drag.is_some()
+            || self.terminal_mouse_capture.is_some()
+            || self.scrollbar_drag.is_some()
+            || self.split_drag.is_some()
+            || self.sidebar_drag
+        {
+            self.selection_autoscroll_last = None;
+            return false;
+        }
+        let Some((_, rect)) = self
+            .pane_rects()
+            .into_iter()
+            .find(|(pane, _)| *pane == selection.pane)
+        else {
+            self.selection_autoscroll_last = None;
+            return false;
+        };
+        let active_terminal = self
+            .state
+            .panes
+            .get(&selection.pane)
+            .and_then(|pane| pane.active_surface())
+            .and_then(|surface| self.state.surfaces.get(&surface))
+            .and_then(|surface| match surface.kind {
+                SurfaceKind::Terminal(terminal) => Some(terminal),
+                _ => None,
+            });
+        if active_terminal != Some(selection.terminal) {
+            self.selection_autoscroll_last = None;
+            return false;
+        }
+
+        let content_top = rect.y + 25.0;
+        let content_bottom = rect.y + rect.height;
+        let Some(lines) = selection_autoscroll_lines(
+            self.cursor_position.1,
+            content_top,
+            content_bottom,
+            self.cell_height(),
+        ) else {
+            self.selection_autoscroll_last = None;
+            return false;
+        };
+        let now = std::time::Instant::now();
+        if self
+            .selection_autoscroll_last
+            .is_some_and(|last| now.saturating_duration_since(last) < INTERVAL)
+        {
+            return true;
+        }
+        self.selection_autoscroll_last = Some(now);
+
+        let Some(runtime) = self.terminals.get(&selection.terminal) else {
+            return false;
+        };
+        let snapshot = &runtime.snapshot;
+        if snapshot.cells.is_empty() || snapshot.cols == 0 {
+            return true;
+        }
+        let column = (((self.cursor_position.0 - rect.x - 8.0) / self.cell_width()).floor()
+            as isize)
+            .clamp(0, snapshot.cols as isize - 1) as usize;
+        let row = if lines < 0 {
+            0
+        } else {
+            snapshot.cells.len() - 1
+        };
+        let endpoint = (column, snapshot.screen_row_origin.saturating_add(row));
+        let can_scroll = if lines < 0 {
+            snapshot.viewport_offset < snapshot.scrollback_rows
+        } else {
+            snapshot.viewport_offset > 0
+        };
+        let endpoint_changed = endpoint != selection.end;
+        selection.end = endpoint;
+        self.selection = Some(selection);
+        if can_scroll {
+            let _ = runtime.session.send(SessionCommand::Scroll(lines));
+        }
+        if endpoint_changed && selection_redraw_due(self.selection_last_redraw, now) {
+            self.rebuild_scene();
+            self.selection_last_redraw = Some(std::time::Instant::now());
+        }
+        true
+    }
+
+    fn update_text_edit_drag(&mut self) -> bool {
+        let Some(target) = self.text_edit_drag else {
+            return false;
+        };
+        let (x, _) = self.cursor_position;
+        match target {
+            TextEditTarget::WorkspaceSearch => {
+                let bounds = self.workspace_search_bounds();
+                let character_width = 14.0 * 0.6;
+                let viewport = self.workspace_search.viewport(editor_columns(
+                    bounds.width - 18.0 - 2.0 * character_width,
+                    character_width,
+                ));
+                let column = viewport.start_column
+                    + ((x - bounds.x - 26.0).max(0.0) / character_width).round() as usize;
+                self.workspace_search.extend_pointer_selection(column);
+            }
+            TextEditTarget::Prompt => {
+                let input = self.prompt_input_bounds();
+                let character_width = 15.0 * 0.6;
+                if let Some(prompt) = &mut self.prompt {
+                    let viewport = prompt.editor.viewport(editor_columns(
+                        input.width - 20.0 - 2.0 * character_width,
+                        character_width,
+                    ));
+                    let column = viewport.start_column
+                        + ((x - input.x - 10.0 - 2.0 * character_width).max(0.0) / character_width)
+                            .round() as usize;
+                    prompt.editor.extend_pointer_selection(column);
+                }
+            }
+            TextEditTarget::Palette => {
+                let command = self.titlebar_command_bounds();
+                let prefix = format!("{}  > ", self.language.command_palette());
+                let character_width = 14.0 * 0.6;
+                let left = command.x + 12.0 + ui::display_width(&prefix) as f32 * character_width;
+                let viewport = self.palette_query.viewport(editor_columns(
+                    command.width - 24.0 - ui::display_width(&prefix) as f32 * character_width,
+                    character_width,
+                ));
+                let column = viewport.start_column
+                    + ((x - left).max(0.0) / character_width).round() as usize;
+                self.palette_query.extend_pointer_selection(column);
+            }
+            TextEditTarget::Search => {
+                let width = 430.0_f32
+                    .min(self.window_size.width as f32 - 32.0)
+                    .max(220.0);
+                let left = (self.window_size.width as f32 - width - 16.0).max(16.0);
+                let character_width = 14.0 * 0.6;
+                let text_left = left
+                    + 10.0
+                    + (ui::display_width(self.language.find()) + 2) as f32 * character_width;
+                let prefix_columns = ui::display_width(self.language.find()) + 2;
+                let viewport = self.search_editor.viewport(editor_columns(
+                    width - 20.0 - prefix_columns as f32 * character_width,
+                    character_width,
+                ));
+                let column = viewport.start_column
+                    + ((x - text_left).max(0.0) / character_width).round() as usize;
+                self.search_editor.extend_pointer_selection(column);
+            }
+        }
+        self.rebuild_scene();
+        true
+    }
+
+    fn finish_mouse_action(&mut self) {
+        self.mouse_pressed = false;
+        self.selection_last_redraw = None;
+        self.selection_autoscroll_last = None;
+        if self.text_edit_drag.take().is_some() {
+            self.rebuild_scene();
+            return;
+        }
+        if self.sidebar_drag {
+            self.sidebar_drag = false;
+            self.rebuild_scene();
+            return;
+        }
+        if self.scrollbar_drag.take().is_some() {
+            return;
+        }
+        if self.terminal_mouse_capture.is_some() {
+            self.send_captured_terminal_mouse(
+                MouseActionInput::Release,
+                Some(MouseButtonInput::Left),
+            );
+            self.terminal_mouse_capture = None;
+            return;
+        }
+        let resized_split = self.split_drag.is_some();
+        self.split_drag = None;
+        if resized_split {
+            return;
+        }
+        let Some(selection) = self.selection else {
+            return;
+        };
+        if selection.start == selection.end {
+            self.selection = None;
+            self.rebuild_scene();
+            return;
+        }
+        self.copy_selection_to_clipboard();
+        // A high-frequency drag may have coalesced its final motion event.
+        // Always paint the authoritative endpoint once on release.
+        self.rebuild_scene();
+    }
+
+    fn cell_at_cursor(&self) -> Option<(PaneId, TerminalId, (usize, usize))> {
+        let (x, y) = self.cursor_position;
+        let (pane, rect) = self
+            .pane_rects()
+            .into_iter()
+            .find(|(_, rect)| terminal_content_contains(*rect, x, y))?;
+        let col = ((x - rect.x - 8.0) / self.cell_width()).floor().max(0.0) as usize;
+        let row = ((y - rect.y - 25.0) / self.cell_height()).floor().max(0.0) as usize;
+        let pane_state = self.state.panes.get(&pane)?;
+        let terminal = pane_state
+            .active_surface()
+            .and_then(|id| self.state.surfaces.get(&id))
+            .and_then(|surface| match surface.kind {
+                SurfaceKind::Terminal(id) => Some(id),
+                _ => None,
+            })?;
+        let snapshot = &self.terminals.get(&terminal)?.snapshot;
+        let screen_row = snapshot.screen_row_origin.saturating_add(row);
+        (row < snapshot.cells.len() && col < snapshot.cols as usize).then_some((
+            pane,
+            terminal,
+            (col, screen_row),
+        ))
+    }
+
+    fn copy_selection_to_clipboard(&self) -> bool {
+        let Some(selection) = self
+            .selection
+            .filter(|selection| selection.start != selection.end)
+        else {
+            return false;
+        };
+        let Some(runtime) = self.terminals.get(&selection.terminal) else {
+            return false;
+        };
+        let point = |(column, screen_row): (usize, usize)| SelectionPoint {
+            column: column.min(u16::MAX as usize) as u16,
+            screen_row: screen_row.min(u32::MAX as usize) as u32,
+        };
+        runtime
+            .session
+            .send(SessionCommand::CopySelection {
+                start: point(selection.start),
+                end: point(selection.end),
+            })
+            .is_ok()
+    }
+
+    fn send_terminal_mouse(
+        &mut self,
+        action: MouseActionInput,
+        button: Option<MouseButtonInput>,
+    ) -> bool {
+        let (x, y) = self.cursor_position;
+        let Some((pane, rect)) = self
+            .pane_rects()
+            .into_iter()
+            .find(|(_, rect)| terminal_content_contains(*rect, x, y))
+        else {
+            return false;
+        };
+        let Some(terminal) = self
+            .state
+            .panes
+            .get(&pane)
+            .and_then(|pane| pane.active_surface())
+            .and_then(|id| self.state.surfaces.get(&id))
+            .and_then(|surface| match surface.kind {
+                SurfaceKind::Terminal(id) => Some(id),
+                _ => None,
+            })
+        else {
+            return false;
+        };
+        let Some(runtime) = self.terminals.get(&terminal) else {
+            return false;
+        };
+        if !runtime.snapshot.mouse_tracking {
+            return false;
+        }
+        let _ = runtime.session.send(SessionCommand::Mouse(MouseInput {
+            action,
+            button,
+            x: (x - rect.x - 8.0).max(0.0),
+            y: (y - rect.y - 25.0).max(0.0),
+            cell_width: self.cell_width().round() as u32,
+            cell_height: self.cell_height().round() as u32,
+            modifiers: KeyModifiers {
+                shift: self.modifiers.shift_key(),
+                alt: self.modifiers.alt_key(),
+                control: self.modifiers.control_key(),
+                super_key: self.modifiers.super_key(),
+            },
+            any_button_pressed: self.mouse_pressed,
+        }));
+        true
+    }
+
+    fn terminal_at_cursor(&self) -> Option<(PaneId, TerminalId)> {
+        let (x, y) = self.cursor_position;
+        let (pane, _) = self
+            .pane_rects()
+            .into_iter()
+            .find(|(_, rect)| terminal_content_contains(*rect, x, y))?;
+        self.terminal_in_pane(pane)
+    }
+
+    fn terminal_at_point(&self, x: f32, y: f32) -> Option<(PaneId, TerminalId)> {
+        let panes = self.pane_rects();
+        let bounds: Vec<_> = panes
+            .iter()
+            .map(|(_, rect)| ui::Bounds {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+            })
+            .collect();
+        let index = ui::bounds_at(&bounds, x, y)?;
+        let pane = panes[index].0;
+        self.terminal_in_pane(pane)
+    }
+
+    fn terminal_in_pane(&self, pane: PaneId) -> Option<(PaneId, TerminalId)> {
+        let terminal = self
+            .state
+            .panes
+            .get(&pane)?
+            .active_surface()
+            .and_then(|id| self.state.surfaces.get(&id))
+            .and_then(|surface| match surface.kind {
+                SurfaceKind::Terminal(id) => Some(id),
+                _ => None,
+            })?;
+        Some((pane, terminal))
+    }
+
+    fn send_captured_terminal_mouse(
+        &mut self,
+        action: MouseActionInput,
+        button: Option<MouseButtonInput>,
+    ) {
+        let Some((pane, terminal)) = self.terminal_mouse_capture else {
+            return;
+        };
+        let Some((_, rect)) = self.pane_rects().into_iter().find(|(id, _)| *id == pane) else {
+            return;
+        };
+        let Some(runtime) = self.terminals.get(&terminal) else {
+            return;
+        };
+        let (x, y) = self.cursor_position;
+        let local_x = (x - rect.x - 8.0).clamp(0.0, (rect.width - 9.0).max(0.0));
+        let local_y = (y - rect.y - 25.0).clamp(0.0, (rect.height - 26.0).max(0.0));
+        let _ = runtime.session.send(SessionCommand::Mouse(MouseInput {
+            action,
+            button,
+            x: local_x,
+            y: local_y,
+            cell_width: self.cell_width().round() as u32,
+            cell_height: self.cell_height().round() as u32,
+            modifiers: KeyModifiers {
+                shift: self.modifiers.shift_key(),
+                alt: self.modifiers.alt_key(),
+                control: self.modifiers.control_key(),
+                super_key: self.modifiers.super_key(),
+            },
+            any_button_pressed: !matches!(action, MouseActionInput::Release),
+        }));
+    }
+
+    fn scroll_surface_at_cursor(&mut self, delta: isize) {
+        let (x, y) = self.cursor_position;
+        let Some((pane_id, _)) = self.pane_rects().into_iter().find(|(_, rect)| {
+            x >= rect.x && x < rect.x + rect.width && y >= rect.y + 25.0 && y < rect.y + rect.height
+        }) else {
+            return;
+        };
+        let Some(surface) = self
+            .state
+            .panes
+            .get(&pane_id)
+            .and_then(|pane| pane.active_surface())
+        else {
+            return;
+        };
+        if let Some(terminal) = self.state.surfaces.get(&surface).and_then(|surface| {
+            if let SurfaceKind::Terminal(terminal) = surface.kind {
+                Some(terminal)
+            } else {
+                None
+            }
+        }) {
+            if let Some(runtime) = self.terminals.get(&terminal) {
+                let _ = runtime.session.send(SessionCommand::Scroll(delta));
+            }
+            return;
+        }
+        if let Some(backend) = self.surface_backends.get(&surface) {
+            let line_count =
+                if let Some(markdown) = backend.as_any().downcast_ref::<MarkdownSurface>() {
+                    markdown_lines(markdown.document(), neutral_document_colors()).len()
+                } else if let Some(logs) = backend.as_any().downcast_ref::<LogSurface>() {
+                    logs.visible_entries().count()
+                } else {
+                    backend.render_text().lines().count()
+                };
+            let offset = self.document_scroll.entry(surface).or_default();
+            *offset = offset
+                .saturating_add_signed(delta)
+                .min(line_count.saturating_sub(1));
+            self.rebuild_scene();
+        }
+    }
+
+    fn paste_clipboard(&mut self) {
+        let Some(text) = self
+            .clipboard
+            .as_mut()
+            .and_then(|clipboard| clipboard.get_text().ok())
+        else {
+            return;
+        };
+        let Some(terminal) = self.active_terminal_id() else {
+            return;
+        };
+        let notifications_changed = self.mark_terminal_notifications_read(terminal);
+        if let Some(runtime) = self.terminals.get(&terminal) {
+            let _ = runtime.session.send(SessionCommand::Paste(text));
+        }
+        if notifications_changed {
+            self.rebuild_scene();
+        }
+    }
+
+    fn resize_terminals(&mut self) {
+        let cell_width = self.cell_width();
+        let cell_height = self.cell_height();
+        for (pane_id, rect) in self.pane_rects() {
+            let terminal = self
+                .state
+                .panes
+                .get(&pane_id)
+                .and_then(|p| p.active_surface())
+                .and_then(|id| self.state.surfaces.get(&id))
+                .and_then(|s| match s.kind {
+                    SurfaceKind::Terminal(id) => Some(id),
+                    _ => None,
+                });
+            let Some(runtime) = terminal.and_then(|id| self.terminals.get_mut(&id)) else {
+                continue;
+            };
+            let cols = ((rect.width - 16.0).max(cell_width) / cell_width) as u16;
+            let rows = ((rect.height - 25.0).max(cell_height) / cell_height) as u16;
+            if let Ok(size) = TerminalSize::new(cols.max(1), rows.max(1))
+                && size != runtime.size
+            {
+                let _ = runtime.session.send(SessionCommand::Resize(size));
+                runtime.size = size;
+            }
+        }
+    }
+
+    fn rebuild_scene(&mut self) {
+        if self.renderer.is_none() {
+            return;
+        }
+        let theme_crust = theme_rgba(self.config.theme.sidebar_background);
+        let theme_mantle = theme_rgba(self.config.theme.sidebar_background);
+        let theme_base = theme_rgba(self.config.theme.background);
+        let theme_surface = theme_rgba(self.config.theme.panel_background);
+        let theme_hover = theme_rgba(self.config.theme.hover_background);
+        let theme_selection = theme_rgba(self.config.theme.selection_background);
+        let theme_selection_text = theme_rgba(self.config.theme.selection_foreground);
+        let theme_cursor = theme_rgba(self.config.theme.cursor);
+        let theme_cursor_text = theme_rgba(self.config.theme.cursor_text);
+        let theme_border = theme_rgba(self.config.theme.border);
+        let theme_text = theme_rgba(self.config.theme.foreground);
+        let theme_subtext = theme_rgba(self.config.theme.muted_foreground);
+        let theme_weak = theme_rgba(self.config.theme.weak_foreground);
+        let theme_blue = theme_rgba(self.config.theme.active_border);
+        let theme_lavender = theme_rgba(self.config.theme.cursor);
+        let theme_green = theme_rgba(self.config.theme.success);
+        let theme_yellow = theme_rgba(self.config.theme.warning);
+        let theme_red = theme_rgba(self.config.theme.error);
+        let sidebar_layout = self.sidebar_layout();
+        self.sidebar_scroll = sidebar_layout.scroll;
+        let workspace = self.state.active_workspace();
+        let mut blocks = Vec::new();
+        let mut rectangles = Vec::new();
+        let mut overlay_blocks = Vec::new();
+        let mut overlay_rectangles = Vec::new();
+        if self.sidebar_visible {
+            rectangles.extend([
+                RectBlock {
+                    left: 0.0,
+                    top: 0.0,
+                    width: self.sidebar_width(),
+                    height: self.window_size.height as f32,
+                    color: theme_mantle,
+                },
+                RectBlock {
+                    left: self.sidebar_width() - if self.sidebar_drag { 1.5 } else { 0.0 },
+                    top: 0.0,
+                    width: if self.sidebar_drag { 3.0 } else { 1.0 },
+                    height: self.window_size.height as f32,
+                    color: if self.sidebar_drag {
+                        theme_blue
+                    } else {
+                        theme_border
+                    },
+                },
+            ]);
+            let search = self.workspace_search_bounds();
+            rectangles.push(RectBlock {
+                left: search.x,
+                top: search.y,
+                width: search.width,
+                height: search.height,
+                color: if self.workspace_search_focused {
+                    theme_blue
+                } else {
+                    theme_border
+                },
+            });
+            rectangles.push(RectBlock {
+                left: search.x + 1.0,
+                top: search.y + 1.0,
+                width: (search.width - 2.0).max(1.0),
+                height: (search.height - 2.0).max(1.0),
+                color: theme_crust,
+            });
+            if self.workspace_search_focused {
+                let character_width = 14.0 * 0.6;
+                let viewport = self.workspace_search.viewport(editor_columns(
+                    search.width - 18.0 - 2.0 * character_width,
+                    character_width,
+                ));
+                push_editor_highlights(
+                    &mut rectangles,
+                    &self.workspace_search,
+                    search.x + 9.0 + 2.0 * character_width,
+                    search.y + 3.0,
+                    search.height - 6.0,
+                    EditorHighlightStyle {
+                        character_width,
+                        colors: (theme_selection, theme_cursor),
+                        viewport,
+                    },
+                );
+            }
+            let mut search_spans = vec![TextSpan {
+                text: "⌕ ".into(),
+                color: theme_text,
+                bold: false,
+                italic: false,
+            }];
+            if self.workspace_search_focused {
+                search_spans.extend(editor_spans(
+                    &self.workspace_search,
+                    theme_text,
+                    theme_selection_text,
+                    theme_cursor_text,
+                    self.workspace_search.viewport(editor_columns(
+                        search.width - 18.0 - 2.0 * 14.0 * 0.6,
+                        14.0 * 0.6,
+                    )),
+                ));
+            } else {
+                search_spans.push(TextSpan {
+                    text: if self.workspace_search.text().is_empty() {
+                        self.language.search_workspaces().into()
+                    } else {
+                        self.workspace_search.text().into()
+                    },
+                    color: theme_subtext,
+                    bold: false,
+                    italic: false,
+                });
+            }
+            blocks.push(TextBlock {
+                text: String::new(),
+                spans: search_spans,
+                left: search.x + 9.0,
+                top: search.y + 4.0,
+                width: search.width - 18.0,
+                height: search.height - 4.0,
+                color: if self.workspace_search_focused {
+                    theme_text
+                } else {
+                    theme_subtext
+                },
+                font_size: 14.0,
+                line_height: 21.0,
+            });
+            for row in &sidebar_layout.rows {
+                let item = &self.state.workspaces[row.index];
+                let active = row.index == self.state.active_workspace;
+                let hovered = self.navigation_hover == Some(NavigationHover::Workspace(row.index));
+                if active || hovered {
+                    rectangles.push(RectBlock {
+                        left: row.bounds.x + 6.0,
+                        top: row.bounds.y + 1.0,
+                        width: (row.bounds.width - 12.0).max(1.0),
+                        height: row.bounds.height - 2.0,
+                        color: if active { theme_selection } else { theme_hover },
+                    });
+                }
+                if active {
+                    rectangles.push(RectBlock {
+                        left: row.bounds.x + 6.0,
+                        top: row.bounds.y + 1.0,
+                        width: 3.0,
+                        height: row.bounds.height - 2.0,
+                        color: theme_blue,
+                    });
+                }
+                rectangles.push(RectBlock {
+                    left: row.bounds.x + 12.0,
+                    top: row.bounds.y + row.bounds.height - 1.0,
+                    width: (row.bounds.width - 24.0).max(1.0),
+                    height: 1.0,
+                    color: theme_border,
+                });
+                let unread: Vec<_> = self
+                    .state
+                    .notifications
+                    .iter()
+                    .filter(|notification| notification.workspace == item.id && !notification.read)
+                    .collect();
+                let unread_label = unread_badge_label(unread.len());
+                let badge_width = unread_label.as_deref().map_or(0.0, |label| {
+                    (ui::display_width(label) as f32 * 11.0 * 0.6 + 8.0).max(18.0)
+                });
+                let text_left = row.bounds.x
+                    + if unread_label.is_some() {
+                        16.0 + badge_width + 7.0
+                    } else {
+                        16.0
+                    };
+                let pinned = if item.pinned {
+                    format!(" {}", self.language.pinned())
+                } else {
+                    String::new()
+                };
+                let text_width = (row.bounds.x + row.bounds.width - 12.0 - text_left).max(1.0);
+                let text_columns = (text_width / (14.0 * 0.6)).max(1.0) as usize;
+                let name_columns = text_columns.saturating_sub(ui::display_width(&pinned));
+                let agent_priority = self.workspace_agent_priority(row.index);
+                let subagent_count = self.workspace_claude_subagent_count(row.index);
+                let agent_state = if subagent_count == 0 {
+                    self.agent_state_text(agent_priority).to_owned()
+                } else {
+                    format!(
+                        "{} · {}",
+                        self.agent_state_text(agent_priority),
+                        self.language.subagent_count(subagent_count)
+                    )
+                };
+                let show_agent = agent_priority > 0;
+                let agent_color = match agent_priority {
+                    5 => theme_red,
+                    4 => theme_yellow,
+                    3 => theme_blue,
+                    2 => theme_green,
+                    _ => theme_subtext,
+                };
+                if let Some(label) = unread_label {
+                    let badge = ui::Bounds {
+                        x: row.bounds.x + 16.0,
+                        y: row.bounds.y + 3.0,
+                        width: badge_width,
+                        height: 18.0,
+                    };
+                    let badge_color = if unread
+                        .iter()
+                        .any(|notification| notification.attention == AttentionState::Error)
+                    {
+                        theme_red
+                    } else if unread
+                        .iter()
+                        .any(|notification| notification.attention == AttentionState::NeedsInput)
+                    {
+                        theme_yellow
+                    } else {
+                        theme_blue
+                    };
+                    rectangles.push(RectBlock {
+                        left: badge.x,
+                        top: badge.y,
+                        width: badge.width,
+                        height: badge.height,
+                        color: badge_color,
+                    });
+                    blocks.push(TextBlock {
+                        text: label.clone(),
+                        spans: vec![],
+                        left: ui::centered_text_left(badge, &label, 11.0),
+                        top: badge.y + 1.0,
+                        width: badge.width,
+                        height: badge.height,
+                        color: theme_crust,
+                        font_size: 11.0,
+                        line_height: 16.0,
+                    });
+                }
+                blocks.push(TextBlock {
+                    text: format!(
+                        "{}{}",
+                        ui::truncate_display_width(&item.name, name_columns),
+                        pinned
+                    ),
+                    spans: vec![],
+                    left: text_left,
+                    top: row.bounds.y + 3.0,
+                    width: text_width,
+                    height: 20.0,
+                    color: if active { theme_text } else { theme_subtext },
+                    font_size: 14.0,
+                    line_height: 19.0,
+                });
+                let mut next_top = row.bounds.y + 24.0;
+                if show_agent {
+                    blocks.push(TextBlock {
+                        text: String::new(),
+                        spans: vec![
+                            plain_span(format!("{}: ", self.language.agent()), theme_subtext),
+                            plain_span(agent_state, agent_color),
+                        ],
+                        left: row.bounds.x + 16.0,
+                        top: next_top,
+                        width: row.bounds.width - 28.0,
+                        height: 18.0,
+                        color: theme_subtext,
+                        font_size: 12.0,
+                        line_height: 17.0,
+                    });
+                    next_top += 19.0;
+                }
+                if let Some(branch) = &item.git_branch {
+                    blocks.push(TextBlock {
+                        text: String::new(),
+                        spans: vec![
+                            plain_span("Git: ", theme_subtext),
+                            plain_span(
+                                ui::truncate_display_width(branch, text_columns.saturating_sub(5)),
+                                theme_green,
+                            ),
+                        ],
+                        left: row.bounds.x + 16.0,
+                        top: next_top,
+                        width: row.bounds.width - 28.0,
+                        height: 18.0,
+                        color: theme_subtext,
+                        font_size: 12.0,
+                        line_height: 17.0,
+                    });
+                    next_top += 19.0;
+                }
+                let path_columns = ((row.bounds.width - 28.0) / (12.0 * 0.6)).max(1.0) as usize;
+                blocks.push(TextBlock {
+                    text: ui::truncate_display_width_start(
+                        &item.cwd.to_string_lossy(),
+                        path_columns,
+                    ),
+                    spans: vec![],
+                    left: row.bounds.x + 16.0,
+                    top: next_top,
+                    width: row.bounds.width - 28.0,
+                    height: 18.0,
+                    color: theme_subtext,
+                    font_size: 12.0,
+                    line_height: 17.0,
+                });
+            }
+            rectangles.push(RectBlock {
+                left: sidebar_layout.new_workspace.x,
+                top: sidebar_layout.new_workspace.y,
+                width: sidebar_layout.new_workspace.width,
+                height: sidebar_layout.new_workspace.height,
+                color: theme_surface,
+            });
+            rectangles.push(RectBlock {
+                left: sidebar_layout.new_workspace.x + 1.0,
+                top: sidebar_layout.new_workspace.y + 1.0,
+                width: (sidebar_layout.new_workspace.width - 2.0).max(1.0),
+                height: sidebar_layout.new_workspace.height - 2.0,
+                color: if self.navigation_hover == Some(NavigationHover::NewWorkspace) {
+                    theme_hover
+                } else {
+                    theme_mantle
+                },
+            });
+            blocks.push(TextBlock {
+                text: "+".into(),
+                spans: vec![],
+                left: ui::centered_text_left(sidebar_layout.new_workspace, "+", 18.0),
+                top: sidebar_layout.new_workspace.y + 4.0,
+                width: 14.0,
+                height: 27.0,
+                color: theme_text,
+                font_size: 18.0,
+                line_height: 21.0,
+            });
+        }
+        if workspace.is_none() {
+            let button = self.empty_workspace_button();
+            let hovered = self.navigation_hover == Some(NavigationHover::EmptyWorkspaceNew);
+            let message = self.language.empty_workspace();
+            let action = self.language.new_workspace();
+            rectangles.push(RectBlock {
+                left: button.x,
+                top: button.y,
+                width: button.width,
+                height: button.height,
+                color: if hovered { theme_blue } else { theme_border },
+            });
+            rectangles.push(RectBlock {
+                left: button.x + 1.0,
+                top: button.y + 1.0,
+                width: (button.width - 2.0).max(1.0),
+                height: (button.height - 2.0).max(1.0),
+                color: if hovered { theme_hover } else { theme_mantle },
+            });
+            blocks.push(TextBlock {
+                text: message.into(),
+                spans: vec![],
+                left: button.x
+                    + (button.width - ui::display_width(message) as f32 * 14.0 * 0.6) / 2.0,
+                top: button.y - 34.0,
+                width: button.width,
+                height: 26.0,
+                color: theme_subtext,
+                font_size: 14.0,
+                line_height: 20.0,
+            });
+            blocks.push(TextBlock {
+                text: action.into(),
+                spans: vec![],
+                left: button.x
+                    + (button.width - ui::display_width(action) as f32 * 14.0 * 0.6) / 2.0,
+                top: button.y + 8.0,
+                width: button.width - 32.0,
+                height: button.height - 8.0,
+                color: theme_text,
+                font_size: 14.0,
+                line_height: 20.0,
+            });
+        }
+        for (pane_id, rect) in self.pane_rects() {
+            let active = workspace.is_some_and(|w| w.active_pane == pane_id);
+            let surface = self
+                .state
+                .panes
+                .get(&pane_id)
+                .and_then(|p| p.active_surface())
+                .and_then(|id| self.state.surfaces.get(&id));
+            let tab_layout = self.surface_tabs_layout(pane_id, rect);
+            rectangles.push(RectBlock {
+                left: rect.x,
+                top: rect.y,
+                width: rect.width,
+                height: rect.height,
+                color: if active { theme_base } else { theme_crust },
+            });
+            rectangles.push(RectBlock {
+                left: rect.x,
+                top: rect.y,
+                width: rect.width,
+                height: 1.0,
+                color: match surface.map(|surface| surface.attention) {
+                    Some(AttentionState::NeedsInput) => theme_yellow,
+                    Some(AttentionState::Error) => theme_red,
+                    Some(AttentionState::Activity) => theme_blue,
+                    Some(AttentionState::None) if active => theme_blue,
+                    Some(AttentionState::None) | None => theme_border,
+                },
+            });
+            rectangles.push(RectBlock {
+                left: rect.x,
+                top: rect.y + 1.0,
+                width: rect.width,
+                height: 24.0,
+                color: theme_mantle,
+            });
+            rectangles.push(RectBlock {
+                left: rect.x,
+                top: rect.y + 24.0,
+                width: rect.width,
+                height: 1.0,
+                color: theme_border,
+            });
+            let new_tab = self.surface_new_tab_bounds(rect);
+            let new_hovered = self.navigation_hover == Some(NavigationHover::TabNew(pane_id));
+            rectangles.push(RectBlock {
+                left: new_tab.x + 2.0,
+                top: new_tab.y + 2.0,
+                width: new_tab.width - 4.0,
+                height: new_tab.height - 4.0,
+                color: if new_hovered {
+                    theme_hover
+                } else {
+                    theme_mantle
+                },
+            });
+            blocks.push(TextBlock {
+                text: "+".into(),
+                spans: vec![],
+                left: ui::centered_text_left(new_tab, "+", 16.0),
+                top: new_tab.y + 3.0,
+                width: 14.0,
+                height: 21.0,
+                color: if new_hovered {
+                    theme_text
+                } else {
+                    theme_subtext
+                },
+                font_size: 16.0,
+                line_height: 20.0,
+            });
+            let Some(surface) = surface else {
+                let button = empty_pane_button(rect);
+                let hovered = self.navigation_hover == Some(NavigationHover::EmptyPaneNew(pane_id));
+                let message = self.language.empty_pane();
+                let action = self
+                    .language
+                    .action_title("surface.new", "New Terminal Tab");
+                rectangles.push(RectBlock {
+                    left: button.x,
+                    top: button.y,
+                    width: button.width,
+                    height: button.height,
+                    color: if hovered { theme_blue } else { theme_border },
+                });
+                rectangles.push(RectBlock {
+                    left: button.x + 1.0,
+                    top: button.y + 1.0,
+                    width: (button.width - 2.0).max(1.0),
+                    height: (button.height - 2.0).max(1.0),
+                    color: if hovered { theme_hover } else { theme_mantle },
+                });
+                blocks.push(TextBlock {
+                    text: message.into(),
+                    spans: vec![],
+                    left: rect.x
+                        + (rect.width - ui::display_width(message) as f32 * 14.0 * 0.6) / 2.0,
+                    top: button.y - 34.0,
+                    width: (rect.width - 32.0).max(1.0),
+                    height: 26.0,
+                    color: theme_subtext,
+                    font_size: 14.0,
+                    line_height: 20.0,
+                });
+                blocks.push(TextBlock {
+                    text: action.into(),
+                    spans: vec![],
+                    left: button.x
+                        + (button.width - ui::display_width(action) as f32 * 14.0 * 0.6) / 2.0,
+                    top: button.y + 7.0,
+                    width: button.width - 28.0,
+                    height: button.height - 8.0,
+                    color: theme_text,
+                    font_size: 14.0,
+                    line_height: 20.0,
+                });
+                continue;
+            };
+            if let Some(pane) = self.state.panes.get(&pane_id) {
+                for tab in &tab_layout {
+                    let Some(surface) = pane
+                        .surfaces
+                        .get(tab.index)
+                        .and_then(|id| self.state.surfaces.get(id))
+                    else {
+                        continue;
+                    };
+                    let selected = tab.index == pane.active_surface;
+                    let hovered = matches!(
+                        self.navigation_hover,
+                        Some(NavigationHover::Tab(hover_pane, index))
+                            if hover_pane == pane_id && index == tab.index
+                    );
+                    rectangles.push(RectBlock {
+                        left: tab.bounds.x,
+                        top: tab.bounds.y + 1.0,
+                        width: tab.bounds.width,
+                        height: tab.bounds.height - 2.0,
+                        color: if selected {
+                            theme_selection
+                        } else if hovered {
+                            theme_hover
+                        } else {
+                            theme_mantle
+                        },
+                    });
+                    rectangles.push(RectBlock {
+                        left: tab.bounds.x + tab.bounds.width - 1.0,
+                        top: tab.bounds.y + 5.0,
+                        width: 1.0,
+                        height: 15.0,
+                        color: theme_border,
+                    });
+                    if selected {
+                        rectangles.push(RectBlock {
+                            left: tab.bounds.x,
+                            top: tab.bounds.y + tab.bounds.height - 2.0,
+                            width: tab.bounds.width,
+                            height: 2.0,
+                            color: theme_blue,
+                        });
+                    }
+                    if matches!(
+                        self.navigation_hover,
+                        Some(NavigationHover::TabClose(hover_pane, index))
+                            if hover_pane == pane_id && index == tab.index
+                    ) && let Some(close) = tab.close
+                    {
+                        rectangles.push(RectBlock {
+                            left: close.x,
+                            top: close.y + 1.0,
+                            width: close.width,
+                            height: (close.height - 2.0).max(1.0),
+                            color: [theme_red[0], theme_red[1], theme_red[2], 180],
+                        });
+                    }
+                    let attention_color = match surface.attention {
+                        AttentionState::NeedsInput => theme_yellow,
+                        AttentionState::Error => theme_red,
+                        AttentionState::Activity => theme_blue,
+                        AttentionState::None if selected => theme_blue,
+                        AttentionState::None => theme_subtext,
+                    };
+                    if surface.attention != AttentionState::None {
+                        rectangles.push(RectBlock {
+                            left: tab.bounds.x + 2.0,
+                            top: tab.bounds.y + 5.0,
+                            width: 2.0,
+                            height: 14.0,
+                            color: attention_color,
+                        });
+                    }
+                    let tab_font_size = self.terminal_font_size.min(12.0);
+                    let (title_bounds, number_bounds) = ui::surface_tab_text_bounds(
+                        tab.bounds,
+                        tab.close,
+                        tab.index,
+                        tab_font_size * 0.6,
+                    );
+                    blocks.push(TextBlock {
+                        text: String::new(),
+                        spans: vec![TextSpan {
+                            text: ui::truncate_display_width(&surface.title, 14),
+                            color: if selected { theme_text } else { theme_subtext },
+                            bold: selected,
+                            italic: false,
+                        }],
+                        left: title_bounds.x,
+                        top: tab.bounds.y + 3.0,
+                        width: title_bounds.width,
+                        height: tab.bounds.height - 3.0,
+                        color: if selected { theme_text } else { theme_subtext },
+                        font_size: tab_font_size,
+                        line_height: self.cell_height(),
+                    });
+                    blocks.push(TextBlock {
+                        text: (tab.index + 1).to_string(),
+                        spans: vec![],
+                        left: number_bounds.x,
+                        top: tab.bounds.y + 3.0,
+                        width: number_bounds.width,
+                        height: tab.bounds.height - 3.0,
+                        color: if selected { theme_text } else { theme_subtext },
+                        font_size: tab_font_size,
+                        line_height: self.cell_height(),
+                    });
+                    if let Some(close) = tab.close {
+                        blocks.push(TextBlock {
+                            text: "×".into(),
+                            spans: vec![],
+                            left: ui::centered_text_left(close, "×", tab_font_size),
+                            top: close.y + 3.0,
+                            width: close.width,
+                            height: close.height - 3.0,
+                            color: if selected { theme_text } else { theme_subtext },
+                            font_size: tab_font_size,
+                            line_height: self.cell_height(),
+                        });
+                    }
+                }
+            }
+            let (text, spans) = match surface.kind {
+                SurfaceKind::Terminal(id) => self
+                    .terminals
+                    .get(&id)
+                    .map(|runtime| {
+                        let cell_width = self.cell_width();
+                        let cell_height = self.cell_height();
+                        for (row, cells) in runtime.snapshot.cells.iter().enumerate() {
+                            for (col, cell) in cells.iter().enumerate() {
+                                if cell.background_explicit {
+                                    rectangles.push(RectBlock {
+                                        left: rect.x + 8.0 + col as f32 * cell_width,
+                                        top: rect.y + 25.0 + row as f32 * cell_height,
+                                        width: cell_width,
+                                        height: cell_height,
+                                        color: [
+                                            cell.background.r,
+                                            cell.background.g,
+                                            cell.background.b,
+                                            255,
+                                        ],
+                                    });
+                                }
+                                if cell.underline || cell.strikethrough {
+                                    let color = [
+                                        cell.foreground.r,
+                                        cell.foreground.g,
+                                        cell.foreground.b,
+                                        255,
+                                    ];
+                                    if cell.underline {
+                                        rectangles.push(RectBlock {
+                                            left: rect.x + 8.0 + col as f32 * cell_width,
+                                            top: rect.y + 25.0 + (row as f32 + 0.88) * cell_height,
+                                            width: cell_width,
+                                            height: 1.0,
+                                            color,
+                                        });
+                                    }
+                                    if cell.strikethrough {
+                                        rectangles.push(RectBlock {
+                                            left: rect.x + 8.0 + col as f32 * cell_width,
+                                            top: rect.y + 25.0 + (row as f32 + 0.52) * cell_height,
+                                            width: cell_width,
+                                            height: 1.0,
+                                            color,
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        if self.search_visible && !self.search_editor.text().is_empty() {
+                            let needle = self.search_editor.text().to_lowercase();
+                            for (row, line) in runtime.snapshot.lines.iter().enumerate() {
+                                let lower = line.to_lowercase();
+                                for (byte, _) in lower.match_indices(&needle) {
+                                    let col = lower[..byte].chars().count();
+                                    let width = needle.chars().count().max(1);
+                                    rectangles.push(RectBlock {
+                                        left: rect.x + 8.0 + col as f32 * cell_width,
+                                        top: rect.y + 25.0 + row as f32 * cell_height,
+                                        width: width as f32 * cell_width,
+                                        height: cell_height,
+                                        color: [249, 226, 175, 105],
+                                    });
+                                }
+                            }
+                        }
+                        if let Some(selection) = self
+                            .selection
+                            .filter(|item| item.pane == pane_id && item.terminal == id)
+                        {
+                            let (start, end) = ordered_cells(selection.start, selection.end);
+                            let origin = runtime.snapshot.screen_row_origin;
+                            let viewport_end = origin
+                                .saturating_add(runtime.snapshot.rows.saturating_sub(1) as usize);
+                            for screen_row in start.1.max(origin)..=end.1.min(viewport_end) {
+                                let row = screen_row - origin;
+                                let from = if screen_row == start.1 { start.0 } else { 0 };
+                                let to = if screen_row == end.1 {
+                                    end.0
+                                } else {
+                                    runtime.snapshot.cols as usize - 1
+                                };
+                                rectangles.push(RectBlock {
+                                    left: rect.x + 8.0 + from as f32 * cell_width,
+                                    top: rect.y + 25.0 + row as f32 * cell_height,
+                                    width: (to.saturating_sub(from) + 1) as f32 * cell_width,
+                                    height: cell_height,
+                                    color: [69, 71, 90, 210],
+                                });
+                            }
+                        }
+                        if let Some(cursor) =
+                            runtime.snapshot.cursor.filter(|cursor| cursor.visible)
+                        {
+                            rectangles.push(RectBlock {
+                                left: rect.x + 8.0 + cursor.x as f32 * cell_width,
+                                top: rect.y + 25.0 + cursor.y as f32 * cell_height,
+                                width: cell_width,
+                                height: cell_height,
+                                color: [
+                                    theme_lavender[0],
+                                    theme_lavender[1],
+                                    theme_lavender[2],
+                                    if cursor.blinking {
+                                        145
+                                    } else {
+                                        theme_lavender[3]
+                                    },
+                                ],
+                            });
+                        }
+                        if let Some(scrollbar) = ui::terminal_scrollbar_layout(
+                            ui::Bounds {
+                                x: rect.x,
+                                y: rect.y,
+                                width: rect.width,
+                                height: rect.height,
+                            },
+                            runtime.snapshot.rows as usize,
+                            runtime.snapshot.scrollback_rows,
+                            runtime.snapshot.viewport_offset,
+                        ) {
+                            rectangles.push(RectBlock {
+                                left: scrollbar.track.x,
+                                top: scrollbar.track.y,
+                                width: scrollbar.track.width,
+                                height: scrollbar.track.height,
+                                color: [theme_subtext[0], theme_subtext[1], theme_subtext[2], 28],
+                            });
+                            rectangles.push(RectBlock {
+                                left: scrollbar.thumb.x,
+                                top: scrollbar.thumb.y,
+                                width: scrollbar.thumb.width,
+                                height: scrollbar.thumb.height,
+                                color: [theme_subtext[0], theme_subtext[1], theme_subtext[2], 150],
+                            });
+                        }
+                        let mut spans = Vec::new();
+                        for (row_index, row) in runtime.snapshot.cells.iter().enumerate() {
+                            spans.extend(row.iter().map(|cell| TextSpan {
+                                text: cell.text.clone(),
+                                color: [
+                                    cell.foreground.r,
+                                    cell.foreground.g,
+                                    cell.foreground.b,
+                                    255,
+                                ],
+                                bold: cell.bold,
+                                italic: cell.italic,
+                            }));
+                            if row_index + 1 < runtime.snapshot.cells.len() {
+                                spans.push(TextSpan {
+                                    text: "\n".into(),
+                                    color: theme_text,
+                                    bold: false,
+                                    italic: false,
+                                });
+                            }
+                        }
+                        (String::new(), spans)
+                    })
+                    .unwrap_or_default(),
+                SurfaceKind::Markdown(_) => {
+                    let offset = self.document_scroll.get(&surface.id).copied().unwrap_or(0);
+                    let visible_rows =
+                        ((rect.height - 30.0) / self.cell_height()).max(1.0) as usize;
+                    let palette = DocumentColors {
+                        text: if active { theme_text } else { theme_subtext },
+                        muted: theme_subtext,
+                        accent: theme_blue,
+                        heading: theme_blue,
+                        code: theme_green,
+                        warning: theme_yellow,
+                        error: theme_red,
+                    };
+                    let mut spans = Vec::new();
+                    if let Some(markdown) = self
+                        .surface_backends
+                        .get(&surface.id)
+                        .and_then(|backend| backend.as_any().downcast_ref::<MarkdownSurface>())
+                    {
+                        spans.extend(markdown_spans(
+                            markdown.document(),
+                            offset,
+                            visible_rows,
+                            palette,
+                            self.search_visible.then_some(self.search_editor.text()),
+                        ));
+                    } else {
+                        spans.push(plain_span(
+                            self.language.load_surface_failed(),
+                            palette.error,
+                        ));
+                    }
+                    (String::new(), spans)
+                }
+                SurfaceKind::Logs(_) => {
+                    let offset = self.document_scroll.get(&surface.id).copied().unwrap_or(0);
+                    let visible_rows =
+                        ((rect.height - 30.0) / self.cell_height()).max(1.0) as usize;
+                    let palette = DocumentColors {
+                        text: if active { theme_text } else { theme_subtext },
+                        muted: theme_subtext,
+                        accent: theme_blue,
+                        heading: theme_blue,
+                        code: theme_green,
+                        warning: theme_yellow,
+                        error: theme_red,
+                    };
+                    let mut spans = Vec::new();
+                    if let Some(logs) = self
+                        .surface_backends
+                        .get(&surface.id)
+                        .and_then(|backend| backend.as_any().downcast_ref::<LogSurface>())
+                    {
+                        let filter_label = format_log_filter(logs.filter());
+                        let content_rows = if filter_label.is_empty() {
+                            visible_rows
+                        } else {
+                            spans.push(TextSpan {
+                                text: format!("FILTER: {filter_label}  [Ctrl+Shift+L]\n"),
+                                color: palette.accent,
+                                bold: true,
+                                italic: false,
+                            });
+                            visible_rows.saturating_sub(1)
+                        };
+                        spans.extend(log_spans(
+                            logs,
+                            offset,
+                            content_rows,
+                            palette,
+                            self.search_visible.then_some(self.search_editor.text()),
+                        ));
+                    } else {
+                        spans.push(plain_span(
+                            self.language.load_surface_failed(),
+                            palette.error,
+                        ));
+                    }
+                    (String::new(), spans)
+                }
+                SurfaceKind::Browser(_) => (self.language.browser_excluded().into(), vec![]),
+            };
+            blocks.push(TextBlock {
+                text,
+                spans,
+                left: rect.x + 8.0,
+                top: rect.y + 25.0,
+                width: rect.width - 14.0,
+                height: rect.height
+                    - 29.0
+                    - if matches!(surface.kind, SurfaceKind::Terminal(terminal) if self.terminal_notices.contains_key(&terminal)) {
+                        self.cell_height() + 8.0
+                    } else {
+                        0.0
+                    },
+                color: if active { theme_text } else { theme_subtext },
+                font_size: self.terminal_font_size,
+                line_height: self.cell_height(),
+            });
+            if let SurfaceKind::Terminal(terminal) = surface.kind
+                && let Some(notice) = self.terminal_notices.get(&terminal)
+            {
+                let message = match notice {
+                    TerminalNotice::Exited(status) => self.language.terminal_exited(status),
+                    TerminalNotice::Error(error) => self.language.terminal_error(error),
+                    TerminalNotice::SpawnFailed(error) => {
+                        self.language.terminal_spawn_failed(error)
+                    }
+                };
+                let notice_height = self.cell_height() + 8.0;
+                let notice_top = rect.y + rect.height - notice_height;
+                rectangles.push(RectBlock {
+                    left: rect.x + 4.0,
+                    top: notice_top,
+                    width: rect.width - 8.0,
+                    height: notice_height,
+                    color: [theme_surface[0], theme_surface[1], theme_surface[2], 248],
+                });
+                blocks.push(TextBlock {
+                    text: ui::truncate(&message, ((rect.width - 20.0) / 8.0).max(8.0) as usize),
+                    spans: vec![],
+                    left: rect.x + 10.0,
+                    top: notice_top + 3.0,
+                    width: rect.width - 20.0,
+                    height: self.cell_height(),
+                    color: match notice {
+                        TerminalNotice::Exited(_) => theme_yellow,
+                        TerminalNotice::Error(_) | TerminalNotice::SpawnFailed(_) => theme_red,
+                    },
+                    font_size: self.terminal_font_size,
+                    line_height: self.cell_height(),
+                });
+            }
+        }
+        if let Some(workspace) = workspace
+            && !self
+                .state
+                .panes
+                .get(&workspace.active_pane)
+                .is_some_and(|pane| pane.zoomed)
+        {
+            let area = terminal_workspace_area(
+                self.window_size.width as f32,
+                self.window_size.height as f32,
+                self.sidebar_width(),
+            );
+            let mut dividers = Vec::new();
+            collect_dividers(&workspace.root, area, &mut Vec::new(), &mut dividers);
+            let hovered = divider_at(
+                &workspace.root,
+                area,
+                self.cursor_position.0,
+                self.cursor_position.1,
+                &mut Vec::new(),
+            );
+            for divider in dividers {
+                let dragging = self
+                    .split_drag
+                    .as_ref()
+                    .is_some_and(|active| active.path == divider.path);
+                let highlighted = dragging
+                    || hovered
+                        .as_ref()
+                        .is_some_and(|active| active.path == divider.path);
+                let line = divider_line(
+                    &divider,
+                    if dragging {
+                        4.0
+                    } else if highlighted {
+                        2.0
+                    } else {
+                        1.0
+                    },
+                );
+                rectangles.push(RectBlock {
+                    left: line.x,
+                    top: line.y,
+                    width: line.width,
+                    height: line.height,
+                    color: if highlighted {
+                        theme_blue
+                    } else {
+                        theme_subtext
+                    },
+                });
+            }
+        }
+        if self.search_visible {
+            let status = self
+                .search_result
+                .as_ref()
+                .map(|result| format!("{}/{}", result.current, result.total))
+                .unwrap_or_else(|| "0/0".into());
+            let width = 430.0_f32
+                .min(self.window_size.width as f32 - 32.0)
+                .max(220.0);
+            let left = (self.window_size.width as f32 - width - 16.0).max(16.0);
+            overlay_rectangles.push(RectBlock {
+                left,
+                top: 8.0,
+                width,
+                height: 30.0,
+                color: theme_blue,
+            });
+            overlay_rectangles.push(RectBlock {
+                left: left + 1.0,
+                top: 9.0,
+                width: width - 2.0,
+                height: 28.0,
+                color: theme_mantle,
+            });
+            let character_width = 14.0 * 0.6;
+            let search_prefix = format!("{}: ", self.language.find());
+            let search_viewport = self.search_editor.viewport(editor_columns(
+                width - 20.0 - ui::display_width(&search_prefix) as f32 * character_width,
+                character_width,
+            ));
+            push_editor_highlights(
+                &mut overlay_rectangles,
+                &self.search_editor,
+                left + 10.0 + ui::display_width(&search_prefix) as f32 * character_width,
+                10.0,
+                26.0,
+                EditorHighlightStyle {
+                    character_width,
+                    colors: (theme_selection, theme_cursor),
+                    viewport: search_viewport,
+                },
+            );
+            let mut search_spans = vec![TextSpan {
+                text: search_prefix,
+                color: theme_text,
+                bold: false,
+                italic: false,
+            }];
+            search_spans.extend(editor_spans(
+                &self.search_editor,
+                theme_text,
+                theme_selection_text,
+                theme_cursor_text,
+                search_viewport,
+            ));
+            search_spans.push(TextSpan {
+                text: format!("   {status}   {}", self.language.find_navigation()),
+                color: theme_text,
+                bold: false,
+                italic: false,
+            });
+            overlay_blocks.push(TextBlock {
+                text: String::new(),
+                spans: search_spans,
+                left: left + 10.0,
+                top: 13.0,
+                width: width - 20.0,
+                height: 24.0,
+                color: theme_text,
+                font_size: 14.0,
+                line_height: 19.0,
+            });
+        }
+        if let Some(confirmation) = &self.close_confirmation {
+            let panel = self.confirmation_panel();
+            let (cancel, confirm) = self.confirmation_buttons();
+            overlay_rectangles.push(RectBlock {
+                left: 0.0,
+                top: 40.0,
+                width: self.window_size.width as f32,
+                height: (self.window_size.height as f32 - 40.0).max(1.0),
+                color: [0, 0, 0, 150],
+            });
+            overlay_rectangles.extend(context_menu_frame(panel, theme_surface, theme_blue));
+            for (bounds, color) in [(cancel, theme_hover), (confirm, theme_red)] {
+                overlay_rectangles.push(RectBlock {
+                    left: bounds.x,
+                    top: bounds.y,
+                    width: bounds.width,
+                    height: bounds.height,
+                    color,
+                });
+            }
+            overlay_blocks.push(TextBlock {
+                text: confirmation.title.clone(),
+                spans: vec![],
+                left: panel.x + 20.0,
+                top: panel.y + 16.0,
+                width: panel.width - 40.0,
+                height: 24.0,
+                color: theme_red,
+                font_size: 16.0,
+                line_height: 22.0,
+            });
+            overlay_blocks.push(TextBlock {
+                text: confirmation.message.clone(),
+                spans: vec![],
+                left: panel.x + 20.0,
+                top: panel.y + 48.0,
+                width: panel.width - 40.0,
+                height: 48.0,
+                color: theme_text,
+                font_size: 14.0,
+                line_height: 20.0,
+            });
+            for (bounds, text, color) in [
+                (cancel, self.language.cancel(), theme_text),
+                (confirm, self.language.close_anyway(), theme_text),
+            ] {
+                let text_width = ui::display_width(text) as f32 * 14.0 * 0.6;
+                overlay_blocks.push(TextBlock {
+                    text: text.into(),
+                    spans: vec![],
+                    left: bounds.x + (bounds.width - text_width).max(0.0) / 2.0,
+                    top: bounds.y + 7.0,
+                    width: text_width.max(1.0),
+                    height: 22.0,
+                    color,
+                    font_size: 14.0,
+                    line_height: 20.0,
+                });
+            }
+        }
+        if let Some(prompt) = &self.prompt {
+            let panel = self.prompt_panel();
+            let input = self.prompt_input_bounds();
+            let label = match prompt.kind {
+                PromptKind::RenameWorkspace => self.language.rename_workspace(),
+                PromptKind::DescribeWorkspace => self.language.workspace_description(),
+                PromptKind::ChangeWorkspaceDirectory => self.language.change_workspace_directory(),
+                PromptKind::FindDirectory => self.language.find_workspace(),
+                PromptKind::FilterLogs => self.language.filter_logs(),
+            };
+            overlay_rectangles.push(RectBlock {
+                left: 0.0,
+                top: 40.0,
+                width: self.window_size.width as f32,
+                height: (self.window_size.height as f32 - 40.0).max(1.0),
+                color: [0, 0, 0, 125],
+            });
+            overlay_rectangles.extend(context_menu_frame(panel, theme_surface, theme_blue));
+            overlay_rectangles.push(RectBlock {
+                left: input.x,
+                top: input.y,
+                width: input.width,
+                height: input.height,
+                color: if prompt.error.is_some() {
+                    theme_red
+                } else {
+                    theme_border
+                },
+            });
+            overlay_rectangles.push(RectBlock {
+                left: input.x + 1.0,
+                top: input.y + 1.0,
+                width: (input.width - 2.0).max(1.0),
+                height: (input.height - 2.0).max(1.0),
+                color: theme_surface,
+            });
+            let character_width = 15.0 * 0.6;
+            let prompt_viewport = prompt.editor.viewport(editor_columns(
+                input.width - 20.0 - 2.0 * character_width,
+                character_width,
+            ));
+            push_editor_highlights(
+                &mut overlay_rectangles,
+                &prompt.editor,
+                input.x + 10.0 + 2.0 * character_width,
+                input.y + 3.0,
+                input.height - 6.0,
+                EditorHighlightStyle {
+                    character_width,
+                    colors: (theme_selection, theme_cursor),
+                    viewport: prompt_viewport,
+                },
+            );
+            overlay_blocks.push(TextBlock {
+                text: label.into(),
+                spans: vec![],
+                left: panel.x + 18.0,
+                top: panel.y + 14.0,
+                width: panel.width - 36.0,
+                height: 24.0,
+                color: theme_blue,
+                font_size: 14.0,
+                line_height: 20.0,
+            });
+            let mut prompt_spans = vec![TextSpan {
+                text: "› ".into(),
+                color: theme_blue,
+                bold: true,
+                italic: false,
+            }];
+            prompt_spans.extend(editor_spans(
+                &prompt.editor,
+                theme_text,
+                theme_selection_text,
+                theme_cursor_text,
+                prompt_viewport,
+            ));
+            overlay_blocks.push(TextBlock {
+                text: String::new(),
+                spans: prompt_spans,
+                left: input.x + 10.0,
+                top: input.y + 7.0,
+                width: input.width - 20.0,
+                height: input.height - 8.0,
+                color: theme_text,
+                font_size: 15.0,
+                line_height: 21.0,
+            });
+            if let Some(error) = &prompt.error {
+                overlay_blocks.push(TextBlock {
+                    text: error.clone(),
+                    spans: vec![],
+                    left: panel.x + 18.0,
+                    top: input.y + input.height + 9.0,
+                    width: panel.width - 36.0,
+                    height: 24.0,
+                    color: theme_red,
+                    font_size: 13.0,
+                    line_height: 18.0,
+                });
+            }
+        }
+        if self.palette_visible {
+            let registry = ActionRegistry::default();
+            let actions = self.palette_actions(&registry);
+            let capacity =
+                (((self.window_size.height as f32 - 150.0) / 25.0) as usize).clamp(3, 12);
+            let visible = ui::scrolled_range(actions.len(), self.palette_scroll, capacity);
+            let panel = self.command_palette_panel(actions.len());
+            overlay_rectangles.push(RectBlock {
+                left: panel.x,
+                top: panel.y,
+                width: panel.width,
+                height: panel.height,
+                color: theme_blue,
+            });
+            overlay_rectangles.push(RectBlock {
+                left: panel.x + 1.0,
+                top: panel.y + 1.0,
+                width: (panel.width - 2.0).max(1.0),
+                height: (panel.height - 2.0).max(1.0),
+                color: theme_mantle,
+            });
+            let palette_rows = ui::palette_rows(panel, visible.len());
+            if let Some((track, thumb)) =
+                ui::list_scrollbar(panel, actions.len(), visible.len(), self.palette_scroll)
+            {
+                overlay_rectangles.push(RectBlock {
+                    left: track.x,
+                    top: track.y,
+                    width: track.width,
+                    height: track.height,
+                    color: theme_crust,
+                });
+                overlay_rectangles.push(RectBlock {
+                    left: thumb.x,
+                    top: thumb.y,
+                    width: thumb.width,
+                    height: thumb.height,
+                    color: theme_subtext,
+                });
+            }
+            let highlighted = self
+                .palette_hover
+                .filter(|index| visible.contains(index))
+                .unwrap_or(self.palette_index);
+            if visible.contains(&highlighted) {
+                let selected_row = highlighted.saturating_sub(visible.start);
+                let selected = palette_rows[selected_row];
+                overlay_rectangles.push(RectBlock {
+                    left: selected.x,
+                    top: selected.y,
+                    width: selected.width,
+                    height: selected.height,
+                    color: theme_selection,
+                });
+                overlay_rectangles.push(RectBlock {
+                    left: selected.x,
+                    top: selected.y,
+                    width: 3.0,
+                    height: selected.height,
+                    color: theme_blue,
+                });
+            }
+            for (index, action) in actions[visible.clone()].iter().enumerate() {
+                let absolute = visible.start + index;
+                let selected = absolute == highlighted;
+                let shortcut = self.shortcut_for_action(action.id());
+                let shortcut_width = shortcut
+                    .as_deref()
+                    .map_or(0.0, |label| ui::display_width(label) as f32 * 13.0 * 0.6);
+                let spans = if selected {
+                    vec![
+                        TextSpan {
+                            text: "> ".into(),
+                            color: theme_blue,
+                            bold: true,
+                            italic: false,
+                        },
+                        TextSpan {
+                            text: self
+                                .language
+                                .action_title(action.id(), action.title())
+                                .into(),
+                            color: theme_text,
+                            bold: true,
+                            italic: false,
+                        },
+                    ]
+                } else {
+                    vec![TextSpan {
+                        text: format!(
+                            "  {}",
+                            self.language.action_title(action.id(), action.title())
+                        ),
+                        color: theme_text,
+                        bold: false,
+                        italic: false,
+                    }]
+                };
+                let row = palette_rows[index];
+                overlay_blocks.push(TextBlock {
+                    text: String::new(),
+                    spans,
+                    left: panel.x + 18.0,
+                    top: row.y,
+                    width: (panel.width - 48.0 - shortcut_width).max(40.0),
+                    height: row.height,
+                    color: theme_text,
+                    font_size: 16.0,
+                    line_height: row.height,
+                });
+                if let Some(shortcut) = shortcut {
+                    overlay_blocks.push(TextBlock {
+                        text: shortcut,
+                        spans: vec![],
+                        left: panel.x + panel.width - 18.0 - shortcut_width,
+                        top: row.y,
+                        width: shortcut_width.max(1.0),
+                        height: row.height,
+                        color: if selected { theme_blue } else { theme_subtext },
+                        font_size: 13.0,
+                        line_height: row.height,
+                    });
+                }
+            }
+        }
+        if self.notifications_visible
+            && self.close_confirmation.is_none()
+            && self.prompt.is_none()
+            && !self.palette_visible
+        {
+            let panel = self.notification_panel();
+            let pending_requests = self.pending_agent_request_list();
+            let notification_panel = self.notification_list_panel(pending_requests.len());
+            let visible = self.notification_range();
+            let notification_rows = ui::notification_row_layouts(notification_panel, visible.len());
+            overlay_rectangles.extend(context_menu_frame(panel, theme_surface, theme_blue));
+            if !pending_requests.is_empty() {
+                let request_range = self.agent_request_range(pending_requests.len());
+                let action_sets = pending_requests[request_range.clone()]
+                    .iter()
+                    .map(agent_approval_actions)
+                    .collect::<Vec<_>>();
+                let action_counts = action_sets
+                    .iter()
+                    .map(|actions| actions.len())
+                    .collect::<Vec<_>>();
+                let cards = ui::agent_approval_cards(
+                    self.agent_approval_region(pending_requests.len()),
+                    &action_counts,
+                );
+                overlay_blocks.push(TextBlock {
+                    text: format!(
+                        "{}  {}/{}",
+                        self.language.agent_approval(),
+                        request_range.start + 1,
+                        pending_requests.len()
+                    ),
+                    spans: vec![],
+                    left: panel.x + 18.0,
+                    top: panel.y + 14.0,
+                    width: panel.width - 36.0,
+                    height: 24.0,
+                    color: theme_yellow,
+                    font_size: 14.0,
+                    line_height: 21.0,
+                });
+                for (card_index, card) in cards.iter().enumerate() {
+                    let absolute = request_range.start + card_index;
+                    let request = &pending_requests[absolute];
+                    let selected = self.agent_request_selection == absolute;
+                    overlay_rectangles.push(RectBlock {
+                        left: card.bounds.x,
+                        top: card.bounds.y,
+                        width: card.bounds.width,
+                        height: card.bounds.height,
+                        color: if selected {
+                            theme_selection
+                        } else {
+                            theme_mantle
+                        },
+                    });
+                    overlay_rectangles.push(RectBlock {
+                        left: card.bounds.x,
+                        top: card.bounds.y,
+                        width: 3.0,
+                        height: card.bounds.height,
+                        color: theme_yellow,
+                    });
+                    overlay_blocks.push(TextBlock {
+                        text: format!("{} · Details", self.agent_request_source(request)),
+                        spans: vec![],
+                        left: card.content.x,
+                        top: card.content.y,
+                        width: card.content.width,
+                        height: 20.0,
+                        color: theme_blue,
+                        font_size: 13.0,
+                        line_height: 18.0,
+                    });
+                    let columns = (card.content.width / (13.0 * 0.6)).floor() as usize;
+                    for (line, text) in ui::notification_preview(&request.message, columns, 2, None)
+                        .into_iter()
+                        .enumerate()
+                    {
+                        overlay_blocks.push(TextBlock {
+                            text,
+                            spans: vec![],
+                            left: card.content.x,
+                            top: card.content.y + 22.0 + line as f32 * 18.0,
+                            width: card.content.width,
+                            height: 18.0,
+                            color: theme_text,
+                            font_size: 13.0,
+                            line_height: 17.0,
+                        });
+                    }
+                    for (action_index, (action, button)) in action_sets[card_index]
+                        .iter()
+                        .zip(&card.buttons)
+                        .enumerate()
+                    {
+                        let hovered = self.navigation_hover
+                            == Some(NavigationHover::AgentApproval(absolute, action_index));
+                        let keyboard_selected =
+                            selected && self.agent_request_action == action_index;
+                        overlay_rectangles.push(RectBlock {
+                            left: button.x,
+                            top: button.y,
+                            width: button.width,
+                            height: button.height,
+                            color: if hovered || keyboard_selected {
+                                if matches!(action, AgentApprovalAction::Deny) {
+                                    theme_red
+                                } else {
+                                    theme_blue
+                                }
+                            } else {
+                                theme_hover
+                            },
+                        });
+                        let label = agent_approval_action_label(self.language, *action);
+                        overlay_blocks.push(TextBlock {
+                            text: label.into(),
+                            spans: vec![],
+                            left: ui::centered_text_left(*button, label, 12.0),
+                            top: button.y + 4.0,
+                            width: button.width,
+                            height: button.height - 4.0,
+                            color: theme_text,
+                            font_size: 12.0,
+                            line_height: 19.0,
+                        });
+                    }
+                }
+            }
+            overlay_blocks.push(TextBlock {
+                text: format!(
+                    "{}  {}  {}/{}",
+                    self.language.needs_attention(),
+                    self.state
+                        .notifications
+                        .iter()
+                        .filter(|item| !item.read)
+                        .count(),
+                    visible
+                        .start
+                        .saturating_add(1)
+                        .min(self.state.notifications.len()),
+                    self.state.notifications.len()
+                ),
+                spans: vec![],
+                left: notification_panel.x + 18.0,
+                top: notification_panel.y + 16.0,
+                width: (notification_panel.width - 154.0).max(1.0),
+                height: 24.0,
+                color: theme_text,
+                font_size: 14.0,
+                line_height: 21.0,
+            });
+            let mark_all_read = ui::notification_mark_all_read_button(notification_panel);
+            let has_unread = self.has_unread_notifications();
+            let mark_all_read_hovered =
+                self.navigation_hover == Some(NavigationHover::NotificationMarkAllRead);
+            overlay_rectangles.push(RectBlock {
+                left: mark_all_read.x,
+                top: mark_all_read.y,
+                width: mark_all_read.width,
+                height: mark_all_read.height,
+                color: if mark_all_read_hovered {
+                    theme_blue
+                } else if has_unread {
+                    theme_hover
+                } else {
+                    theme_mantle
+                },
+            });
+            let mark_all_read_label = self.language.mark_all_read();
+            overlay_blocks.push(TextBlock {
+                text: mark_all_read_label.into(),
+                spans: vec![],
+                left: ui::centered_text_left(mark_all_read, mark_all_read_label, 12.0),
+                top: mark_all_read.y + 4.0,
+                width: mark_all_read.width,
+                height: mark_all_read.height - 4.0,
+                color: if has_unread {
+                    theme_text
+                } else {
+                    theme_subtext
+                },
+                font_size: 12.0,
+                line_height: 19.0,
+            });
+            let now_ms = unix_time_ms();
+            for (row_index, item) in self
+                .state
+                .notifications
+                .iter()
+                .rev()
+                .skip(visible.start)
+                .take(visible.len())
+                .enumerate()
+            {
+                let row = notification_rows[row_index];
+                let absolute = visible.start + row_index;
+                let hovered = matches!(
+                    self.navigation_hover,
+                    Some(NavigationHover::Notification(index) | NavigationHover::NotificationClose(index))
+                        if index == absolute
+                );
+                let close_hovered =
+                    self.navigation_hover == Some(NavigationHover::NotificationClose(absolute));
+                if hovered || self.notification_selection == absolute {
+                    overlay_rectangles.push(RectBlock {
+                        left: row.bounds.x,
+                        top: row.bounds.y,
+                        width: row.bounds.width,
+                        height: row.bounds.height,
+                        color: if close_hovered {
+                            theme_selection
+                        } else {
+                            theme_hover
+                        },
+                    });
+                }
+                if !item.read {
+                    overlay_rectangles.push(RectBlock {
+                        left: row.accent.x,
+                        top: row.accent.y,
+                        width: row.accent.width,
+                        height: row.accent.height,
+                        color: match item.attention {
+                            AttentionState::NeedsInput => theme_yellow,
+                            AttentionState::Error => theme_red,
+                            _ => theme_blue,
+                        },
+                    });
+                }
+                if hovered {
+                    if close_hovered {
+                        overlay_rectangles.push(RectBlock {
+                            left: row.close.x,
+                            top: row.close.y,
+                            width: row.close.width,
+                            height: row.close.height,
+                            color: theme_red,
+                        });
+                    }
+                    overlay_blocks.push(TextBlock {
+                        text: "×".into(),
+                        spans: vec![],
+                        left: ui::centered_text_left(row.close, "×", 16.0),
+                        top: row.close.y,
+                        width: row.close.width,
+                        height: row.close.height,
+                        color: theme_text,
+                        font_size: 16.0,
+                        line_height: row.close.height,
+                    });
+                }
+                let age = notification_age_label(
+                    now_ms,
+                    item.created_at_unix_ms,
+                    self.language.is_chinese(),
+                );
+                let age_width = ui::display_width(&age) as f32 * 12.0 * 0.6;
+                overlay_blocks.push(TextBlock {
+                    text: ui::truncate_display_width(&item.title, 32),
+                    spans: vec![],
+                    left: row.content.x,
+                    top: row.content.y,
+                    width: (row.content.width - age_width - 8.0).max(24.0),
+                    height: 22.0,
+                    color: theme_text,
+                    font_size: 14.0,
+                    line_height: 20.0,
+                });
+                overlay_blocks.push(TextBlock {
+                    text: age,
+                    spans: vec![],
+                    left: row.content.x + (row.content.width - age_width).max(0.0),
+                    top: row.content.y + 1.0,
+                    width: age_width.max(1.0),
+                    height: 20.0,
+                    color: theme_weak,
+                    font_size: 12.0,
+                    line_height: 18.0,
+                });
+                let body_columns = (row.content.width / (13.0 * 0.6)).floor() as usize;
+                let scroll_line = hovered
+                    .then_some(self.notification_marquee_line)
+                    .filter(|line| *line > 0);
+                for (line_index, text) in
+                    ui::notification_preview(&item.body, body_columns, 2, scroll_line)
+                        .into_iter()
+                        .enumerate()
+                {
+                    overlay_blocks.push(TextBlock {
+                        text,
+                        spans: vec![],
+                        left: row.content.x,
+                        top: row.content.y + 26.0 + line_index as f32 * 20.0,
+                        width: row.content.width,
+                        height: 20.0,
+                        color: theme_subtext,
+                        font_size: 13.0,
+                        line_height: 19.0,
+                    });
+                }
+            }
+        }
+        if let Some((request_id, scroll)) = &self.agent_request_detail
+            && let Ok(Some(request)) = self.pending_agent_requests.get(request_id)
+        {
+            let width = 620.0_f32.min((self.window_size.width as f32 - 40.0).max(260.0));
+            let height = 420.0_f32.min((self.window_size.height as f32 - 80.0).max(180.0));
+            let panel = ui::Bounds {
+                x: (self.window_size.width as f32 - width) / 2.0,
+                y: (self.window_size.height as f32 - height) / 2.0,
+                width,
+                height,
+            };
+            overlay_rectangles.push(RectBlock {
+                left: 0.0,
+                top: 40.0,
+                width: self.window_size.width as f32,
+                height: (self.window_size.height as f32 - 40.0).max(1.0),
+                color: [0, 0, 0, 150],
+            });
+            overlay_rectangles.extend(context_menu_frame(panel, theme_surface, theme_blue));
+            overlay_blocks.push(TextBlock {
+                text: format!(
+                    "{} · {}",
+                    self.language.agent_approval(),
+                    request.kind.as_str()
+                ),
+                spans: vec![],
+                left: panel.x + 18.0,
+                top: panel.y + 14.0,
+                width: panel.width - 36.0,
+                height: 24.0,
+                color: theme_yellow,
+                font_size: 15.0,
+                line_height: 21.0,
+            });
+            let columns = ((panel.width - 36.0) / (13.0 * 0.6)).floor() as usize;
+            let lines = ui::notification_lines(&request.message, columns);
+            let capacity = ((panel.height - 70.0) / 20.0).floor() as usize;
+            let start = (*scroll).min(lines.len().saturating_sub(capacity));
+            for (index, line) in lines.into_iter().skip(start).take(capacity).enumerate() {
+                overlay_blocks.push(TextBlock {
+                    text: line,
+                    spans: vec![],
+                    left: panel.x + 18.0,
+                    top: panel.y + 48.0 + index as f32 * 20.0,
+                    width: panel.width - 36.0,
+                    height: 20.0,
+                    color: theme_text,
+                    font_size: 13.0,
+                    line_height: 19.0,
+                });
+            }
+        }
+        if self.sidebar_drag {
+            overlay_rectangles.push(RectBlock {
+                left: (self.sidebar_width() - 3.0).max(0.0),
+                top: 0.0,
+                width: 6.0,
+                height: self.window_size.height as f32,
+                color: [theme_blue[0], theme_blue[1], theme_blue[2], 70],
+            });
+            overlay_rectangles.push(RectBlock {
+                left: (self.sidebar_width() - 1.0).max(0.0),
+                top: 0.0,
+                width: 2.0,
+                height: self.window_size.height as f32,
+                color: theme_blue,
+            });
+        }
+        rectangles.push(RectBlock {
+            left: 0.0,
+            top: 0.0,
+            width: self.window_size.width as f32,
+            height: 40.0,
+            color: theme_mantle,
+        });
+        let command = self.titlebar_command_bounds();
+        rectangles.push(RectBlock {
+            left: command.x,
+            top: command.y,
+            width: command.width,
+            height: command.height,
+            color: if self.palette_visible {
+                theme_blue
+            } else {
+                theme_surface
+            },
+        });
+        rectangles.push(RectBlock {
+            left: command.x + 1.0,
+            top: command.y + 1.0,
+            width: (command.width - 2.0).max(1.0),
+            height: command.height - 2.0,
+            color: theme_surface,
+        });
+        let palette_prefix = format!("{}  > ", self.language.command_palette());
+        let palette_prefix_columns = ui::display_width(&palette_prefix);
+        if self.palette_visible {
+            let prefix = format!("{}  > ", self.language.command_palette());
+            let character_width = 14.0 * 0.6;
+            let palette_viewport = self.palette_query.viewport(editor_columns(
+                command.width - 24.0 - ui::display_width(&prefix) as f32 * character_width,
+                character_width,
+            ));
+            push_editor_highlights(
+                &mut rectangles,
+                &self.palette_query,
+                command.x + 12.0 + ui::display_width(&prefix) as f32 * character_width,
+                command.y + 2.0,
+                command.height - 4.0,
+                EditorHighlightStyle {
+                    character_width,
+                    colors: (theme_selection, theme_cursor),
+                    viewport: palette_viewport,
+                },
+            );
+        }
+        let mut palette_spans = vec![TextSpan {
+            text: palette_prefix,
+            color: if self.palette_visible {
+                theme_blue
+            } else {
+                theme_subtext
+            },
+            bold: false,
+            italic: false,
+        }];
+        if self.palette_visible {
+            palette_spans.extend(editor_spans(
+                &self.palette_query,
+                theme_blue,
+                theme_selection_text,
+                theme_cursor_text,
+                self.palette_query.viewport(editor_columns(
+                    command.width - 24.0 - palette_prefix_columns as f32 * 14.0 * 0.6,
+                    14.0 * 0.6,
+                )),
+            ));
+        }
+        blocks.push(TextBlock {
+            text: String::new(),
+            spans: palette_spans,
+            left: command.x + 12.0,
+            top: command.y + 4.0,
+            width: command.width - 24.0,
+            height: 24.0,
+            color: if self.palette_visible {
+                theme_blue
+            } else {
+                theme_subtext
+            },
+            font_size: 14.0,
+            line_height: 20.0,
+        });
+        let titlebar_unread = self
+            .state
+            .notifications
+            .iter()
+            .filter(|notification| !notification.read)
+            .count()
+            + self.pending_agent_requests.len().unwrap_or_default();
+        for (index, button) in self.titlebar_buttons().into_iter().enumerate() {
+            let hovered = self.navigation_hover == Some(NavigationHover::TitlebarButton(index));
+            rectangles.push(RectBlock {
+                left: button.bounds.x,
+                top: button.bounds.y,
+                width: button.bounds.width,
+                height: button.bounds.height,
+                color: if matches!(button.action, TitlebarAction::Close) && hovered {
+                    theme_red
+                } else if hovered {
+                    theme_hover
+                } else {
+                    theme_mantle
+                },
+            });
+            if button.active {
+                rectangles.push(RectBlock {
+                    left: button.bounds.x + 8.0,
+                    top: button.bounds.y + button.bounds.height - 3.0,
+                    width: button.bounds.width - 16.0,
+                    height: 3.0,
+                    color: theme_blue,
+                });
+            }
+            if matches!(button.action, TitlebarAction::ToggleSidebar) {
+                let center_x = button.bounds.x + button.bounds.width / 2.0;
+                let center_y = button.bounds.y + button.bounds.height / 2.0;
+                for offset in [-5.0_f32, 0.0, 5.0] {
+                    rectangles.push(RectBlock {
+                        left: center_x - 7.0,
+                        top: center_y + offset - 1.0,
+                        width: 14.0,
+                        height: 2.0,
+                        color: theme_text,
+                    });
+                }
+                continue;
+            }
+            if matches!(button.action, TitlebarAction::ToggleNotifications) && titlebar_unread > 0 {
+                let badge_width =
+                    (ui::display_width(&button.label) as f32 * 11.0 * 0.6 + 8.0).max(18.0);
+                let badge = ui::Bounds {
+                    x: button.bounds.x + (button.bounds.width - badge_width) / 2.0,
+                    y: button.bounds.y + (button.bounds.height - 18.0) / 2.0,
+                    width: badge_width,
+                    height: 18.0,
+                };
+                rectangles.push(RectBlock {
+                    left: badge.x,
+                    top: badge.y,
+                    width: badge.width,
+                    height: badge.height,
+                    color: theme_blue,
+                });
+                blocks.push(TextBlock {
+                    text: button.label.clone(),
+                    spans: vec![],
+                    left: ui::centered_text_left(badge, &button.label, 11.0),
+                    top: badge.y + 1.0,
+                    width: badge.width,
+                    height: badge.height,
+                    color: theme_crust,
+                    font_size: 11.0,
+                    line_height: 16.0,
+                });
+                continue;
+            }
+            blocks.push(TextBlock {
+                text: button.label.clone(),
+                spans: vec![],
+                left: ui::centered_text_left(button.bounds, &button.label, 16.0),
+                top: button.bounds.y + 10.0,
+                width: 16.0,
+                height: 22.0,
+                color: theme_text,
+                font_size: 16.0,
+                line_height: 19.0,
+            });
+        }
+        if let Some(menu) = self.notification_context_menu {
+            let panel = ui::popup_menu(
+                menu.anchor.0,
+                menu.anchor.1,
+                self.window_size.width as f32,
+                self.window_size.height as f32,
+                NOTIFICATION_CONTEXT_WIDTH,
+                30.0,
+                NOTIFICATION_CONTEXT_ACTIONS.len(),
+            );
+            overlay_rectangles.extend(context_menu_frame(panel, theme_surface, theme_border));
+            let is_read = self
+                .state
+                .notifications
+                .iter()
+                .find(|item| item.id == menu.notification)
+                .is_some_and(|item| item.read);
+            let labels = if self.language.is_chinese() {
+                [
+                    "打开通知",
+                    if is_read {
+                        "标记为未读"
+                    } else {
+                        "标记为已读"
+                    },
+                    "清除通知",
+                ]
+            } else {
+                [
+                    "Open Notification",
+                    if is_read { "Mark Unread" } else { "Mark Read" },
+                    "Clear Notification",
+                ]
+            };
+            for (index, label) in labels.into_iter().enumerate() {
+                if self.navigation_hover == Some(NavigationHover::ContextAction(index)) {
+                    overlay_rectangles.push(RectBlock {
+                        left: panel.x + 3.0,
+                        top: panel.y + index as f32 * 30.0 + 2.0,
+                        width: panel.width - 6.0,
+                        height: 26.0,
+                        color: theme_hover,
+                    });
+                    overlay_rectangles.push(RectBlock {
+                        left: panel.x + 3.0,
+                        top: panel.y + index as f32 * 30.0 + 2.0,
+                        width: 3.0,
+                        height: 26.0,
+                        color: theme_blue,
+                    });
+                }
+                overlay_blocks.push(TextBlock {
+                    text: label.into(),
+                    spans: vec![],
+                    left: panel.x + 14.0,
+                    top: panel.y + index as f32 * 30.0 + 5.0,
+                    width: panel.width - 28.0,
+                    height: 25.0,
+                    color: if matches!(
+                        NOTIFICATION_CONTEXT_ACTIONS[index],
+                        NotificationContextAction::Clear
+                    ) {
+                        theme_red
+                    } else {
+                        theme_text
+                    },
+                    font_size: 15.0,
+                    line_height: 21.0,
+                });
+            }
+        }
+        if let Some(menu) = self.terminal_context_menu {
+            let panel = ui::popup_menu(
+                menu.anchor.0,
+                menu.anchor.1,
+                self.window_size.width as f32,
+                self.window_size.height as f32,
+                TERMINAL_CONTEXT_WIDTH,
+                30.0,
+                TERMINAL_CONTEXT_ACTIONS.len(),
+            );
+            overlay_rectangles.extend(context_menu_frame(panel, theme_surface, theme_border));
+            let labels = if self.language.is_chinese() {
+                ["复制所选内容", "粘贴", "复制全部", "清除回滚"]
+            } else {
+                ["Copy Selection", "Paste", "Copy All", "Clear Scrollback"]
+            };
+            for (index, label) in labels.into_iter().enumerate() {
+                if self.navigation_hover == Some(NavigationHover::ContextAction(index)) {
+                    overlay_rectangles.push(RectBlock {
+                        left: panel.x + 3.0,
+                        top: panel.y + index as f32 * 30.0 + 2.0,
+                        width: panel.width - 6.0,
+                        height: 26.0,
+                        color: theme_hover,
+                    });
+                    overlay_rectangles.push(RectBlock {
+                        left: panel.x + 3.0,
+                        top: panel.y + index as f32 * 30.0 + 2.0,
+                        width: 3.0,
+                        height: 26.0,
+                        color: theme_blue,
+                    });
+                }
+                let enabled = terminal_context_action_enabled(
+                    TERMINAL_CONTEXT_ACTIONS[index],
+                    self.selection,
+                    menu.pane,
+                );
+                overlay_blocks.push(TextBlock {
+                    text: label.into(),
+                    spans: vec![],
+                    left: panel.x + 14.0,
+                    top: panel.y + index as f32 * 30.0 + 5.0,
+                    width: panel.width - 28.0,
+                    height: 25.0,
+                    color: if enabled { theme_text } else { theme_weak },
+                    font_size: 15.0,
+                    line_height: 21.0,
+                });
+            }
+        }
+        if let Some(menu) = self.tab_context_menu {
+            let panel = ui::popup_menu(
+                menu.anchor.0,
+                menu.anchor.1,
+                self.window_size.width as f32,
+                self.window_size.height as f32,
+                TAB_CONTEXT_WIDTH,
+                30.0,
+                TAB_CONTEXT_ACTIONS.len(),
+            );
+            overlay_rectangles.extend(context_menu_frame(panel, theme_surface, theme_border));
+            let labels = if self.language.is_chinese() {
+                ["关闭标签", "关闭其他标签", "新建终端标签"]
+            } else {
+                ["Close Tab", "Close Other Tabs", "New Terminal Tab"]
+            };
+            let tab_count = self
+                .state
+                .panes
+                .get(&menu.pane)
+                .map(|pane| pane.surfaces.len())
+                .unwrap_or(0);
+            for (index, label) in labels.into_iter().enumerate() {
+                if self.navigation_hover == Some(NavigationHover::ContextAction(index)) {
+                    overlay_rectangles.push(RectBlock {
+                        left: panel.x + 3.0,
+                        top: panel.y + index as f32 * 30.0 + 2.0,
+                        width: panel.width - 6.0,
+                        height: 26.0,
+                        color: theme_hover,
+                    });
+                    overlay_rectangles.push(RectBlock {
+                        left: panel.x + 3.0,
+                        top: panel.y + index as f32 * 30.0 + 2.0,
+                        width: 3.0,
+                        height: 26.0,
+                        color: theme_blue,
+                    });
+                }
+                let enabled = tab_context_action_enabled(TAB_CONTEXT_ACTIONS[index], tab_count);
+                overlay_blocks.push(TextBlock {
+                    text: label.into(),
+                    spans: vec![],
+                    left: panel.x + 14.0,
+                    top: panel.y + index as f32 * 30.0 + 5.0,
+                    width: panel.width - 28.0,
+                    height: 25.0,
+                    color: if !enabled {
+                        theme_weak
+                    } else {
+                        match TAB_CONTEXT_ACTIONS[index] {
+                            TabContextAction::Close => theme_red,
+                            TabContextAction::CloseOthers => theme_yellow,
+                            TabContextAction::NewSurface => theme_text,
+                        }
+                    },
+                    font_size: 15.0,
+                    line_height: 21.0,
+                });
+            }
+        }
+        if let Some(menu) = self.workspace_context_menu {
+            let panel = ui::popup_menu(
+                menu.anchor.0,
+                menu.anchor.1,
+                self.window_size.width as f32,
+                self.window_size.height as f32,
+                WORKSPACE_CONTEXT_WIDTH,
+                30.0,
+                WORKSPACE_CONTEXT_ACTIONS.len(),
+            );
+            overlay_rectangles.extend(context_menu_frame(panel, theme_surface, theme_border));
+            let pinned = self
+                .state
+                .workspaces
+                .iter()
+                .find(|workspace| workspace.id == menu.workspace)
+                .is_some_and(|workspace| workspace.pinned);
+            let labels = if self.language.is_chinese() {
+                [
+                    "新建终端标签",
+                    "重命名工作区",
+                    "编辑工作区描述",
+                    "更改目录",
+                    if pinned {
+                        "取消置顶"
+                    } else {
+                        "置顶工作区"
+                    },
+                    "关闭工作区",
+                ]
+            } else {
+                [
+                    "New Terminal Tab",
+                    "Rename Workspace",
+                    "Edit Description",
+                    "Change Directory",
+                    if pinned {
+                        "Unpin Workspace"
+                    } else {
+                        "Pin Workspace"
+                    },
+                    "Close Workspace",
+                ]
+            };
+            for (index, label) in labels.into_iter().enumerate() {
+                if self.navigation_hover == Some(NavigationHover::ContextAction(index)) {
+                    overlay_rectangles.push(RectBlock {
+                        left: panel.x + 3.0,
+                        top: panel.y + index as f32 * 30.0 + 2.0,
+                        width: panel.width - 6.0,
+                        height: 26.0,
+                        color: theme_hover,
+                    });
+                    overlay_rectangles.push(RectBlock {
+                        left: panel.x + 3.0,
+                        top: panel.y + index as f32 * 30.0 + 2.0,
+                        width: 3.0,
+                        height: 26.0,
+                        color: theme_blue,
+                    });
+                }
+                let enabled = workspace_context_action_enabled(
+                    WORKSPACE_CONTEXT_ACTIONS[index],
+                    self.state.workspaces.len(),
+                );
+                overlay_blocks.push(TextBlock {
+                    text: label.into(),
+                    spans: vec![],
+                    left: panel.x + 14.0,
+                    top: panel.y + index as f32 * 30.0 + 5.0,
+                    width: panel.width - 28.0,
+                    height: 25.0,
+                    color: if !enabled {
+                        theme_weak
+                    } else if matches!(
+                        WORKSPACE_CONTEXT_ACTIONS[index],
+                        WorkspaceContextAction::Close
+                    ) {
+                        theme_red
+                    } else {
+                        theme_text
+                    },
+                    font_size: 15.0,
+                    line_height: 21.0,
+                });
+            }
+        }
+        self.update_ime_cursor_area();
+        if let Some(renderer) = &mut self.renderer {
+            renderer.set_scene_with_overlays(
+                blocks,
+                rectangles,
+                overlay_blocks,
+                overlay_rectangles,
+            );
+            renderer.window().request_redraw();
+        }
+    }
+
+    /// Register a Codex app-server approval without granting it implicitly.
+    ///
+    /// Wire contract:
+    /// `agent.approval.register` receives
+    /// `{source,workspace_id,surface_id,request:{jsonrpc_id,method,kind,
+    /// thread_id,turn_id,item_id,params},decisions:[deny|once|always|all]}`.
+    /// The result is `{status:"pending",approval_id}` until a UI decision,
+    /// then `{status:"resolved",decision:{mode}}`.
+    fn register_agent_approval(&mut self, params: &Value) -> Result<Value, String> {
+        let source = required_string(params, "source")?;
+        if !matches!(source, "codex_app_server" | "claude_hook") {
+            return Err("params.source must be `codex_app_server` or `claude_hook`".into());
+        }
+        let workspace_id = uuid::Uuid::parse_str(required_string(params, "workspace_id")?)
+            .map_err(|_| "invalid params.workspace_id".to_owned())?;
+        let surface_id = uuid::Uuid::parse_str(required_string(params, "surface_id")?)
+            .map_err(|_| "invalid params.surface_id".to_owned())?;
+        let workspace = self
+            .state
+            .workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .ok_or_else(|| "workspace not found".to_owned())?;
+        let belongs =
+            self.state.panes.values().any(|pane| {
+                workspace.root.contains(pane.id) && pane.surfaces.contains(&surface_id)
+            });
+        if !belongs || !self.state.surfaces.contains_key(&surface_id) {
+            return Err("surface does not belong to params.workspace_id".into());
+        }
+        let request = params
+            .get("request")
+            .and_then(Value::as_object)
+            .ok_or_else(|| "missing params.request object".to_owned())?;
+        let jsonrpc_id = request
+            .get("jsonrpc_id")
+            .filter(|value| value.is_string() || value.is_number())
+            .ok_or_else(|| "request.jsonrpc_id must be a string or number".to_owned())?;
+        let method = required_string_object(request, "method")?;
+        let kind = required_string_object(request, "kind")?;
+        validate_agent_approval_protocol(source, method, kind)?;
+        let thread_id = required_string_object(request, "thread_id")?;
+        let turn_id = required_string_object(request, "turn_id")?;
+        let item_id = required_string_object(request, "item_id")?;
+        let verified_claude_lifecycle = if source == "claude_hook" {
+            let lifecycle_id = required_string(params, "lifecycle_id")?;
+            let surface = self
+                .state
+                .surfaces
+                .get(&surface_id)
+                .ok_or_else(|| "Claude approval surface not found".to_owned())?;
+            let terminal = match surface.kind {
+                SurfaceKind::Terminal(terminal) => terminal,
+                _ => return Err("Claude approval target must be a terminal surface".into()),
+            };
+            let runtime = self
+                .terminals
+                .get(&terminal)
+                .ok_or_else(|| "Claude approval terminal is not running".to_owned())?;
+            let metadata_agent = surface
+                .agent
+                .as_ref()
+                .map(|metadata| metadata.name.as_str());
+            let authoritative_agent = self
+                .agent_sessions
+                .get(&surface_id)
+                .map(|session| session.agent_kind.as_str());
+            if !claude_approval_binding_matches(
+                &runtime.lifecycle_id,
+                metadata_agent,
+                authoritative_agent,
+                lifecycle_id,
+            ) {
+                return Err("Claude approval does not match the active Agent lifecycle".into());
+            }
+            Some(lifecycle_id.to_owned())
+        } else {
+            None
+        };
+        let request_params = request
+            .get("params")
+            .ok_or_else(|| "missing request.params".to_owned())?;
+        let decisions = params
+            .get("decisions")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "missing params.decisions array".to_owned())?;
+        let mut modes = Vec::new();
+        for decision in decisions {
+            let mode = decision
+                .as_str()
+                .ok_or_else(|| "params.decisions entries must be strings".to_owned())?;
+            if !matches!(mode, "deny" | "once" | "always" | "all") {
+                return Err(format!("unsupported approval decision `{mode}`"));
+            }
+            if !modes.contains(&mode) {
+                modes.push(mode);
+            }
+        }
+        if !modes.contains(&"deny") || !modes.contains(&"once") {
+            return Err("params.decisions must include `deny` and `once`".into());
+        }
+        let approval_id = format!(
+            "approval:{source}:{surface_id}:{thread_id}:{turn_id}:{item_id}:{}",
+            jsonrpc_id
+        );
+        if let Some(result) = self.agent_approval_results.get(&approval_id).copied() {
+            return Ok(agent_approval_resolved_json(result));
+        }
+        let lifecycle_id = verified_claude_lifecycle.unwrap_or_else(|| {
+            self.agent_sessions
+                .get(&surface_id)
+                .and_then(|session| session.lifecycle.external_id.clone())
+                .unwrap_or_else(|| format!("{source}:{thread_id}"))
+        });
+        let summary = format!("[{source}] {kind} · {method} {request_params}");
+        let interaction = AgentInteractionRequest {
+            request_id: approval_id.clone(),
+            surface_id: surface_id.to_string(),
+            lifecycle_id,
+            agent_pid: None,
+            pid_start_time: None,
+            kind: IpcAgentRequestKind::new(IpcAgentRequestKind::PERMISSION),
+            message: summary.clone(),
+            choices: modes
+                .into_iter()
+                .map(|mode| wmcterm_ipc::AgentChoice {
+                    id: mode.into(),
+                    label: mode.into(),
+                })
+                .collect(),
+            deadline_unix_ms: params.get("deadline_unix_ms").and_then(Value::as_u64),
+        };
+        match self
+            .pending_agent_requests
+            .register(interaction)
+            .map_err(|error| error.to_string())?
+        {
+            wmcterm_ipc::RegisterOutcome::AlreadyCompleted(reply) => {
+                let mode = completed_approval_action(&reply).unwrap_or(AgentApprovalAction::Deny);
+                self.remember_agent_approval_result(approval_id, mode);
+                self.sync_surface_agent_request_state(surface_id);
+                Ok(agent_approval_resolved_json(mode))
+            }
+            wmcterm_ipc::RegisterOutcome::Inserted => {
+                self.sync_surface_agent_request_state(surface_id);
+                self.notifications_visible = true;
+                if approval_needs_native_notification(
+                    self.config.agent.notifications,
+                    self.window_focused,
+                    self.active_surface_id(),
+                    surface_id,
+                ) {
+                    show_native_notification(self.language.agent_approval(), &summary);
+                }
+                self.rebuild_scene();
+                Ok(json!({"status":"pending","approval_id":approval_id}))
+            }
+            wmcterm_ipc::RegisterOutcome::DuplicatePending => {
+                self.sync_surface_agent_request_state(surface_id);
+                self.notifications_visible = true;
+                self.rebuild_scene();
+                Ok(json!({"status":"pending","approval_id":approval_id}))
+            }
+        }
+    }
+
+    fn poll_agent_approval(&self, params: &Value) -> Result<Value, String> {
+        let approval_id = required_string(params, "approval_id")?;
+        if let Some(action) = self.agent_approval_results.get(approval_id).copied() {
+            return Ok(agent_approval_resolved_json(action));
+        }
+        if self
+            .pending_agent_requests
+            .get(approval_id)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            Ok(json!({"status":"pending","approval_id":approval_id}))
+        } else {
+            Err("approval_id not found".into())
+        }
+    }
+
+    fn handle_rpc(&mut self, request: Request) -> Response {
+        let id = request.id.clone();
+        let result: Result<Value, String> = (|| {
+            match request.method.as_str() {
+            "app.status" => Ok(json!({
+                "product": "wmcterm",
+                "version": env!("CARGO_PKG_VERSION"),
+                "active_workspace": self.state.active_workspace().map(|workspace| workspace.id),
+                "active_terminal": self.active_terminal_id(),
+                "workspaces": self.state.workspaces.len(),
+                "panes": self.state.panes.len(),
+                "surfaces": self.state.surfaces.len(),
+                "running_terminals": self.terminals.len(),
+                "unread_notifications": self.state.notifications.iter().filter(|item| !item.read).count(),
+            })),
+            "app.capabilities" => Ok(json!({
+                "protocol_version": 2,
+                "product": "wmcterm",
+                "version": env!("CARGO_PKG_VERSION"),
+                "context": {
+                    "marker_env": "WMCTERM",
+                    "workspace_env": "WMCTERM_WORKSPACE_ID",
+                    "pane_env": "WMCTERM_PANE_ID",
+                    "surface_env": "WMCTERM_SURFACE_ID",
+                    "terminal_lifecycle_env": "WMCTERM_TERMINAL_LIFECYCLE_ID",
+                    "control_socket_env": "WMCTERM_CONTROL_SOCKET",
+                    "legacy_socket_env": "WMCTERM_SOCKET",
+                    "implicit_surface_target": true,
+                    "explicit_surface_target": true,
+                    "atomic_target_create": true,
+                    "focus_preserving_create": true,
+                    "focus_preserving_documents": true,
+                    "atomic_close_others": true,
+                    "destructive_rpc_requires_target": true,
+                },
+                "create_options": [
+                    "workspace", "pane", "surface", "direction", "focus", "command", "cwd",
+                    "environment", "title"
+                ],
+                "agent_approval": {
+                    "register_method": "agent.approval.register",
+                    "poll_method": "agent.approval.poll",
+                    "sources": ["codex_app_server", "claude_hook"],
+                    "decision_modes": ["deny", "once", "always", "all"],
+                    "fail_closed": true
+                },
+                "methods": [
+                    "app.status", "workspace.list", "workspace.create", "workspace.activate",
+                    "workspace.rename", "workspace.describe", "workspace.move", "workspace.pin",
+                    "workspace.cwd",
+                    "workspace.close", "pane.list", "pane.split", "pane.focus", "pane.zoom",
+                    "pane.close", "pane.close-others", "surface.list", "surface.new", "surface.activate",
+                    "surface.close", "surface.close-others", "surface.read", "surface.search", "surface.markdown",
+                    "surface.logs", "screen.read", "send", "terminal.search", "terminal.clear",
+                    "terminal.scroll", "notification.list", "notification.mark", "notify",
+                    "agent.update", "agent.request.list", "agent.request.reply", "agent.request.cancel",
+                    "agent.approval.register", "agent.approval.poll"
+                ],
+                "control_keys": [
+                    "enter", "tab", "escape", "backspace", "up", "down", "left", "right",
+                    "ctrl+a..ctrl+z", "ctrl+space", "ctrl+[", "ctrl+\\", "ctrl+]", "ctrl+^", "ctrl+_"
+                ]
+            })),
+            "workspace.list" => Ok(json!(
+                self.state
+                    .workspaces
+                    .iter()
+                    .map(|w| json!({"id": w.id, "name": w.name, "cwd": w.cwd, "status": w.status, "description": w.description, "git_branch": w.git_branch, "pull_request": w.pull_request, "listening_ports": w.listening_ports, "pinned": w.pinned}))
+                    .collect::<Vec<_>>()
+            )),
+            "workspace.activate" | "workspace.rename" | "workspace.describe" | "workspace.cwd"
+            | "workspace.move" | "workspace.pin" | "workspace.close" => request
+                .params
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                .ok_or_else(|| "invalid params.id".to_owned())
+                .and_then(|workspace| {
+                    let command = match request.method.as_str() {
+                        "workspace.activate" => WorkspaceCommand::Activate { id: workspace },
+                        "workspace.rename" => WorkspaceCommand::Rename {
+                            id: workspace,
+                            name: request
+                                .params
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| "missing params.name".to_owned())?
+                                .to_owned(),
+                        },
+                        "workspace.describe" => WorkspaceCommand::Describe {
+                            id: workspace,
+                            description: request
+                                .params
+                                .get("description")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| "missing params.description".to_owned())?
+                                .to_owned(),
+                        },
+                        "workspace.cwd" => {
+                            let input = request
+                                .params
+                                .get("cwd")
+                                .and_then(Value::as_str)
+                                .ok_or_else(|| "missing params.cwd".to_owned())?;
+                            let current = self
+                                .state
+                                .workspaces
+                                .iter()
+                                .find(|item| item.id == workspace)
+                                .ok_or_else(|| "workspace not found".to_owned())?
+                                .cwd
+                                .clone();
+                            WorkspaceCommand::ChangeDirectory {
+                                id: workspace,
+                                cwd: resolve_existing_directory(input, &current)?,
+                            }
+                        }
+                        "workspace.move" => WorkspaceCommand::Move {
+                            id: workspace,
+                            offset: request
+                                .params
+                                .get("offset")
+                                .and_then(Value::as_i64)
+                                .unwrap_or(0) as isize,
+                        },
+                        "workspace.pin" => WorkspaceCommand::Pin {
+                            id: workspace,
+                            pinned: request.params.get("pinned").and_then(Value::as_bool).unwrap_or(true),
+                        },
+                        "workspace.close" => {
+                            let closed = self.remove_workspace_by_id(workspace);
+                            return Ok(json!({
+                                "workspace_id": workspace,
+                                "closed": closed,
+                                "confirmation_required": false,
+                            }));
+                        }
+                        _ => unreachable!(),
+                    };
+                    self.state
+                        .execute(AppCommand::Workspace(command))
+                        .map_err(|e| e.to_string())?;
+                    self.resize_terminals();
+                    if request.method == "workspace.cwd" {
+                        self.refresh_workspace_metadata();
+                    }
+                    self.rebuild_scene();
+                    Ok(json!({"ok": true}))
+                }),
+            "workspace.create" => {
+                let name = request
+                    .params
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or("workspace")
+                    .to_owned();
+                let process_cwd = env::current_dir().map_err(|error| error.to_string())?;
+                let cwd_input = request
+                    .params
+                    .get("cwd")
+                    .and_then(Value::as_str)
+                    .unwrap_or_else(|| process_cwd.to_str().unwrap_or("."));
+                // Validate before mutating AppState. A bad Agent-provided cwd
+                // must not leave an active workspace whose first PTY can never
+                // start.
+                let cwd = resolve_existing_directory(cwd_input, &process_cwd)?;
+                self.state
+                    .execute(AppCommand::Workspace(WorkspaceCommand::Create {
+                        name,
+                        cwd,
+                    }))
+                    .map_err(|e| e.to_string())
+                    .and_then(|_| {
+                        if let Some(command) = request.params.get("command").and_then(Value::as_str)
+                            && let Some(terminal) = self.active_terminal_id()
+                        {
+                            self.commands.insert(terminal, command.to_owned());
+                        }
+                        let missing: Vec<_> = self
+                            .state
+                            .surfaces
+                            .values()
+                            .filter_map(|s| match s.kind {
+                                SurfaceKind::Terminal(t) if !self.terminals.contains_key(&t) => {
+                                    Some(t)
+                                }
+                                _ => None,
+                            })
+                            .collect();
+                        for terminal in missing {
+                            if let Err(error) = self.spawn_terminal(terminal) {
+                                let message = error.to_string();
+                                self.report_terminal_notice(
+                                    terminal,
+                                    TerminalNotice::SpawnFailed(message.clone()),
+                                );
+                                self.rebuild_scene();
+                                return Err(message);
+                            }
+                        }
+                        self.resize_terminals();
+                        self.rebuild_scene();
+                        Ok(json!({"workspace_id": self.state.active_workspace().map(|w| w.id)}))
+                    })
+            }
+            "pane.split" => {
+                let placement = split_direction(&request.params)?;
+                let focus = request
+                    .params
+                    .get("focus")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let options = parse_terminal_create_options(&request.params)?;
+                let (workspace, pane) = self.rpc_target_pane(&request.params)?;
+                self.rpc_split_pane(workspace, pane, placement, options, focus)
+            }
+            "pane.list" => {
+                let mut panes = Vec::new();
+                let workspace_id = optional_uuid_param(&request.params, "workspace")?;
+                let workspace = match workspace_id {
+                    Some(id) => self.state.workspaces.iter().find(|workspace| workspace.id == id),
+                    None => self.state.active_workspace(),
+                };
+                if workspace_id.is_some() && workspace.is_none() {
+                    return Err("workspace not found".to_owned());
+                }
+                if let Some(workspace) = workspace {
+                    let mut ids = Vec::new();
+                    workspace.root.leaves(&mut ids);
+                    panes.extend(ids.into_iter().filter_map(|id| self.state.panes.get(&id)).map(
+                        |pane| json!({"id": pane.id, "surfaces": pane.surfaces, "active_surface": pane.active_surface, "zoomed": pane.zoomed}),
+                    ));
+                }
+                Ok(json!(panes))
+            }
+            "pane.close" | "pane.zoom" => {
+                let pane = request
+                    .params
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                    .ok_or_else(|| "invalid or missing params.id".to_owned())?;
+                if request.method == "pane.close" {
+                    if !self.state.panes.contains_key(&pane) {
+                        return Err("pane not found".into());
+                    }
+                    let can_remove = self.state.workspaces.iter().any(|workspace| {
+                        if !workspace.root.contains(pane) {
+                            return false;
+                        }
+                        let mut leaves = Vec::new();
+                        workspace.root.leaves(&mut leaves);
+                        leaves.len() > 1
+                    });
+                    if !can_remove {
+                        return Err("cannot close the last pane in a workspace".into());
+                    }
+                    let closed = self.remove_pane_by_id(pane);
+                    self.resize_terminals();
+                    self.rebuild_scene();
+                    return Ok(json!({
+                        "closed": usize::from(closed),
+                        "closed_ids": if closed { vec![pane] } else { Vec::new() },
+                        "confirmation_required": false,
+                    }));
+                } else {
+                    self.state
+                        .execute(AppCommand::Pane(PaneCommand::ToggleZoom { id: pane }))
+                        .map_err(|e| e.to_string())?;
+                    self.rebuild_scene();
+                }
+                Ok(json!({"ok": true}))
+            }
+            "pane.close-others" => {
+                let anchor = optional_uuid_param(&request.params, "anchor")?
+                    .ok_or_else(|| "missing params.anchor".to_owned())?;
+                let workspace = self
+                    .state
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.root.contains(anchor))
+                    .ok_or_else(|| "anchor pane not found".to_owned())?;
+                let mut candidates = Vec::new();
+                workspace.root.leaves(&mut candidates);
+                let targets = wmcterm_core::plan_close_others(&candidates, anchor)
+                    .map_err(|error| error.to_string())?;
+                let closed_ids = targets
+                    .iter()
+                    .copied()
+                    .filter(|pane| self.remove_pane_by_id(*pane))
+                    .collect::<Vec<_>>();
+                self.resize_terminals();
+                self.rebuild_scene();
+                Ok(json!({
+                    "anchor": anchor,
+                    "closed": closed_ids.len(),
+                    "closed_ids": closed_ids,
+                    "pending_ids": Vec::<PaneId>::new(),
+                    "confirmation_required": false,
+                }))
+            }
+            "surface.list" => {
+                let workspace_id = optional_uuid_param(&request.params, "workspace")?
+                    .ok_or_else(|| "missing params.workspace".to_owned())?;
+                let workspace = self.state.workspaces.iter().find(|workspace| workspace.id == workspace_id)
+                    .ok_or_else(|| "workspace not found".to_owned())?;
+                let mut pane_ids = Vec::new();
+                workspace.root.leaves(&mut pane_ids);
+                let surfaces = pane_ids.into_iter()
+                    .filter_map(|pane| self.state.panes.get(&pane))
+                    .flat_map(|pane| pane.surfaces.iter())
+                    .filter_map(|id| self.state.surfaces.get(id))
+                    .map(|surface| {
+                        let terminal = match surface.kind { SurfaceKind::Terminal(id) => Some(id), _ => None };
+                        json!({"id": surface.id, "title": surface.title, "kind": surface.kind, "terminal": terminal, "attention": surface.attention, "agent": surface.agent})
+                    }).collect::<Vec<_>>();
+                Ok(json!(surfaces))
+            },
+            "surface.read" | "surface.search" => {
+                let surface = request.params.get("id").and_then(Value::as_str).and_then(|value| uuid::Uuid::parse_str(value).ok()).or_else(|| {
+                    self.state.active_workspace().and_then(|workspace| self.state.panes.get(&workspace.active_pane)).and_then(|pane| pane.active_surface())
+                }).ok_or_else(|| "no surface selected".to_owned())?;
+                let backend = self.surface_backends.get(&surface).ok_or_else(|| "surface is not a document or log".to_owned())?;
+                if request.method == "surface.read" {
+                    Ok(json!({"text": backend.render_text()}))
+                } else {
+                    let query = request.params.get("query").and_then(Value::as_str).ok_or_else(|| "missing params.query".to_owned())?;
+                    Ok(json!(backend.search(query).into_iter().map(|item| json!({"line": item.line, "text": item.text})).collect::<Vec<_>>()))
+                }
+            }
+            "surface.activate" => request
+                .params
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                .ok_or_else(|| "invalid params.id".to_owned())
+                .and_then(|surface: SurfaceId| {
+                    self.activate_surface_id(surface).map_err(|error| error.to_string())?;
+                    Ok(json!({"ok": true}))
+                }),
+            "screen.read" => {
+                let terminal = self.terminal_for_params(&request.params)?;
+                let runtime = self.terminals.get(&terminal).ok_or_else(|| "target terminal is not running".to_owned())?;
+                Ok(json!({"text": runtime.snapshot.to_plain_text()}))
+            }
+            "send" => {
+                let text = request.params.get("text").and_then(Value::as_str).ok_or_else(|| "missing params.text".to_owned())?;
+                let terminal = self.terminal_for_params(&request.params)?;
+                let runtime = self.terminals.get(&terminal).ok_or_else(|| "target terminal is not running".to_owned())?;
+                let command = if request
+                    .params
+                    .get("paste")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    SessionCommand::Paste(text.to_owned())
+                } else {
+                    SessionCommand::Input(text.as_bytes().to_vec())
+                };
+                runtime.session.send(command).map_err(|error| error.to_string())?;
+                Ok(json!({"ok": true}))
+            }
+            "terminal.search" => {
+                let query = request.params.get("query").and_then(Value::as_str).ok_or_else(|| "missing params.query".to_owned())?.to_owned();
+                let direction = request.params.get("direction").and_then(Value::as_i64).unwrap_or(1) as isize;
+                let terminal = self.terminal_for_params(&request.params)?;
+                let runtime = self.terminals.get(&terminal).ok_or_else(|| "terminal is not running".to_owned())?;
+                runtime.session.send(SessionCommand::Search { query, direction }).map_err(|e| e.to_string())?;
+                Ok(json!({"ok": true}))
+            }
+            "terminal.clear" => {
+                let terminal = self.terminal_for_params(&request.params)?;
+                let runtime = self.terminals.get(&terminal).ok_or_else(|| "terminal is not running".to_owned())?;
+                runtime.session.send(SessionCommand::ClearScrollback).map_err(|e| e.to_string())?;
+                Ok(json!({"ok": true}))
+            }
+            "terminal.scroll" => {
+                let lines = request.params.get("lines").and_then(Value::as_i64).unwrap_or(0) as isize;
+                let terminal = self.terminal_for_params(&request.params)?;
+                let runtime = self.terminals.get(&terminal).ok_or_else(|| "terminal is not running".to_owned())?;
+                runtime.session.send(SessionCommand::Scroll(lines)).map_err(|e| e.to_string())?;
+                Ok(json!({"ok": true}))
+            }
+            "surface.new" => {
+                let focus = request
+                    .params
+                    .get("focus")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                let options = parse_terminal_create_options(&request.params)?;
+                let (workspace, pane) = self.rpc_target_pane(&request.params)?;
+                self.rpc_create_surface(workspace, pane, options, focus)
+            }
+            "surface.markdown" | "surface.logs" => {
+                let path = request.params.get("path").and_then(Value::as_str)
+                    .ok_or_else(|| "missing params.path".to_owned())?;
+                let focus = request.params.get("focus").and_then(Value::as_bool).unwrap_or(true);
+                let (workspace, pane) = self.rpc_target_pane(&request.params)?;
+                self.rpc_open_text_surface(
+                    workspace,
+                    pane,
+                    std::path::Path::new(path),
+                    request.method == "surface.logs",
+                    focus,
+                )
+            },
+            "surface.close" => {
+                let surface = optional_uuid_param(&request.params, "id")?
+                    .ok_or_else(|| "missing params.id".to_owned())?;
+                if !self.state.surfaces.contains_key(&surface) {
+                    return Err("surface not found".into());
+                }
+                let closed = self.remove_surface_by_id(surface);
+                self.resize_terminals();
+                self.rebuild_scene();
+                Ok(json!({
+                    "closed": usize::from(closed),
+                    "closed_ids": if closed { vec![surface] } else { Vec::new() },
+                    "confirmation_required": false,
+                }))
+            }
+            "surface.close-others" => {
+                let anchor = optional_uuid_param(&request.params, "anchor")?
+                    .ok_or_else(|| "missing params.anchor".to_owned())?;
+                let pane = self
+                    .state
+                    .panes
+                    .values()
+                    .find(|pane| pane.surfaces.contains(&anchor))
+                    .ok_or_else(|| "anchor surface not found".to_owned())?;
+                let targets = wmcterm_core::plan_close_others(&pane.surfaces, anchor)
+                    .map_err(|error| error.to_string())?;
+                let closed_ids = targets
+                    .iter()
+                    .copied()
+                    .filter(|surface| self.remove_surface_by_id(*surface))
+                    .collect::<Vec<_>>();
+                self.resize_terminals();
+                self.rebuild_scene();
+                Ok(json!({
+                    "anchor": anchor,
+                    "closed": closed_ids.len(),
+                    "closed_ids": closed_ids,
+                    "pending_ids": Vec::<SurfaceId>::new(),
+                    "confirmation_required": false,
+                }))
+            }
+            "notify" => {
+                let title = request
+                    .params
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or("wmcterm")
+                    .to_owned();
+                let body = request
+                    .params
+                    .get("body")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_owned();
+                let terminal = self.terminal_for_params(&request.params)?;
+                self.notify_terminal(terminal, &body);
+                if let Some(last) = self.state.notifications.last_mut() {
+                    last.title = title;
+                }
+                self.rebuild_scene();
+                Ok(json!({"ok": true}))
+            }
+            "notification.list" => Ok(json!(self.state.notifications)),
+            "notification.mark" => {
+                let notification = request
+                    .params
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
+                    .ok_or_else(|| "invalid params.id".to_owned())?;
+                let read = request
+                    .params
+                    .get("read")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(true);
+                if !self
+                    .state
+                    .notifications
+                    .iter()
+                    .any(|item| item.id == notification)
+                {
+                    return Err("notification not found".into());
+                }
+                self.set_notification_read(notification, read);
+                self.rebuild_scene();
+                Ok(json!({"ok": true}))
+            }
+            "agent.approval.register" => self.register_agent_approval(&request.params),
+            "agent.approval.poll" => self.poll_agent_approval(&request.params),
+            "agent.request.list" => self
+                .pending_agent_requests
+                .list()
+                .map(|requests| json!(requests))
+                .map_err(|error| error.to_string()),
+            "agent.request.reply" | "agent.request.cancel" => {
+                let request_id = request
+                    .params
+                    .get("request_id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| "missing params.request_id".to_owned())?;
+                let pending_request = self
+                    .pending_agent_requests
+                    .get(request_id)
+                    .map_err(|error| error.to_string())?;
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|value| value.as_millis() as u64)
+                    .unwrap_or_default();
+                let outcome = if request.method == "agent.request.cancel" {
+                    self.pending_agent_requests.cancel(
+                        request_id,
+                        request
+                            .params
+                            .get("reason")
+                            .and_then(Value::as_str)
+                            .unwrap_or("cancelled"),
+                        now,
+                    )
+                } else {
+                    let resolution = request
+                        .params
+                        .get("resolution")
+                        .cloned()
+                        .map(serde_json::from_value::<AgentResolution>)
+                        .transpose()
+                        .map_err(|error| error.to_string())?
+                        .unwrap_or_default();
+                    self.pending_agent_requests
+                        .resolve(request_id, resolution, now)
+                }
+                .map_err(|error| error.to_string())?;
+                let reply = match outcome {
+                    CompleteOutcome::Completed(reply) => {
+                        if let Some(request) = pending_request.as_ref() {
+                            self.conclude_agent_request_state(request);
+                        } else if let Ok(surface) = uuid::Uuid::parse_str(&reply.surface_id) {
+                            self.sync_surface_agent_request_state(surface);
+                        }
+                        reply
+                    }
+                    CompleteOutcome::AlreadyCompleted(reply) => reply,
+                };
+                if request_id.starts_with("approval:")
+                    && let Some(action) = completed_approval_action(&reply)
+                {
+                    self.remember_agent_approval_result(request_id.to_owned(), action);
+                }
+                self.rebuild_scene();
+                Ok(json!(reply))
+            }
+            "agent.update" => {
+                let claude_hook = request
+                    .params
+                    .get("claude_hook")
+                    .cloned()
+                    .map(serde_json::from_value::<ClaudeHookEvent>)
+                    .transpose()
+                    .map_err(|error| error.to_string())?;
+                serde_json::from_value::<AgentEvent>(request.params.clone())
+                    .map_err(|e| e.to_string())
+                    .and_then(|event| {
+                    let terminal = self.terminal_for_params(&request.params)?;
+                    if !self.record_agent_event(terminal, &request.params, &event)? {
+                        return Ok(json!({"ignored": true}));
+                    }
+                    let state = self.apply_agent_event(terminal, event);
+                    if let Some(hook) = claude_hook.as_ref() {
+                        self.record_claude_hook(terminal, hook)?;
+                    }
+                    self.rebuild_scene();
+                    Ok(json!({"state": state, "claude_subagents": self.claude_subagents.len()}))
+                })
+            }
+            "pane.focus" => request
+                .params
+                .get("id")
+                .and_then(Value::as_str)
+                .and_then(|v| uuid::Uuid::parse_str(v).ok())
+                .ok_or_else(|| "invalid params.id".to_owned())
+                .and_then(|pane| {
+                    self.state
+                        .execute(AppCommand::Pane(PaneCommand::Focus { id: pane }))
+                        .map_err(|e| e.to_string())
+                        .map(|_| {
+                            self.rebuild_scene();
+                            json!({"ok": true})
+                        })
+                }),
+            _ => Err(format!("unknown method: {}", request.method)),
+        }
+        })();
+        match result {
+            Ok(value) => Response::success(id, value),
+            Err(error) => Response::error(id, -32601, error),
+        }
+    }
+}
+
+impl ApplicationHandler<UserEvent> for WmctermApplication {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.renderer.is_some() {
+            return;
+        }
+        let mut attributes = default_window_attributes()
+            .with_inner_size(self.window_size)
+            .with_min_inner_size(LogicalSize::new(600.0, 360.0))
+            .with_window_icon(application_icon())
+            .with_decorations(false)
+            .with_transparent(self.config.window.opacity < 1.0);
+        #[cfg(target_os = "linux")]
+        if let Some(token) = event_loop.read_token_from_env() {
+            reset_activation_token_env();
+            attributes = attributes.with_activation_token(token);
+        }
+        if let Some(monitor) = event_loop.primary_monitor() {
+            let monitor_size = monitor.size();
+            let monitor_position = monitor.position();
+            let x = monitor_position.x
+                + monitor_size.width.saturating_sub(self.window_size.width) as i32 / 2;
+            let y = monitor_position.y
+                + monitor_size.height.saturating_sub(self.window_size.height) as i32 / 2;
+            attributes = attributes.with_position(PhysicalPosition::new(x, y));
+        }
+        match event_loop
+            .create_window(attributes)
+            .context("creating wmcterm window")
+            .and_then(|window| {
+                GpuRenderer::new(
+                    Arc::new(window),
+                    event_loop,
+                    self.config.terminal.font_family.clone(),
+                )
+            }) {
+            Ok(renderer) => {
+                renderer.window().set_ime_allowed(true);
+                self.renderer = Some(renderer);
+                self.resize_terminals();
+                self.rebuild_scene();
+            }
+            Err(error) => {
+                tracing::error!(%error, "renderer initialization failed");
+                event_loop.exit();
+            }
+        }
+    }
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.reload_config_if_changed();
+        if self.expire_agent_requests() {
+            self.rebuild_scene();
+        }
+        if self.last_metadata_refresh.elapsed() >= std::time::Duration::from_secs(5) {
+            self.refresh_workspace_metadata();
+            self.last_metadata_refresh = std::time::Instant::now();
+            self.rebuild_scene();
+        }
+        let mut document_changed = false;
+        for backend in self.surface_backends.values_mut() {
+            match backend.refresh() {
+                Ok(changed) => document_changed |= changed,
+                Err(error) => tracing::warn!(%error, "refreshing document surface failed"),
+            }
+        }
+        if document_changed {
+            self.rebuild_scene();
+        }
+        let mut wait = std::time::Duration::from_secs(1);
+        if self.update_selection_autoscroll() {
+            wait = wait.min(std::time::Duration::from_millis(16));
+        }
+        if self.notifications_visible
+            && let Some((_, started)) = self.notification_hover_started
+        {
+            const HOVER_DELAY: std::time::Duration = std::time::Duration::from_millis(800);
+            const LINE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1100);
+            let elapsed = started.elapsed();
+            let line = if elapsed < HOVER_DELAY {
+                0
+            } else {
+                1 + ((elapsed - HOVER_DELAY).as_millis() / LINE_INTERVAL.as_millis()) as usize
+            };
+            if line != self.notification_marquee_line {
+                self.notification_marquee_line = line;
+                self.rebuild_scene();
+            }
+            wait = std::time::Duration::from_millis(100);
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(std::time::Instant::now() + wait));
+    }
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::TerminalWake => self.drain_terminal_events(event_loop),
+            UserEvent::Rpc(request, response) => {
+                let _ = response.send(self.handle_rpc(request));
+            }
+            UserEvent::WorkspaceMetadata(metadata) => {
+                self.metadata_refresh_in_flight = false;
+                for update in metadata {
+                    if let Some(workspace) = self
+                        .state
+                        .workspaces
+                        .iter_mut()
+                        .find(|workspace| workspace.id == update.id)
+                    {
+                        workspace.git_branch = update.git_branch;
+                        workspace.listening_ports = update.listening_ports;
+                    }
+                }
+                self.rebuild_scene();
+            }
+        }
+    }
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => {
+                self.request_application_close();
+                if self.quit_requested {
+                    event_loop.exit();
+                }
+            }
+            WindowEvent::ModifiersChanged(value) => self.modifiers = value.state(),
+            WindowEvent::Ime(Ime::Commit(text)) => self.commit_ime_text(text),
+            WindowEvent::Ime(Ime::Preedit(text, _)) => self.update_ime_preedit(&text),
+            WindowEvent::Ime(Ime::Disabled) => self.update_ime_preedit(""),
+            WindowEvent::Focused(focused) => {
+                self.window_focused = focused;
+                if !focused {
+                    if self.notifications_visible {
+                        self.notifications_visible = false;
+                        self.notification_scroll = 0;
+                        self.notification_selection = 0;
+                        self.notification_context_menu = None;
+                        self.rebuild_scene();
+                    }
+                    self.sidebar_drag = false;
+                    self.scrollbar_drag = None;
+                    self.text_edit_drag = None;
+                    if self.terminal_mouse_capture.is_some() {
+                        self.send_captured_terminal_mouse(
+                            MouseActionInput::Release,
+                            Some(MouseButtonInput::Left),
+                        );
+                        self.terminal_mouse_capture = None;
+                    }
+                    self.mouse_pressed = false;
+                    self.selection_autoscroll_last = None;
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                self.cursor_position = (position.x as f32, position.y as f32);
+                self.update_palette_hover();
+                self.update_navigation_hover();
+                if self.mouse_pressed {
+                    self.update_mouse_action();
+                }
+                self.update_cursor_icon();
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                self.begin_mouse_action();
+                if self.quit_requested {
+                    event_loop.exit();
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: MouseButton::Left,
+                ..
+            } => self.finish_mouse_action(),
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Right,
+                ..
+            } => {
+                if self.close_confirmation.is_some() {
+                    return;
+                }
+                self.dismiss_notifications_outside_cursor();
+                if self.open_notification_context_menu()
+                    || self.open_workspace_context_menu()
+                    || self.open_tab_context_menu()
+                    || self.pointer_over_overlay()
+                    || (!self.modifiers.shift_key() && self.open_terminal_context_menu())
+                {
+                    return;
+                }
+                // Right-click paste and terminal mouse reporting are terminal-content
+                // actions. Do not let unhandled application chrome or document
+                // surfaces fall through to the active terminal.
+                let Some((_, terminal)) = self.terminal_at_cursor() else {
+                    return;
+                };
+                self.focus_at_cursor();
+                if self.mark_terminal_notifications_read(terminal) {
+                    self.rebuild_scene();
+                }
+                if self.modifiers.shift_key()
+                    || !self
+                        .send_terminal_mouse(MouseActionInput::Press, Some(MouseButtonInput::Right))
+                {
+                    self.paste_clipboard();
+                } else {
+                    self.send_terminal_mouse(
+                        MouseActionInput::Release,
+                        Some(MouseButtonInput::Right),
+                    );
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Middle,
+                ..
+            } => {
+                if self.close_confirmation.is_some() {
+                    return;
+                }
+                self.dismiss_notifications_outside_cursor();
+                if self.pointer_over_overlay() || self.scrollbar_at_cursor().is_some() {
+                    return;
+                }
+                if !self.focus_at_cursor() && self.terminal_at_cursor().is_some() {
+                    self.paste_clipboard();
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => -(y * 3.0) as isize,
+                    MouseScrollDelta::PixelDelta(position) => {
+                        -(position.y / self.cell_height() as f64) as isize
+                    }
+                };
+                if let Some((_, scroll)) = &mut self.agent_request_detail {
+                    *scroll = scroll.saturating_add_signed(lines.signum());
+                    self.rebuild_scene();
+                    return;
+                }
+                if self.notifications_visible
+                    && self
+                        .notification_panel()
+                        .contains(self.cursor_position.0, self.cursor_position.1)
+                {
+                    if lines != 0 {
+                        let pending_count = self.pending_agent_requests.len().unwrap_or_default();
+                        if pending_count > 0
+                            && self
+                                .agent_approval_region(pending_count)
+                                .contains(self.cursor_position.0, self.cursor_position.1)
+                        {
+                            self.scroll_agent_requests(lines);
+                        } else {
+                            self.scroll_notifications(lines);
+                        }
+                    }
+                    return;
+                }
+                if self.palette_visible {
+                    let registry = ActionRegistry::default();
+                    let actions = self.palette_actions(&registry);
+                    if self
+                        .command_palette_panel(actions.len())
+                        .contains(self.cursor_position.0, self.cursor_position.1)
+                    {
+                        if lines != 0 {
+                            self.scroll_palette(lines);
+                        }
+                        return;
+                    }
+                }
+                if self.pointer_over_overlay() {
+                    return;
+                }
+                if self.sidebar_visible && self.cursor_position.0 < self.sidebar_width() {
+                    if lines != 0 {
+                        self.scroll_sidebar(lines);
+                    }
+                    return;
+                }
+                if lines != 0 && self.scroll_tabs_at_cursor(lines) {
+                    return;
+                }
+                if lines != 0 {
+                    let button = if lines < 0 {
+                        MouseButtonInput::WheelUp
+                    } else {
+                        MouseButtonInput::WheelDown
+                    };
+                    if self.modifiers.shift_key()
+                        || !self.send_terminal_mouse(MouseActionInput::Press, Some(button))
+                    {
+                        self.scroll_surface_at_cursor(lines);
+                    }
+                }
+            }
+            WindowEvent::Resized(size) => {
+                self.window_size = size;
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.resize(size.width, size.height);
+                }
+                self.resize_terminals();
+                self.rebuild_scene();
+            }
+            WindowEvent::DroppedFile(path) => {
+                let text = shell_quote_path(&path);
+                if let Some((_, terminal)) =
+                    self.terminal_at_point(self.cursor_position.0, self.cursor_position.1)
+                {
+                    let notifications_changed = self.mark_terminal_notifications_read(terminal);
+                    if let Some(runtime) = self.terminals.get(&terminal) {
+                        let _ = runtime
+                            .session
+                            .send(SessionCommand::Input(text.into_bytes()));
+                    }
+                    if notifications_changed {
+                        self.rebuild_scene();
+                    }
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } => {
+                self.send_key(&event);
+                if self.quit_requested {
+                    event_loop.exit();
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                if let Some(renderer) = &mut self.renderer
+                    && let Err(error) = renderer.render()
+                {
+                    tracing::error!(%error, "render failed");
+                    event_loop.exit();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn shell_quote_path(path: &std::path::Path) -> String {
+    shell_quote_command(&path.to_string_lossy())
+}
+
+fn shell_quote_command(value: &str) -> String {
+    #[cfg(windows)]
+    {
+        format!("\"{}\"", value.replace('"', "\\\""))
+    }
+    #[cfg(not(windows))]
+    {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn codex_teams_command() -> String {
+    std::env::current_exe()
+        .map(|path| {
+            format!(
+                "{} codex-teams",
+                shell_quote_command(&path.to_string_lossy())
+            )
+        })
+        .unwrap_or_else(|_| "wmcterm codex-teams".into())
+}
+
+fn optional_uuid_param(params: &Value, name: &str) -> Result<Option<uuid::Uuid>, String> {
+    match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => uuid::Uuid::parse_str(value)
+            .map(Some)
+            .map_err(|_| format!("invalid params.{name}")),
+        Some(_) => Err(format!("params.{name} must be a UUID string")),
+    }
+}
+
+fn explicit_terminal_target(
+    params: &Value,
+) -> Result<(Option<TerminalId>, Option<SurfaceId>), String> {
+    let terminal = optional_uuid_param(params, "terminal")?;
+    let surface = optional_uuid_param(params, "surface")?;
+    if terminal.is_none() && surface.is_none() {
+        return Err("missing params.terminal or params.surface".into());
+    }
+    Ok((terminal, surface))
+}
+
+fn rpc_target_pane_in_state(state: &AppState, params: &Value) -> Result<(usize, PaneId), String> {
+    let requested_pane = optional_uuid_param(params, "pane")?;
+    let requested_surface = optional_uuid_param(params, "surface")?;
+    let requested_workspace = optional_uuid_param(params, "workspace")?;
+    let surface_pane = requested_surface
+        .map(|surface| {
+            state
+                .panes
+                .iter()
+                .find(|(_, pane)| pane.surfaces.contains(&surface))
+                .map(|(id, _)| *id)
+                .ok_or_else(|| "target surface not found".to_owned())
+        })
+        .transpose()?;
+    if let (Some(pane), Some(surface_pane)) = (requested_pane, surface_pane)
+        && pane != surface_pane
+    {
+        return Err("target pane does not contain target surface".into());
+    }
+    let workspace_index = requested_workspace
+        .map(|id| {
+            state
+                .workspaces
+                .iter()
+                .position(|workspace| workspace.id == id)
+                .ok_or_else(|| "target workspace not found".to_owned())
+        })
+        .transpose()?;
+    let pane = requested_pane
+        .or(surface_pane)
+        .or_else(|| workspace_index.map(|index| state.workspaces[index].active_pane))
+        .ok_or_else(|| "missing pane, surface, or workspace target".to_owned())?;
+    if !state.panes.contains_key(&pane) {
+        return Err("target pane not found".into());
+    }
+    let workspace = state
+        .workspaces
+        .iter()
+        .position(|workspace| workspace.root.contains(pane))
+        .ok_or_else(|| "target pane is not in a workspace".to_owned())?;
+    if workspace_index.is_some_and(|requested| requested != workspace) {
+        return Err("target pane is not in target workspace".into());
+    }
+    Ok((workspace, pane))
+}
+
+fn focus_created_surface(
+    state: &mut AppState,
+    workspace_index: usize,
+    pane_id: PaneId,
+    surface_id: Option<SurfaceId>,
+    focus: bool,
+) {
+    if !focus {
+        return;
+    }
+    state.active_workspace = workspace_index;
+    if let Some(workspace) = state.workspaces.get_mut(workspace_index) {
+        workspace.active_pane = pane_id;
+    }
+    if let (Some(surface), Some(pane)) = (surface_id, state.panes.get_mut(&pane_id))
+        && let Some(index) = pane.surfaces.iter().position(|id| *id == surface)
+    {
+        pane.active_surface = index;
+    }
+}
+
+fn parse_terminal_create_options(params: &Value) -> Result<TerminalCreateOptions, String> {
+    let command = optional_limited_string(params, "command", 65_536)?;
+    let title = optional_limited_string(params, "title", 256)?.map(|title| title.trim().to_owned());
+    if title.as_deref().is_some_and(str::is_empty) {
+        return Err("params.title must not be empty".into());
+    }
+    if title
+        .as_deref()
+        .is_some_and(|title| title.chars().any(char::is_control))
+    {
+        return Err("params.title must not contain control characters".into());
+    }
+    let cwd = match params.get("cwd") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if value.len() <= 4096 => {
+            let path = std::path::PathBuf::from(value);
+            if !path.is_dir() {
+                return Err("params.cwd must name an existing directory".into());
+            }
+            Some(path)
+        }
+        Some(Value::String(_)) => return Err("params.cwd is too long".into()),
+        Some(_) => return Err("params.cwd must be a string".into()),
+    };
+    let environment = parse_environment(params.get("environment"))?;
+    Ok(TerminalCreateOptions {
+        command,
+        cwd,
+        environment,
+        title,
+    })
+}
+
+fn optional_limited_string(
+    params: &Value,
+    name: &str,
+    maximum: usize,
+) -> Result<Option<String>, String> {
+    match params.get(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) if value.len() <= maximum && !value.contains('\0') => {
+            Ok(Some(value.clone()))
+        }
+        Some(Value::String(_)) => Err(format!("params.{name} is too long or contains NUL")),
+        Some(_) => Err(format!("params.{name} must be a string")),
+    }
+}
+
+fn parse_environment(value: Option<&Value>) -> Result<Vec<(String, String)>, String> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let object = value
+        .as_object()
+        .ok_or_else(|| "params.environment must be an object of strings".to_owned())?;
+    if object.len() > 64 {
+        return Err("params.environment may contain at most 64 entries".into());
+    }
+    object
+        .iter()
+        .map(|(key, value)| {
+            if !valid_environment_key(key) {
+                return Err(format!("unsafe environment key: {key}"));
+            }
+            let value = value
+                .as_str()
+                .ok_or_else(|| format!("environment value for {key} must be a string"))?;
+            if value.len() > 32_768 || value.contains('\0') {
+                return Err(format!(
+                    "environment value for {key} is too long or contains NUL"
+                ));
+            }
+            Ok((key.clone(), value.to_owned()))
+        })
+        .collect()
+}
+
+fn valid_environment_key(key: &str) -> bool {
+    if key.is_empty() || key.len() > 128 {
+        return false;
+    }
+    let mut chars = key.chars();
+    if !chars
+        .next()
+        .is_some_and(|ch| ch == '_' || ch.is_ascii_alphabetic())
+        || !chars.all(|ch| ch == '_' || ch.is_ascii_alphanumeric())
+    {
+        return false;
+    }
+    let upper = key.to_ascii_uppercase();
+    upper != "WMCTERM"
+        && !upper.starts_with("WMCTERM_")
+        && upper != "LD_PRELOAD"
+        && !upper.starts_with("DYLD_")
+}
+
+fn resolve_existing_directory(
+    input: &str,
+    relative_to: &std::path::Path,
+) -> Result<std::path::PathBuf, String> {
+    if input.trim().is_empty() {
+        return Err("path cannot be empty".into());
+    }
+    let expanded = wmcterm_config::expand_home_path(std::path::Path::new(input.trim()));
+    let candidate = if expanded.is_absolute() {
+        expanded
+    } else {
+        relative_to.join(expanded)
+    };
+    let resolved = candidate
+        .canonicalize()
+        .map_err(|error| format!("{} ({error})", candidate.display()))?;
+    if !resolved.is_dir() {
+        return Err(format!("{} is not a directory", resolved.display()));
+    }
+    Ok(resolved)
+}
+
+fn select_new_workspace_cwd(
+    inherit_cwd: bool,
+    active: Option<&std::path::Path>,
+    default: Option<&std::path::Path>,
+    process: &std::path::Path,
+) -> std::path::PathBuf {
+    inherit_cwd
+        .then_some(active)
+        .flatten()
+        .or(default)
+        .unwrap_or(process)
+        .to_path_buf()
+}
+
+fn split_direction(params: &Value) -> Result<SplitPlacement, String> {
+    match params
+        .get("direction")
+        .and_then(Value::as_str)
+        .unwrap_or("right")
+    {
+        "right" | "vertical" => Ok(SplitPlacement {
+            axis: SplitAxis::Vertical,
+            new_first: false,
+        }),
+        "left" => Ok(SplitPlacement {
+            axis: SplitAxis::Vertical,
+            new_first: true,
+        }),
+        "down" | "horizontal" => Ok(SplitPlacement {
+            axis: SplitAxis::Horizontal,
+            new_first: false,
+        }),
+        "up" => Ok(SplitPlacement {
+            axis: SplitAxis::Horizontal,
+            new_first: true,
+        }),
+        _ => Err("params.direction must be left, right, up, down, vertical, or horizontal".into()),
+    }
+}
+
+fn place_new_split_first(node: &mut PaneNode, target: PaneId, new_pane: PaneId) -> bool {
+    let PaneNode::Split { first, second, .. } = node else {
+        return false;
+    };
+    if matches!(&**first, PaneNode::Leaf { pane } if *pane == target)
+        && matches!(&**second, PaneNode::Leaf { pane } if *pane == new_pane)
+    {
+        std::mem::swap(first, second);
+        return true;
+    }
+    place_new_split_first(first, target, new_pane)
+        || place_new_split_first(second, target, new_pane)
+}
+
+#[derive(Clone, Copy)]
+struct DocumentColors {
+    text: [u8; 4],
+    muted: [u8; 4],
+    accent: [u8; 4],
+    heading: [u8; 4],
+    code: [u8; 4],
+    warning: [u8; 4],
+    error: [u8; 4],
+}
+
+const fn neutral_document_colors() -> DocumentColors {
+    DocumentColors {
+        text: [255; 4],
+        muted: [160, 160, 160, 255],
+        accent: [120, 160, 255, 255],
+        heading: [255, 220, 120, 255],
+        code: [140, 220, 140, 255],
+        warning: [255, 180, 100, 255],
+        error: [255, 100, 100, 255],
+    }
+}
+
+const fn tab_context_action_enabled(action: TabContextAction, tab_count: usize) -> bool {
+    match action {
+        TabContextAction::Close => tab_count > 0,
+        TabContextAction::CloseOthers => tab_count > 1,
+        TabContextAction::NewSurface => true,
+    }
+}
+
+fn terminal_context_action_enabled(
+    action: TerminalContextAction,
+    selection: Option<MouseSelection>,
+    pane: PaneId,
+) -> bool {
+    match action {
+        TerminalContextAction::Copy => match selection {
+            Some(selection) => selection.pane == pane && selection.start != selection.end,
+            None => false,
+        },
+        TerminalContextAction::Paste
+        | TerminalContextAction::CopyAll
+        | TerminalContextAction::ClearScrollback => true,
+    }
+}
+
+const fn workspace_context_action_enabled(
+    action: WorkspaceContextAction,
+    workspace_count: usize,
+) -> bool {
+    match action {
+        WorkspaceContextAction::Close => workspace_count > 0,
+        WorkspaceContextAction::NewSurface
+        | WorkspaceContextAction::Rename
+        | WorkspaceContextAction::Describe
+        | WorkspaceContextAction::ChangeDirectory
+        | WorkspaceContextAction::TogglePin => true,
+    }
+}
+
+fn context_menu_frame(panel: ui::Bounds, background: [u8; 4], border: [u8; 4]) -> [RectBlock; 3] {
+    [
+        RectBlock {
+            left: panel.x + 4.0,
+            top: panel.y + 4.0,
+            width: panel.width,
+            height: panel.height,
+            color: [0, 0, 0, 105],
+        },
+        RectBlock {
+            left: panel.x,
+            top: panel.y,
+            width: panel.width,
+            height: panel.height,
+            color: border,
+        },
+        RectBlock {
+            left: panel.x + 1.0,
+            top: panel.y + 1.0,
+            width: (panel.width - 2.0).max(1.0),
+            height: (panel.height - 2.0).max(1.0),
+            color: background,
+        },
+    ]
+}
+
+fn notification_destination(
+    state: &AppState,
+    notification: uuid::Uuid,
+) -> Option<NotificationDestination> {
+    let notification = state
+        .notifications
+        .iter()
+        .find(|item| item.id == notification)?;
+    let workspace_index = state
+        .workspaces
+        .iter()
+        .position(|workspace| workspace.id == notification.workspace)?;
+    let workspace = &state.workspaces[workspace_index];
+    let surface = state.panes.iter().find_map(|(pane_id, pane)| {
+        if !workspace.root.contains(*pane_id) {
+            return None;
+        }
+        pane.surfaces
+            .iter()
+            .position(|surface| *surface == notification.surface)
+            .map(|index| (*pane_id, index))
+    });
+    Some(NotificationDestination {
+        workspace_index,
+        pane: surface,
+        surface: notification.surface,
+    })
+}
+
+fn non_actionable_agent_exit(event: &AgentEvent) -> bool {
+    let AgentEvent::Stop {
+        success: true,
+        message: Some(message),
+    } = event
+    else {
+        return false;
+    };
+    matches!(
+        message
+            .trim()
+            .to_ascii_lowercase()
+            .replace(['-', '_'], " ")
+            .as_str(),
+        "other" | "exit" | "exited" | "user exit" | "user requested" | "logout"
+    )
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StyledDocumentLine {
+    text: String,
+    color: [u8; 4],
+    bold: bool,
+    italic: bool,
+}
+
+fn plain_span(text: impl Into<String>, color: [u8; 4]) -> TextSpan {
+    TextSpan {
+        text: text.into(),
+        color,
+        bold: false,
+        italic: false,
+    }
+}
+
+fn markdown_lines(document: &MarkdownDocument, colors: DocumentColors) -> Vec<StyledDocumentLine> {
+    let mut lines = Vec::new();
+    for block in &document.blocks {
+        match block {
+            MarkdownBlock::Heading { level, text } => lines.push(StyledDocumentLine {
+                text: format!("{} {text}", if *level <= 2 { "▌" } else { "·" }),
+                color: if *level == 1 {
+                    colors.heading
+                } else {
+                    colors.accent
+                },
+                bold: true,
+                italic: false,
+            }),
+            MarkdownBlock::Paragraph(text) => lines.push(StyledDocumentLine {
+                text: text.clone(),
+                color: colors.text,
+                bold: false,
+                italic: false,
+            }),
+            MarkdownBlock::CodeBlock { language, code } => {
+                lines.push(StyledDocumentLine {
+                    text: format!("┌─ {}", language.as_deref().unwrap_or("code")),
+                    color: colors.muted,
+                    bold: true,
+                    italic: false,
+                });
+                lines.extend(code.lines().map(|line| StyledDocumentLine {
+                    text: format!("│ {line}"),
+                    color: colors.code,
+                    bold: false,
+                    italic: false,
+                }));
+                lines.push(StyledDocumentLine {
+                    text: "└─".into(),
+                    color: colors.muted,
+                    bold: false,
+                    italic: false,
+                });
+            }
+            MarkdownBlock::List { ordered, items } => {
+                lines.extend(
+                    items
+                        .iter()
+                        .enumerate()
+                        .map(|(index, item)| StyledDocumentLine {
+                            text: if *ordered {
+                                format!("  {}. {item}", index + 1)
+                            } else {
+                                format!("  • {item}")
+                            },
+                            color: colors.text,
+                            bold: false,
+                            italic: false,
+                        }),
+                );
+            }
+            MarkdownBlock::Quote(text) => {
+                lines.extend(text.lines().map(|line| StyledDocumentLine {
+                    text: format!("│ {line}"),
+                    color: colors.muted,
+                    bold: false,
+                    italic: true,
+                }));
+            }
+            MarkdownBlock::ThematicBreak => lines.push(StyledDocumentLine {
+                text: "────────────────────────────────".into(),
+                color: colors.muted,
+                bold: false,
+                italic: false,
+            }),
+        }
+        lines.push(StyledDocumentLine {
+            text: String::new(),
+            color: colors.text,
+            bold: false,
+            italic: false,
+        });
+    }
+    lines
+}
+
+fn markdown_spans(
+    document: &MarkdownDocument,
+    offset: usize,
+    limit: usize,
+    colors: DocumentColors,
+    search: Option<&str>,
+) -> Vec<TextSpan> {
+    styled_lines_to_spans(
+        markdown_lines(document, colors),
+        offset,
+        limit,
+        search,
+        colors.heading,
+    )
+}
+
+fn log_level_color(level: LogLevel, colors: DocumentColors) -> [u8; 4] {
+    match level {
+        LogLevel::Trace | LogLevel::Debug => colors.muted,
+        LogLevel::Info | LogLevel::Unknown => colors.text,
+        LogLevel::Warn => colors.warning,
+        LogLevel::Error | LogLevel::Fatal => colors.error,
+    }
+}
+
+fn log_lines(logs: &LogSurface, colors: DocumentColors) -> Vec<StyledDocumentLine> {
+    logs.visible_entries()
+        .map(|entry| StyledDocumentLine {
+            text: entry.text.clone(),
+            color: log_level_color(entry.level, colors),
+            bold: matches!(entry.level, LogLevel::Error | LogLevel::Fatal),
+            italic: false,
+        })
+        .collect()
+}
+
+fn log_spans(
+    logs: &LogSurface,
+    offset: usize,
+    limit: usize,
+    colors: DocumentColors,
+    search: Option<&str>,
+) -> Vec<TextSpan> {
+    styled_lines_to_spans(
+        log_lines(logs, colors),
+        offset,
+        limit,
+        search,
+        colors.heading,
+    )
+}
+
+fn styled_lines_to_spans(
+    lines: Vec<StyledDocumentLine>,
+    offset: usize,
+    limit: usize,
+    search: Option<&str>,
+    match_color: [u8; 4],
+) -> Vec<TextSpan> {
+    let query = search
+        .filter(|query| !query.is_empty())
+        .map(str::to_lowercase);
+    let visible: Vec<_> = lines.into_iter().skip(offset).take(limit).collect();
+    let visible_len = visible.len();
+    visible
+        .into_iter()
+        .enumerate()
+        .map(|(index, line)| TextSpan {
+            text: format!(
+                "{}{}",
+                line.text,
+                if index + 1 < visible_len { "\n" } else { "" }
+            ),
+            color: if query
+                .as_ref()
+                .is_some_and(|query| line.text.to_lowercase().contains(query))
+            {
+                match_color
+            } else {
+                line.color
+            },
+            bold: line.bold,
+            italic: line.italic,
+        })
+        .collect()
+}
+
+fn document_search_offsets(backend: &dyn SurfaceBackend, query: &str) -> Vec<usize> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let query = query.to_lowercase();
+    if let Some(markdown) = backend.as_any().downcast_ref::<MarkdownSurface>() {
+        return markdown_lines(markdown.document(), neutral_document_colors())
+            .iter()
+            .enumerate()
+            .filter_map(|(index, line)| line.text.to_lowercase().contains(&query).then_some(index))
+            .collect();
+    }
+    if let Some(logs) = backend.as_any().downcast_ref::<LogSurface>() {
+        return logs
+            .visible_entries()
+            .enumerate()
+            .filter_map(|(index, entry)| {
+                entry.text.to_lowercase().contains(&query).then_some(index)
+            })
+            .collect();
+    }
+    backend
+        .render_text()
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| line.to_lowercase().contains(&query).then_some(index))
+        .collect()
+}
+
+fn parse_log_filter(input: &str) -> LogFilter {
+    let mut levels = None;
+    let mut query = Vec::new();
+    for token in input.split_whitespace() {
+        if let Some(values) = token.strip_prefix("level:") {
+            let parsed: Vec<_> = values.split(',').filter_map(parse_log_level).collect();
+            if !parsed.is_empty() {
+                levels = Some(parsed);
+            }
+        } else {
+            query.push(token);
+        }
+    }
+    LogFilter {
+        query: (!query.is_empty()).then(|| query.join(" ")),
+        levels,
+    }
+}
+
+fn parse_log_level(value: &str) -> Option<LogLevel> {
+    match value.to_ascii_lowercase().as_str() {
+        "trace" => Some(LogLevel::Trace),
+        "debug" => Some(LogLevel::Debug),
+        "info" => Some(LogLevel::Info),
+        "warn" | "warning" => Some(LogLevel::Warn),
+        "error" | "err" => Some(LogLevel::Error),
+        "fatal" | "panic" => Some(LogLevel::Fatal),
+        "unknown" => Some(LogLevel::Unknown),
+        _ => None,
+    }
+}
+
+fn format_log_filter(filter: &LogFilter) -> String {
+    let mut parts = Vec::new();
+    if let Some(levels) = &filter.levels {
+        let values = levels
+            .iter()
+            .map(|level| format!("{level:?}").to_ascii_lowercase())
+            .collect::<Vec<_>>()
+            .join(",");
+        parts.push(format!("level:{values}"));
+    }
+    if let Some(query) = &filter.query {
+        parts.push(query.clone());
+    }
+    parts.join(" ")
+}
+
+fn editor_spans(
+    editor: &TextEditor,
+    normal: [u8; 4],
+    selected: [u8; 4],
+    cursor_text: [u8; 4],
+    viewport: TextViewport,
+) -> Vec<TextSpan> {
+    fn push(spans: &mut Vec<TextSpan>, text: &str, color: [u8; 4]) {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(last) = spans.last_mut()
+            && last.color == color
+            && !last.bold
+            && !last.italic
+        {
+            last.text.push_str(text);
+        } else {
+            spans.push(TextSpan {
+                text: text.into(),
+                color,
+                bold: false,
+                italic: false,
+            });
+        }
+    }
+
+    let selection = editor.selection_range();
+    let cursor = editor.cursor_byte();
+    let mut spans = Vec::new();
+    for (byte, character) in editor
+        .text()
+        .char_indices()
+        .filter(|(byte, _)| *byte >= viewport.start_byte && *byte < viewport.end_byte)
+    {
+        if byte == cursor && editor.has_preedit() {
+            push(&mut spans, &format!("「{}」", editor.preedit()), normal);
+        }
+        let color = if selection
+            .as_ref()
+            .is_some_and(|range| range.contains(&byte))
+        {
+            selected
+        } else if selection.is_none() && byte == cursor && !editor.has_preedit() {
+            cursor_text
+        } else {
+            normal
+        };
+        push(&mut spans, &character.to_string(), color);
+    }
+    if cursor == editor.text().len()
+        && cursor >= viewport.start_byte
+        && cursor <= viewport.end_byte
+        && editor.has_preedit()
+    {
+        push(&mut spans, &format!("「{}」", editor.preedit()), normal);
+    }
+    spans
+}
+
+struct EditorHighlightStyle {
+    character_width: f32,
+    colors: ([u8; 4], [u8; 4]),
+    viewport: TextViewport,
+}
+
+fn push_editor_highlights(
+    rectangles: &mut Vec<RectBlock>,
+    editor: &TextEditor,
+    left: f32,
+    top: f32,
+    height: f32,
+    style: EditorHighlightStyle,
+) {
+    let EditorHighlightStyle {
+        character_width,
+        colors: (selection, cursor),
+        viewport,
+    } = style;
+    if let Some((start, end)) = editor.selection_display_columns() {
+        let start = start.max(viewport.start_column);
+        let end = end.min(viewport.start_column + viewport.columns);
+        if start >= end {
+            return;
+        }
+        rectangles.push(RectBlock {
+            left: left + (start - viewport.start_column) as f32 * character_width,
+            top,
+            width: ((end - start) as f32 * character_width).max(1.0),
+            height,
+            color: selection,
+        });
+    } else if !editor.has_preedit() {
+        rectangles.push(RectBlock {
+            left: left
+                + (editor.cursor_display_column() - viewport.start_column) as f32 * character_width,
+            top,
+            width: editor.cursor_cell_width() as f32 * character_width,
+            height,
+            color: cursor,
+        });
+    }
+}
+
+fn editor_columns(width: f32, character_width: f32) -> usize {
+    (width.max(character_width) / character_width).floor() as usize
+}
+
+const fn theme_rgba(color: ThemeColor) -> [u8; 4] {
+    [color.r, color.g, color.b, color.a]
+}
+
+fn terminal_theme(theme: &ThemeConfig) -> TerminalTheme {
+    let rgb = |color: ThemeColor| Rgb {
+        r: color.r,
+        g: color.g,
+        b: color.b,
+    };
+    TerminalTheme {
+        foreground: rgb(theme.foreground),
+        background: rgb(theme.background),
+        cursor: rgb(theme.cursor),
+        palette: theme.palette.iter().copied().map(rgb).collect(),
+    }
+}
+
+fn terminal_background_is_light(color: ThemeColor) -> bool {
+    (0.299 * f32::from(color.r) + 0.587 * f32::from(color.g) + 0.114 * f32::from(color.b)) / 255.0
+        > 0.5
+}
+
+fn application_icon() -> Option<Icon> {
+    let rgba = image::load_from_memory(include_bytes!("../../../assets/icons/icon.png"))
+        .ok()?
+        .into_rgba8();
+    let (width, height) = rgba.dimensions();
+    Icon::from_rgba(rgba.into_raw(), width, height).ok()
+}
+
+fn physical_ascii_character(key: PhysicalKey) -> Option<char> {
+    let character = match key {
+        PhysicalKey::Code(KeyCode::KeyA) => 'a',
+        PhysicalKey::Code(KeyCode::KeyB) => 'b',
+        PhysicalKey::Code(KeyCode::KeyC) => 'c',
+        PhysicalKey::Code(KeyCode::KeyD) => 'd',
+        PhysicalKey::Code(KeyCode::KeyE) => 'e',
+        PhysicalKey::Code(KeyCode::KeyF) => 'f',
+        PhysicalKey::Code(KeyCode::KeyG) => 'g',
+        PhysicalKey::Code(KeyCode::KeyH) => 'h',
+        PhysicalKey::Code(KeyCode::KeyI) => 'i',
+        PhysicalKey::Code(KeyCode::KeyJ) => 'j',
+        PhysicalKey::Code(KeyCode::KeyK) => 'k',
+        PhysicalKey::Code(KeyCode::KeyL) => 'l',
+        PhysicalKey::Code(KeyCode::KeyM) => 'm',
+        PhysicalKey::Code(KeyCode::KeyN) => 'n',
+        PhysicalKey::Code(KeyCode::KeyO) => 'o',
+        PhysicalKey::Code(KeyCode::KeyP) => 'p',
+        PhysicalKey::Code(KeyCode::KeyQ) => 'q',
+        PhysicalKey::Code(KeyCode::KeyR) => 'r',
+        PhysicalKey::Code(KeyCode::KeyS) => 's',
+        PhysicalKey::Code(KeyCode::KeyT) => 't',
+        PhysicalKey::Code(KeyCode::KeyU) => 'u',
+        PhysicalKey::Code(KeyCode::KeyV) => 'v',
+        PhysicalKey::Code(KeyCode::KeyW) => 'w',
+        PhysicalKey::Code(KeyCode::KeyX) => 'x',
+        PhysicalKey::Code(KeyCode::KeyY) => 'y',
+        PhysicalKey::Code(KeyCode::KeyZ) => 'z',
+        _ => return None,
+    };
+    Some(character)
+}
+
+fn terminal_input_key(logical_key: &Key, physical_character: Option<char>) -> Option<InputKey> {
+    match logical_key {
+        Key::Character(value) => value
+            .chars()
+            .next()
+            .filter(|character| !character.is_control())
+            .or(physical_character)
+            .map(InputKey::Character),
+        Key::Named(NamedKey::Enter) => Some(InputKey::Enter),
+        Key::Named(NamedKey::Backspace) => Some(InputKey::Backspace),
+        Key::Named(NamedKey::Tab) => Some(InputKey::Tab),
+        Key::Named(NamedKey::Escape) => Some(InputKey::Escape),
+        Key::Named(NamedKey::ArrowUp) => Some(InputKey::Up),
+        Key::Named(NamedKey::ArrowDown) => Some(InputKey::Down),
+        Key::Named(NamedKey::ArrowRight) => Some(InputKey::Right),
+        Key::Named(NamedKey::ArrowLeft) => Some(InputKey::Left),
+        Key::Named(NamedKey::Home) => Some(InputKey::Home),
+        Key::Named(NamedKey::End) => Some(InputKey::End),
+        Key::Named(NamedKey::PageUp) => Some(InputKey::PageUp),
+        Key::Named(NamedKey::PageDown) => Some(InputKey::PageDown),
+        Key::Named(NamedKey::Delete) => Some(InputKey::Delete),
+        Key::Named(NamedKey::Insert) => Some(InputKey::Insert),
+        Key::Named(NamedKey::Space) => Some(InputKey::Space),
+        _ => None,
+    }
+}
+
+fn is_window_switch_shortcut(logical_key: &Key, modifiers: ModifiersState) -> bool {
+    matches!(logical_key, Key::Named(NamedKey::Tab))
+        && (modifiers.alt_key() || modifiers.super_key())
+}
+
+fn text_edit_shortcut(event: &KeyEvent, modifiers: ModifiersState) -> Option<TextEditShortcut> {
+    if !(modifiers.control_key() || modifiers.super_key()) || modifiers.alt_key() {
+        return None;
+    }
+    let character = match &event.logical_key {
+        Key::Character(value) if value.len() == 1 => value.chars().next(),
+        _ => physical_ascii_character(event.physical_key),
+    }?;
+    match character.to_ascii_lowercase() {
+        'a' => Some(TextEditShortcut::SelectAll),
+        'c' => Some(TextEditShortcut::Copy),
+        'x' => Some(TextEditShortcut::Cut),
+        _ => None,
+    }
+}
+
+fn apply_text_edit_shortcut(editor: &mut TextEditor, shortcut: TextEditShortcut) -> Option<String> {
+    match shortcut {
+        TextEditShortcut::SelectAll => {
+            editor.select_all();
+            None
+        }
+        TextEditShortcut::Copy => editor.selected_text().map(ToOwned::to_owned),
+        TextEditShortcut::Cut => editor.take_selection(),
+    }
+}
+
+fn shortcut_for_event(event: &KeyEvent, modifiers: ModifiersState) -> Option<Shortcut> {
+    let key = match &event.logical_key {
+        Key::Character(value) if !value.chars().any(char::is_control) => value.to_ascii_lowercase(),
+        Key::Named(NamedKey::Enter) => "enter".into(),
+        Key::Named(NamedKey::Tab) => "tab".into(),
+        Key::Named(NamedKey::Space) => "space".into(),
+        Key::Named(NamedKey::Escape) => "escape".into(),
+        Key::Named(NamedKey::Backspace) => "backspace".into(),
+        Key::Named(NamedKey::Delete) => "delete".into(),
+        Key::Named(NamedKey::Insert) => "insert".into(),
+        Key::Named(NamedKey::Home) => "home".into(),
+        Key::Named(NamedKey::End) => "end".into(),
+        Key::Named(NamedKey::PageUp) => "pageup".into(),
+        Key::Named(NamedKey::PageDown) => "pagedown".into(),
+        Key::Named(NamedKey::ArrowUp) => "up".into(),
+        Key::Named(NamedKey::ArrowDown) => "down".into(),
+        Key::Named(NamedKey::ArrowLeft) => "left".into(),
+        Key::Named(NamedKey::ArrowRight) => "right".into(),
+        _ => physical_ascii_character(event.physical_key)?.to_string(),
+    };
+    Some(Shortcut {
+        ctrl: modifiers.control_key(),
+        alt: modifiers.alt_key(),
+        shift: modifiers.shift_key(),
+        super_key: modifiers.super_key(),
+        key,
+    })
+}
+
+fn format_shortcut_hint(shortcut: &Shortcut) -> String {
+    let mut parts = Vec::new();
+    if shortcut.ctrl {
+        parts.push("Ctrl".to_owned());
+    }
+    if shortcut.alt {
+        parts.push("Alt".to_owned());
+    }
+    if shortcut.shift {
+        parts.push("Shift".to_owned());
+    }
+    if shortcut.super_key {
+        parts.push("Super".to_owned());
+    }
+    let key = match shortcut.key.as_str() {
+        "escape" => "Esc".to_owned(),
+        "pageup" => "PageUp".to_owned(),
+        "pagedown" => "PageDown".to_owned(),
+        "backspace" => "Backspace".to_owned(),
+        "delete" => "Delete".to_owned(),
+        "insert" => "Insert".to_owned(),
+        "enter" => "Enter".to_owned(),
+        "space" => "Space".to_owned(),
+        "left" => "←".to_owned(),
+        "right" => "→".to_owned(),
+        "up" => "↑".to_owned(),
+        "down" => "↓".to_owned(),
+        key if key.len() == 1 => key.to_ascii_uppercase(),
+        key => {
+            let mut characters = key.chars();
+            characters
+                .next()
+                .map(|first| first.to_uppercase().collect::<String>() + characters.as_str())
+                .unwrap_or_default()
+        }
+    };
+    parts.push(key);
+    parts.join("+")
+}
+
+fn workspace_requires_close_confirmation(terminal_count: usize, process_count: usize) -> bool {
+    terminal_count > 1 || process_count > 0
+}
+
+fn application_requires_close_confirmation(
+    process_count: usize,
+    pending_request_count: usize,
+) -> bool {
+    process_count > 0 || pending_request_count > 0
+}
+
+fn agent_state_priority(state: wmcterm_core::AgentState) -> u8 {
+    match state {
+        wmcterm_core::AgentState::Error => 5,
+        wmcterm_core::AgentState::WaitingForInput
+        | wmcterm_core::AgentState::WaitingForPermission => 4,
+        wmcterm_core::AgentState::Running => 3,
+        wmcterm_core::AgentState::Completed => 2,
+        wmcterm_core::AgentState::Idle | wmcterm_core::AgentState::Unknown => 1,
+    }
+}
+
+fn pending_agent_state_for_surface(
+    requests: &[AgentInteractionRequest],
+    surface: SurfaceId,
+) -> Option<wmcterm_core::AgentState> {
+    let surface = surface.to_string();
+    let mut has_request = false;
+    for request in requests
+        .iter()
+        .filter(|request| request.surface_id == surface)
+    {
+        has_request = true;
+        if request.kind.as_str() == IpcAgentRequestKind::PERMISSION {
+            return Some(wmcterm_core::AgentState::WaitingForPermission);
+        }
+    }
+    has_request.then_some(wmcterm_core::AgentState::WaitingForInput)
+}
+
+fn effective_agent_state(
+    pending: Option<wmcterm_core::AgentState>,
+    session: Option<wmcterm_core::AgentState>,
+    current: Option<wmcterm_core::AgentState>,
+) -> Option<wmcterm_core::AgentState> {
+    pending.or(session).or_else(|| {
+        current.map(|state| match state {
+            wmcterm_core::AgentState::WaitingForInput
+            | wmcterm_core::AgentState::WaitingForPermission => wmcterm_core::AgentState::Running,
+            state => state,
+        })
+    })
+}
+
+fn agent_state_attention(state: wmcterm_core::AgentState) -> AttentionState {
+    match state {
+        wmcterm_core::AgentState::WaitingForInput
+        | wmcterm_core::AgentState::WaitingForPermission => AttentionState::NeedsInput,
+        wmcterm_core::AgentState::Error => AttentionState::Error,
+        wmcterm_core::AgentState::Completed => AttentionState::Activity,
+        wmcterm_core::AgentState::Unknown
+        | wmcterm_core::AgentState::Idle
+        | wmcterm_core::AgentState::Running => AttentionState::None,
+    }
+}
+
+fn attention_priority(attention: AttentionState) -> u8 {
+    match attention {
+        AttentionState::None => 0,
+        AttentionState::Activity => 1,
+        AttentionState::NeedsInput => 2,
+        AttentionState::Error => 3,
+    }
+}
+
+fn workspace_status_for_agent_priority(priority: u8) -> wmcterm_core::WorkspaceStatus {
+    match priority {
+        5 => wmcterm_core::WorkspaceStatus::Error,
+        4 => wmcterm_core::WorkspaceStatus::NeedsInput,
+        3 => wmcterm_core::WorkspaceStatus::Running,
+        2 => wmcterm_core::WorkspaceStatus::Completed,
+        _ => wmcterm_core::WorkspaceStatus::Idle,
+    }
+}
+
+fn aggregate_agent_priority(states: impl IntoIterator<Item = wmcterm_core::AgentState>) -> u8 {
+    states
+        .into_iter()
+        .map(agent_state_priority)
+        .max()
+        .unwrap_or(0)
+}
+
+fn unread_badge_label(count: usize) -> Option<String> {
+    match count {
+        0 => None,
+        1..=99 => Some(count.to_string()),
+        _ => Some("99+".to_owned()),
+    }
+}
+
+fn workspace_sidebar_row_height(has_agent: bool, has_git_branch: bool) -> f32 {
+    48.0 + if has_agent { 19.0 } else { 0.0 } + if has_git_branch { 19.0 } else { 0.0 }
+}
+
+fn layout(node: &PaneNode, rect: Rect, output: &mut Vec<(PaneId, Rect)>) {
+    match node {
+        PaneNode::Leaf { pane } => output.push((*pane, rect)),
+        PaneNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => {
+            let ratio = ratio.clamp(0.1, 0.9);
+            let (a, b) = split_rects(*axis, ratio, rect);
+            layout(first, a, output);
+            layout(second, b, output);
+        }
+    }
+}
+
+fn empty_pane_button(rect: Rect) -> ui::Bounds {
+    let width = 210.0_f32.min((rect.width - 32.0).max(1.0));
+    ui::Bounds {
+        x: rect.x + (rect.width - width) / 2.0,
+        y: rect.y + (rect.height - 36.0) / 2.0 + 18.0,
+        width,
+        height: 36.0,
+    }
+}
+
+fn ordered_cells(a: (usize, usize), b: (usize, usize)) -> ((usize, usize), (usize, usize)) {
+    if (a.1, a.0) <= (b.1, b.0) {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
+fn divider_at(
+    node: &PaneNode,
+    rect: Rect,
+    x: f32,
+    y: f32,
+    path: &mut Vec<bool>,
+) -> Option<SplitDrag> {
+    let PaneNode::Split {
+        axis,
+        ratio,
+        first,
+        second,
+    } = node
+    else {
+        return None;
+    };
+    let center = match axis {
+        SplitAxis::Vertical => rect.x + rect.width * ratio,
+        SplitAxis::Horizontal => rect.y + rect.height * ratio,
+    };
+    let hit = match axis {
+        SplitAxis::Vertical => {
+            (x - center).abs() <= 6.0 && y >= rect.y && y <= rect.y + rect.height
+        }
+        SplitAxis::Horizontal => {
+            (y - center).abs() <= 6.0 && x >= rect.x && x <= rect.x + rect.width
+        }
+    };
+    if hit {
+        return Some(SplitDrag {
+            path: path.clone(),
+            axis: *axis,
+            container: rect,
+            center,
+        });
+    }
+    let ratio = ratio.clamp(0.1, 0.9);
+    let (a, b) = split_rects(*axis, ratio, rect);
+    path.push(false);
+    if let Some(found) = divider_at(first, a, x, y, path) {
+        path.pop();
+        return Some(found);
+    }
+    path.pop();
+    path.push(true);
+    let found = divider_at(second, b, x, y, path);
+    path.pop();
+    found
+}
+
+fn collect_dividers(
+    node: &PaneNode,
+    rect: Rect,
+    path: &mut Vec<bool>,
+    output: &mut Vec<SplitDrag>,
+) {
+    let PaneNode::Split {
+        axis,
+        ratio,
+        first,
+        second,
+    } = node
+    else {
+        return;
+    };
+    let ratio = ratio.clamp(0.1, 0.9);
+    let center = match axis {
+        SplitAxis::Vertical => rect.x + rect.width * ratio,
+        SplitAxis::Horizontal => rect.y + rect.height * ratio,
+    };
+    output.push(SplitDrag {
+        path: path.clone(),
+        axis: *axis,
+        container: rect,
+        center,
+    });
+    let (first_rect, second_rect) = split_rects(*axis, ratio, rect);
+    path.push(false);
+    collect_dividers(first, first_rect, path, output);
+    path.pop();
+    path.push(true);
+    collect_dividers(second, second_rect, path, output);
+    path.pop();
+}
+
+fn divider_line(divider: &SplitDrag, thickness: f32) -> Rect {
+    let thickness = thickness.max(1.0);
+    match divider.axis {
+        SplitAxis::Vertical => Rect {
+            x: divider.center - thickness / 2.0,
+            y: divider.container.y,
+            width: thickness,
+            height: divider.container.height,
+        },
+        SplitAxis::Horizontal => Rect {
+            x: divider.container.x,
+            y: divider.center - thickness / 2.0,
+            width: divider.container.width,
+            height: thickness,
+        },
+    }
+}
+
+fn split_rects(axis: SplitAxis, ratio: f32, rect: Rect) -> (Rect, Rect) {
+    match axis {
+        SplitAxis::Vertical => (
+            Rect {
+                width: rect.width * ratio - 3.0,
+                ..rect
+            },
+            Rect {
+                x: rect.x + rect.width * ratio + 3.0,
+                width: rect.width * (1.0 - ratio) - 3.0,
+                ..rect
+            },
+        ),
+        SplitAxis::Horizontal => (
+            Rect {
+                height: rect.height * ratio - 3.0,
+                ..rect
+            },
+            Rect {
+                y: rect.y + rect.height * ratio + 3.0,
+                height: rect.height * (1.0 - ratio) - 3.0,
+                ..rect
+            },
+        ),
+    }
+}
+
+fn set_split_ratio(node: &mut PaneNode, path: &[bool], ratio: f32) {
+    if path.is_empty() {
+        if let PaneNode::Split { ratio: current, .. } = node {
+            *current = ratio;
+        }
+        return;
+    }
+    if let PaneNode::Split { first, second, .. } = node {
+        set_split_ratio(if path[0] { second } else { first }, &path[1..], ratio);
+    }
+}
+
+fn terminal_workspace_area(window_width: f32, window_height: f32, sidebar_width: f32) -> Rect {
+    const TITLEBAR_HEIGHT: f32 = 40.0;
+    const HORIZONTAL_MARGIN: f32 = 12.0;
+    const BOTTOM_MARGIN: f32 = 4.0;
+    Rect {
+        x: sidebar_width + HORIZONTAL_MARGIN,
+        y: TITLEBAR_HEIGHT,
+        width: (window_width - sidebar_width - HORIZONTAL_MARGIN * 2.0).max(1.0),
+        height: (window_height - TITLEBAR_HEIGHT - BOTTOM_MARGIN).max(1.0),
+    }
+}
+
+fn terminal_content_contains(rect: Rect, x: f32, y: f32) -> bool {
+    const CONTENT_LEFT_INSET: f32 = 8.0;
+    const TAB_BAR_HEIGHT: f32 = 25.0;
+    x >= rect.x + CONTENT_LEFT_INSET
+        && x < rect.x + rect.width
+        && y >= rect.y + TAB_BAR_HEIGHT
+        && y < rect.y + rect.height
+}
+
+fn selection_autoscroll_lines(
+    pointer_y: f32,
+    content_top: f32,
+    content_bottom: f32,
+    cell_height: f32,
+) -> Option<isize> {
+    const MAX_LINES_PER_TICK: isize = 8;
+    let distance = if pointer_y < content_top {
+        content_top - pointer_y
+    } else if pointer_y >= content_bottom {
+        pointer_y - content_bottom
+    } else {
+        return None;
+    };
+    let magnitude = (distance / cell_height.max(1.0)).floor() as isize + 1;
+    Some(if pointer_y < content_top {
+        -magnitude.clamp(1, MAX_LINES_PER_TICK)
+    } else {
+        magnitude.clamp(1, MAX_LINES_PER_TICK)
+    })
+}
+
+fn selection_redraw_due(previous: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+    previous.is_none_or(|previous| now.saturating_duration_since(previous) >= FRAME_INTERVAL)
+}
+
+fn notification_arrives_read(
+    window_focused: bool,
+    active_terminal: Option<TerminalId>,
+    terminal: TerminalId,
+) -> bool {
+    window_focused && active_terminal == Some(terminal)
+}
+
+fn approval_needs_native_notification(
+    notifications_enabled: bool,
+    window_focused: bool,
+    active_surface: Option<SurfaceId>,
+    target_surface: SurfaceId,
+) -> bool {
+    notifications_enabled && (!window_focused || active_surface != Some(target_surface))
+}
+
+fn mark_surface_notifications_read(notifications: &mut [Notification], surface: SurfaceId) -> bool {
+    let mut changed = false;
+    for notification in notifications
+        .iter_mut()
+        .filter(|notification| notification.surface == surface && !notification.read)
+    {
+        notification.read = true;
+        changed = true;
+    }
+    changed
+}
+
+fn spawn_event_bridge(
+    terminal: TerminalId,
+    events: flume::Receiver<SessionEvent>,
+    pending: Arc<Mutex<VecDeque<TaggedEvent>>>,
+    wake_pending: Arc<AtomicBool>,
+    proxy: EventLoopProxy<UserEvent>,
+) {
+    thread::Builder::new()
+        .name(format!("wmcterm-event-{terminal}"))
+        .spawn(move || {
+            while let Ok(event) = events.recv() {
+                let mut queue = pending.lock().expect("PTY event queue poisoned");
+                if matches!(&event, SessionEvent::Snapshot(_))
+                    && let Some(previous) = queue.back_mut()
+                    && previous.terminal == terminal
+                    && matches!(&previous.event, SessionEvent::Snapshot(_))
+                {
+                    previous.event = event;
+                } else {
+                    queue.push_back(TaggedEvent { terminal, event });
+                }
+                drop(queue);
+                if !wake_pending.swap(true, Ordering::AcqRel) {
+                    let _ = proxy.send_event(UserEvent::TerminalWake);
+                }
+            }
+        })
+        .expect("failed to spawn terminal event bridge");
+}
+
+fn effective_agent_lifecycle(
+    runtime_lifecycle: &str,
+    provided_lifecycle: Option<&str>,
+) -> Result<String, String> {
+    if provided_lifecycle.is_some_and(|provided| provided != runtime_lifecycle) {
+        return Err("stale agent event for a previous terminal lifecycle".into());
+    }
+    Ok(provided_lifecycle.unwrap_or(runtime_lifecycle).to_owned())
+}
+
+fn agent_session_event_kind(
+    event: &AgentEvent,
+    request_suffix: &str,
+) -> Option<AgentSessionEventKind> {
+    match event {
+        AgentEvent::SessionStart { .. } => None,
+        AgentEvent::ToolUse { tool } => {
+            Some(AgentSessionEventKind::Telemetry(AgentTelemetry::Activity {
+                summary: Some(tool.clone()),
+            }))
+        }
+        AgentEvent::PermissionRequest { message } => {
+            Some(AgentSessionEventKind::ActionRequired(AgentActionRequest {
+                request_id: format!("permission:{request_suffix}"),
+                kind: AgentRequestKind::Permission,
+                message: message.clone(),
+                choices: Vec::new(),
+            }))
+        }
+        AgentEvent::NeedsInput { message } => {
+            Some(AgentSessionEventKind::ActionRequired(AgentActionRequest {
+                request_id: format!("input:{request_suffix}"),
+                kind: AgentRequestKind::Input,
+                message: message.clone(),
+                choices: Vec::new(),
+            }))
+        }
+        AgentEvent::Stop { success, message } => Some(AgentSessionEventKind::Lifecycle(
+            AgentLifecycleEvent::Exited {
+                success: *success,
+                message: message.clone(),
+            },
+        )),
+    }
+}
+
+fn resume_info(state: &AppState, terminal: TerminalId) -> Option<AgentResumeInfo> {
+    let metadata = state
+        .surfaces
+        .values()
+        .find(|surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal))?
+        .agent
+        .as_ref()?;
+    let session_id = metadata.session_id.clone()?;
+    match metadata.name.to_ascii_lowercase().as_str() {
+        "claude" | "claude code" => Some(AgentResumeInfo::Claude { session_id }),
+        "codex" => Some(AgentResumeInfo::Codex { session_id }),
+        "opencode" => Some(AgentResumeInfo::OpenCode { session_id }),
+        _ => None,
+    }
+}
+
+fn show_native_notification(title: &str, body: &str) {
+    let title = title.to_owned();
+    let body = body.to_owned();
+    let _ = thread::Builder::new()
+        .name("wmcterm-notification".into())
+        .spawn(move || {
+            #[cfg(target_os = "linux")]
+            let _ = ProcessCommand::new("notify-send")
+                .args(["--app-name=wmcterm", &title, &body])
+                .status();
+            #[cfg(target_os = "macos")]
+            let _ = ProcessCommand::new("osascript")
+                .args([
+                    "-e",
+                    &format!("display notification {:?} with title {:?}", body, title),
+                ])
+                .status();
+            #[cfg(target_os = "windows")]
+            let _ = (title, body);
+        });
+}
+
+#[cfg(target_os = "linux")]
+fn listening_ports_for(cwd: &std::path::Path) -> Vec<u16> {
+    let Ok(processes) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut socket_inodes = std::collections::HashSet::new();
+    for process in processes.flatten() {
+        if !process
+            .file_name()
+            .to_string_lossy()
+            .chars()
+            .all(|character| character.is_ascii_digit())
+        {
+            continue;
+        }
+        let process_path = process.path();
+        let Ok(process_cwd) = std::fs::read_link(process_path.join("cwd")) else {
+            continue;
+        };
+        if !process_cwd.starts_with(cwd) {
+            continue;
+        }
+        let Ok(descriptors) = std::fs::read_dir(process_path.join("fd")) else {
+            continue;
+        };
+        for descriptor in descriptors.flatten() {
+            let Ok(target) = std::fs::read_link(descriptor.path()) else {
+                continue;
+            };
+            let text = target.to_string_lossy();
+            if let Some(inode) = text
+                .strip_prefix("socket:[")
+                .and_then(|value| value.strip_suffix(']'))
+            {
+                socket_inodes.insert(inode.to_owned());
+            }
+        }
+    }
+    let mut ports = std::collections::HashSet::new();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let Ok(contents) = std::fs::read_to_string(table) else {
+            continue;
+        };
+        for line in contents.lines().skip(1) {
+            let columns: Vec<_> = line.split_whitespace().collect();
+            if columns.len() < 10 || columns[3] != "0A" || !socket_inodes.contains(columns[9]) {
+                continue;
+            }
+            if let Some(port) = columns[1]
+                .split(':')
+                .nth(1)
+                .and_then(|value| u16::from_str_radix(value, 16).ok())
+            {
+                ports.insert(port);
+            }
+        }
+    }
+    let mut ports: Vec<_> = ports.into_iter().collect();
+    ports.sort_unstable();
+    ports
+}
+
+#[cfg(not(target_os = "linux"))]
+fn listening_ports_for(_cwd: &std::path::Path) -> Vec<u16> {
+    Vec::new()
+}
+
+fn should_notify_terminal_bell(
+    mode: BellNotificationMode,
+    window_focused: bool,
+    terminal_active: bool,
+    since_last: Option<std::time::Duration>,
+    debounce: std::time::Duration,
+) -> bool {
+    let allowed_by_context = match mode {
+        BellNotificationMode::Never => false,
+        BellNotificationMode::Background => !window_focused || !terminal_active,
+        BellNotificationMode::Always => true,
+    };
+    allowed_by_context && since_last.is_none_or(|elapsed| elapsed >= debounce)
+}
+
+fn unix_time_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn required_string<'a>(params: &'a Value, field: &str) -> Result<&'a str, String> {
+    params
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("missing or empty params.{field}"))
+}
+
+fn required_string_object<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    field: &str,
+) -> Result<&'a str, String> {
+    object
+        .get(field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| format!("missing or empty request.{field}"))
+}
+
+fn validate_agent_approval_protocol(source: &str, method: &str, kind: &str) -> Result<(), String> {
+    let valid = match source {
+        "codex_app_server" => matches!(
+            (method, kind),
+            ("item/commandExecution/requestApproval", "command_execution")
+                | ("item/fileChange/requestApproval", "file_change")
+                | ("item/permissions/requestApproval", "permissions")
+        ),
+        "claude_hook" => method == "PermissionRequest" && kind == "permission",
+        _ => false,
+    };
+    valid
+        .then_some(())
+        .ok_or_else(|| format!("unsupported {source} approval method/kind `{method}`/`{kind}`"))
+}
+
+fn claude_approval_binding_matches(
+    runtime_lifecycle: &str,
+    metadata_agent: Option<&str>,
+    authoritative_agent: Option<&str>,
+    requested_lifecycle: &str,
+) -> bool {
+    let is_claude =
+        |name: &str| matches!(name.to_ascii_lowercase().as_str(), "claude" | "claude code");
+    let is_unknown = |name: &str| name.is_empty() || name.eq_ignore_ascii_case("agent");
+    runtime_lifecycle == requested_lifecycle
+        && metadata_agent.is_none_or(|agent| is_unknown(agent) || is_claude(agent))
+        && authoritative_agent.is_none_or(|agent| is_unknown(agent) || is_claude(agent))
+}
+
+fn apply_claude_subagent_status(
+    statuses: &mut HashMap<String, ClaudeSubagentStatus>,
+    surface: SurfaceId,
+    hook: &ClaudeHookEvent,
+) {
+    let route_key = format!("{surface}:{}", hook.route_key());
+    match hook.kind {
+        ClaudeHookKind::SubagentStart => {
+            statuses.insert(
+                route_key,
+                ClaudeSubagentStatus {
+                    surface,
+                    session_id: hook.session_id.clone(),
+                },
+            );
+        }
+        ClaudeHookKind::SubagentStop => {
+            statuses.remove(&route_key);
+        }
+        ClaudeHookKind::SessionEnd | ClaudeHookKind::Stop => {
+            statuses.retain(|_, subagent| {
+                subagent.surface != surface || subagent.session_id != hook.session_id
+            });
+        }
+        ClaudeHookKind::SessionStart
+        | ClaudeHookKind::PreToolUse
+        | ClaudeHookKind::PostToolUse
+        | ClaudeHookKind::PostToolUseFailure
+        | ClaudeHookKind::PermissionRequest
+        | ClaudeHookKind::Notification => {}
+    }
+}
+
+fn agent_approval_mode(action: AgentApprovalAction) -> &'static str {
+    match action {
+        AgentApprovalAction::Deny => "deny",
+        AgentApprovalAction::AllowOnce => "once",
+        AgentApprovalAction::AlwaysAllow => "always",
+        AgentApprovalAction::AllTools => "all",
+    }
+}
+
+fn remember_bounded_approval_result(
+    results: &mut HashMap<String, AgentApprovalAction>,
+    order: &mut VecDeque<String>,
+    request_id: String,
+    action: AgentApprovalAction,
+    capacity: usize,
+) {
+    if !results.contains_key(&request_id) {
+        order.push_back(request_id.clone());
+    }
+    results.insert(request_id, action);
+    while order.len() > capacity {
+        if let Some(expired) = order.pop_front() {
+            results.remove(&expired);
+        }
+    }
+}
+
+fn agent_approval_resolved_json(action: AgentApprovalAction) -> Value {
+    json!({"status":"resolved","decision":{"mode":agent_approval_mode(action)}})
+}
+
+fn completed_approval_action(
+    reply: &wmcterm_ipc::AgentInteractionReply,
+) -> Option<AgentApprovalAction> {
+    let wmcterm_ipc::AgentReplyStatus::Resolved { resolution } = &reply.status else {
+        return Some(AgentApprovalAction::Deny);
+    };
+    match resolution.choice_id.as_deref() {
+        Some("deny") => Some(AgentApprovalAction::Deny),
+        Some("once") => Some(AgentApprovalAction::AllowOnce),
+        Some("always") => Some(AgentApprovalAction::AlwaysAllow),
+        Some("all") => Some(AgentApprovalAction::AllTools),
+        _ if resolution.approved == Some(false) => Some(AgentApprovalAction::Deny),
+        _ if resolution.approved == Some(true) => Some(AgentApprovalAction::AllowOnce),
+        _ => None,
+    }
+}
+
+fn agent_approval_actions(request: &AgentInteractionRequest) -> Vec<AgentApprovalAction> {
+    let mut actions = vec![AgentApprovalAction::Deny, AgentApprovalAction::AllowOnce];
+    if request
+        .choices
+        .iter()
+        .any(|choice| agent_choice_has(choice, &["always", "permanent", "始终", "永久"]))
+    {
+        actions.push(AgentApprovalAction::AlwaysAllow);
+    }
+    if request.choices.iter().any(|choice| {
+        choice.id == "all"
+            || agent_choice_has(choice, &["all_tools", "all tools", "all-tools", "全部工具"])
+    }) {
+        actions.push(AgentApprovalAction::AllTools);
+    }
+    actions
+}
+
+fn agent_choice_has(choice: &wmcterm_ipc::AgentChoice, needles: &[&str]) -> bool {
+    let value = format!("{} {}", choice.id, choice.label).to_lowercase();
+    needles.iter().any(|needle| value.contains(needle))
+}
+
+fn agent_approval_resolution(
+    request: &AgentInteractionRequest,
+    action: AgentApprovalAction,
+) -> AgentResolution {
+    let choice = request.choices.iter().find(|choice| match action {
+        AgentApprovalAction::Deny => {
+            agent_choice_has(choice, &["deny", "reject", "cancel", "拒绝"])
+        }
+        AgentApprovalAction::AllowOnce => {
+            !agent_choice_has(
+                choice,
+                &[
+                    "always",
+                    "permanent",
+                    "all_tools",
+                    "all tools",
+                    "始终",
+                    "永久",
+                    "全部工具",
+                ],
+            ) && (choice.id == "once"
+                || agent_choice_has(choice, &["allow", "approve", "once", "允许", "批准"]))
+        }
+        AgentApprovalAction::AlwaysAllow => {
+            agent_choice_has(choice, &["always", "permanent", "始终", "永久"])
+        }
+        AgentApprovalAction::AllTools => {
+            choice.id == "all"
+                || agent_choice_has(choice, &["all_tools", "all tools", "all-tools", "全部工具"])
+        }
+    });
+    AgentResolution {
+        choice_id: choice.map(|choice| choice.id.clone()),
+        text: None,
+        approved: Some(!matches!(action, AgentApprovalAction::Deny)),
+    }
+}
+
+fn agent_approval_action_label(language: Language, action: AgentApprovalAction) -> &'static str {
+    match action {
+        AgentApprovalAction::Deny => language.deny(),
+        AgentApprovalAction::AllowOnce => language.allow_once(),
+        AgentApprovalAction::AlwaysAllow => language.always_allow(),
+        AgentApprovalAction::AllTools => language.allow_all_tools(),
+    }
+}
+
+fn notification_age_label(now_ms: u64, created_at_ms: u64, chinese: bool) -> String {
+    let seconds = now_ms.saturating_sub(created_at_ms) / 1_000;
+    match seconds {
+        0..=59 => {
+            if chinese {
+                "刚刚".into()
+            } else {
+                "now".into()
+            }
+        }
+        60..=3_599 => {
+            let minutes = seconds / 60;
+            if chinese {
+                format!("{minutes} 分钟")
+            } else {
+                format!("{minutes}m")
+            }
+        }
+        3_600..=86_399 => {
+            let hours = seconds / 3_600;
+            if chinese {
+                format!("{hours} 小时")
+            } else {
+                format!("{hours}h")
+            }
+        }
+        _ => {
+            let days = seconds / 86_400;
+            if chinese {
+                format!("{days} 天")
+            } else {
+                format!("{days}d")
+            }
+        }
+    }
+}
+
+fn notification_overlay_press(
+    visible: bool,
+    panel: ui::Bounds,
+    x: f32,
+    y: f32,
+) -> NotificationOverlayPress {
+    if !visible {
+        NotificationOverlayPress::Inactive
+    } else if panel.contains(x, y) {
+        NotificationOverlayPress::Inside
+    } else {
+        NotificationOverlayPress::DismissAndPropagate
+    }
+}
+
+fn titlebar_double_click(
+    previous: std::time::Instant,
+    previous_position: (f32, f32),
+    current: std::time::Instant,
+    current_position: (f32, f32),
+) -> bool {
+    const MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+    const MAX_DISTANCE: f32 = 6.0;
+    current.saturating_duration_since(previous) <= MAX_DELAY
+        && (current_position.0 - previous_position.0).abs() <= MAX_DISTANCE
+        && (current_position.1 - previous_position.1).abs() <= MAX_DISTANCE
+}
+
+fn terminal_double_click(previous: std::time::Instant, current: std::time::Instant) -> bool {
+    const MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+    current.saturating_duration_since(previous) <= MAX_DELAY
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CellWordClass {
+    Whitespace,
+    Word,
+    Punctuation,
+}
+
+fn cell_word_class(cell: &CellSnapshot) -> Option<CellWordClass> {
+    if cell.text.is_empty() {
+        return None;
+    }
+    if cell.text.chars().all(char::is_whitespace) {
+        Some(CellWordClass::Whitespace)
+    } else if cell
+        .text
+        .chars()
+        .any(|character| character.is_alphanumeric() || character == '_')
+    {
+        Some(CellWordClass::Word)
+    } else {
+        Some(CellWordClass::Punctuation)
+    }
+}
+
+/// Returns an inclusive cell range. Empty cells adjacent to a glyph are wide-cell
+/// continuations and belong to that glyph; classification never crosses a row.
+fn word_cell_bounds(row: &[CellSnapshot], clicked: usize) -> Option<(usize, usize)> {
+    if clicked >= row.len() {
+        return None;
+    }
+    let mut owner = clicked;
+    while owner > 0 && row[owner].text.is_empty() {
+        owner -= 1;
+    }
+    let class = cell_word_class(&row[owner])?;
+
+    let mut start = owner;
+    while start > 0 {
+        let mut previous = start - 1;
+        while previous > 0 && row[previous].text.is_empty() {
+            previous -= 1;
+        }
+        if cell_word_class(&row[previous]) != Some(class) {
+            break;
+        }
+        start = previous;
+    }
+
+    let mut end = owner;
+    let mut next = owner + 1;
+    while next < row.len() {
+        if row[next].text.is_empty() {
+            end = next;
+            next += 1;
+            continue;
+        }
+        if cell_word_class(&row[next]) != Some(class) {
+            break;
+        }
+        end = next;
+        next += 1;
+    }
+    Some((start, end))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use wmcterm_core::AgentState;
+
+    #[test]
+    fn bundled_application_icon_decodes_for_winit() {
+        assert!(application_icon().is_some());
+    }
+
+    #[test]
+    fn notification_age_is_relative_and_locale_aware() {
+        let now = 10 * 86_400_000;
+        assert_eq!(notification_age_label(now, now - 30_000, false), "now");
+        assert_eq!(notification_age_label(now, now - 120_000, false), "2m");
+        assert_eq!(notification_age_label(now, now - 7_200_000, true), "2 小时");
+        assert_eq!(notification_age_label(now, now - 172_800_000, true), "2 天");
+    }
+
+    #[test]
+    fn normal_agent_exit_reasons_do_not_create_notifications() {
+        for message in ["other", "exit", "user_requested", "logout"] {
+            assert!(non_actionable_agent_exit(&AgentEvent::Stop {
+                success: true,
+                message: Some(message.into()),
+            }));
+        }
+        assert!(!non_actionable_agent_exit(&AgentEvent::Stop {
+            success: true,
+            message: Some("Task completed".into()),
+        }));
+        assert!(!non_actionable_agent_exit(&AgentEvent::Stop {
+            success: false,
+            message: Some("other".into()),
+        }));
+    }
+
+    #[test]
+    fn titlebar_double_click_requires_nearby_clicks_within_half_a_second() {
+        let first = std::time::Instant::now();
+        assert!(titlebar_double_click(
+            first,
+            (100.0, 20.0),
+            first + std::time::Duration::from_millis(450),
+            (104.0, 23.0),
+        ));
+        assert!(!titlebar_double_click(
+            first,
+            (100.0, 20.0),
+            first + std::time::Duration::from_millis(501),
+            (100.0, 20.0),
+        ));
+        assert!(!titlebar_double_click(
+            first,
+            (100.0, 20.0),
+            first + std::time::Duration::from_millis(200),
+            (120.0, 20.0),
+        ));
+    }
+
+    fn selection_cell(text: &str) -> CellSnapshot {
+        CellSnapshot {
+            text: text.into(),
+            foreground: Rgb { r: 0, g: 0, b: 0 },
+            background: Rgb { r: 0, g: 0, b: 0 },
+            background_explicit: false,
+            bold: false,
+            italic: false,
+            underline: false,
+            strikethrough: false,
+        }
+    }
+
+    #[test]
+    fn terminal_double_click_selects_word_without_crossing_boundaries() {
+        let row = ["a", "b", "_", "中", "", ".", ".", " ", "x"].map(selection_cell);
+
+        assert_eq!(word_cell_bounds(&row, 1), Some((0, 4)));
+        assert_eq!(word_cell_bounds(&row, 4), Some((0, 4)));
+        assert_eq!(word_cell_bounds(&row, 5), Some((5, 6)));
+        assert_eq!(word_cell_bounds(&row, 7), Some((7, 7)));
+        assert_eq!(word_cell_bounds(&row, 8), Some((8, 8)));
+    }
+
+    #[test]
+    fn terminal_double_click_rejects_stale_second_press() {
+        let first = std::time::Instant::now();
+        assert!(terminal_double_click(
+            first,
+            first + std::time::Duration::from_millis(500)
+        ));
+        assert!(!terminal_double_click(
+            first,
+            first + std::time::Duration::from_millis(501)
+        ));
+    }
+
+    #[test]
+    fn first_press_outside_notifications_dismisses_and_propagates() {
+        let panel = ui::Bounds {
+            x: 650.0,
+            y: 48.0,
+            width: 350.0,
+            height: 500.0,
+        };
+        assert_eq!(
+            notification_overlay_press(true, panel, 100.0, 100.0),
+            NotificationOverlayPress::DismissAndPropagate
+        );
+        assert_eq!(
+            notification_overlay_press(true, panel, 700.0, 100.0),
+            NotificationOverlayPress::Inside
+        );
+        assert_eq!(
+            notification_overlay_press(false, panel, 100.0, 100.0),
+            NotificationOverlayPress::Inactive
+        );
+    }
+
+    #[test]
+    fn agent_approval_only_exposes_supported_decisions_and_maps_wire_modes() {
+        let request = AgentInteractionRequest {
+            request_id: "approval:test".into(),
+            surface_id: uuid::Uuid::new_v4().to_string(),
+            lifecycle_id: "lifecycle".into(),
+            agent_pid: None,
+            pid_start_time: None,
+            kind: IpcAgentRequestKind::new(IpcAgentRequestKind::PERMISSION),
+            message: "run cargo test".into(),
+            choices: ["deny", "once", "always", "all"]
+                .into_iter()
+                .map(|mode| wmcterm_ipc::AgentChoice {
+                    id: mode.into(),
+                    label: mode.into(),
+                })
+                .collect(),
+            deadline_unix_ms: None,
+        };
+        assert_eq!(
+            agent_approval_actions(&request),
+            vec![
+                AgentApprovalAction::Deny,
+                AgentApprovalAction::AllowOnce,
+                AgentApprovalAction::AlwaysAllow,
+                AgentApprovalAction::AllTools,
+            ]
+        );
+        let resolution = agent_approval_resolution(&request, AgentApprovalAction::AllTools);
+        assert_eq!(resolution.choice_id.as_deref(), Some("all"));
+        assert_eq!(resolution.approved, Some(true));
+        assert_eq!(
+            agent_approval_resolved_json(AgentApprovalAction::Deny),
+            json!({"status":"resolved","decision":{"mode":"deny"}})
+        );
+
+        let limited = AgentInteractionRequest {
+            choices: vec![],
+            ..request
+        };
+        assert_eq!(
+            agent_approval_actions(&limited),
+            vec![AgentApprovalAction::Deny, AgentApprovalAction::AllowOnce]
+        );
+    }
+
+    #[test]
+    fn pending_agent_state_is_surface_scoped_and_permission_wins() {
+        let target = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        let request = |id: &str, surface: SurfaceId, kind: &str| AgentInteractionRequest {
+            request_id: id.into(),
+            surface_id: surface.to_string(),
+            lifecycle_id: "lifecycle".into(),
+            agent_pid: None,
+            pid_start_time: None,
+            kind: IpcAgentRequestKind::new(kind),
+            message: id.into(),
+            choices: Vec::new(),
+            deadline_unix_ms: None,
+        };
+        let input = request("input", target, IpcAgentRequestKind::INPUT);
+        let permission = request("permission", target, IpcAgentRequestKind::PERMISSION);
+        let unrelated = request("other", other, IpcAgentRequestKind::PERMISSION);
+
+        assert_eq!(
+            pending_agent_state_for_surface(&[input.clone(), unrelated.clone()], target),
+            Some(AgentState::WaitingForInput)
+        );
+        assert_eq!(
+            pending_agent_state_for_surface(&[input, permission, unrelated], target),
+            Some(AgentState::WaitingForPermission)
+        );
+        assert_eq!(pending_agent_state_for_surface(&[], target), None);
+    }
+
+    #[test]
+    fn resolved_agent_state_restores_session_without_overwriting_newer_state() {
+        assert_eq!(
+            effective_agent_state(
+                Some(AgentState::WaitingForPermission),
+                Some(AgentState::Running),
+                Some(AgentState::Completed),
+            ),
+            Some(AgentState::WaitingForPermission)
+        );
+        assert_eq!(
+            effective_agent_state(None, Some(AgentState::Completed), Some(AgentState::Running)),
+            Some(AgentState::Completed)
+        );
+        assert_eq!(
+            effective_agent_state(None, None, Some(AgentState::WaitingForPermission)),
+            Some(AgentState::Running)
+        );
+    }
+
+    #[test]
+    fn derived_attention_and_workspace_status_preserve_severity() {
+        assert!(
+            attention_priority(AttentionState::Error)
+                > attention_priority(AttentionState::NeedsInput)
+        );
+        assert!(
+            attention_priority(AttentionState::NeedsInput)
+                > attention_priority(AttentionState::Activity)
+        );
+        assert_eq!(
+            workspace_status_for_agent_priority(agent_state_priority(
+                AgentState::WaitingForPermission
+            )),
+            wmcterm_core::WorkspaceStatus::NeedsInput
+        );
+    }
+
+    #[test]
+    fn agent_approval_result_cache_is_bounded_and_updates_in_place() {
+        let mut results = HashMap::new();
+        let mut order = VecDeque::new();
+        remember_bounded_approval_result(
+            &mut results,
+            &mut order,
+            "first".into(),
+            AgentApprovalAction::Deny,
+            2,
+        );
+        remember_bounded_approval_result(
+            &mut results,
+            &mut order,
+            "second".into(),
+            AgentApprovalAction::AllowOnce,
+            2,
+        );
+        remember_bounded_approval_result(
+            &mut results,
+            &mut order,
+            "second".into(),
+            AgentApprovalAction::AlwaysAllow,
+            2,
+        );
+        remember_bounded_approval_result(
+            &mut results,
+            &mut order,
+            "third".into(),
+            AgentApprovalAction::AllTools,
+            2,
+        );
+
+        assert_eq!(order, VecDeque::from(["second".into(), "third".into()]));
+        assert!(!results.contains_key("first"));
+        assert_eq!(
+            results.get("second"),
+            Some(&AgentApprovalAction::AlwaysAllow)
+        );
+    }
+
+    #[test]
+    fn approval_protocol_accepts_only_known_codex_and_claude_shapes() {
+        assert!(
+            validate_agent_approval_protocol(
+                "codex_app_server",
+                "item/commandExecution/requestApproval",
+                "command_execution"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_agent_approval_protocol("claude_hook", "PermissionRequest", "permission")
+                .is_ok()
+        );
+        assert!(
+            validate_agent_approval_protocol("claude_hook", "PreToolUse", "permission").is_err()
+        );
+        assert!(
+            validate_agent_approval_protocol("unknown", "PermissionRequest", "permission").is_err()
+        );
+    }
+
+    #[test]
+    fn claude_approval_binding_requires_current_terminal_and_rejects_other_agents() {
+        assert!(claude_approval_binding_matches(
+            "lifecycle-1",
+            Some("Claude Code"),
+            Some("claude"),
+            "lifecycle-1"
+        ));
+        // SessionStart telemetry is best-effort and may race the first
+        // PermissionRequest. A missing display/session record must not make
+        // the bridge permanently unusable; the user still decides in the UI.
+        assert!(claude_approval_binding_matches(
+            "lifecycle-1",
+            None,
+            Some("agent"),
+            "lifecycle-1"
+        ));
+        assert!(!claude_approval_binding_matches(
+            "lifecycle-1",
+            Some("claude"),
+            Some("claude"),
+            "lifecycle-old"
+        ));
+        assert!(!claude_approval_binding_matches(
+            "lifecycle-1",
+            Some("codex"),
+            Some("claude"),
+            "lifecycle-1",
+        ));
+    }
+
+    #[test]
+    fn claude_subagent_status_is_scoped_by_session_and_surface() {
+        let surface = SurfaceId::new_v4();
+        let other_surface = SurfaceId::new_v4();
+        let start = |session: &str, agent: &str| {
+            wmcterm_agent::normalize_claude_hook_event(
+                Some("SubagentStart"),
+                &json!({
+                    "hook_event_name": "SubagentStart",
+                    "session_id": session,
+                    "agent_id": agent,
+                    "agent_type": "Explore"
+                }),
+            )
+            .unwrap()
+        };
+        let stop = |session: &str, agent: &str| {
+            wmcterm_agent::normalize_claude_hook_event(
+                Some("SubagentStop"),
+                &json!({
+                    "hook_event_name": "SubagentStop",
+                    "session_id": session,
+                    "agent_id": agent,
+                    "agent_type": "Explore"
+                }),
+            )
+            .unwrap()
+        };
+        let mut statuses = HashMap::new();
+        apply_claude_subagent_status(&mut statuses, surface, &start("one", "worker"));
+        apply_claude_subagent_status(&mut statuses, other_surface, &start("two", "worker"));
+        apply_claude_subagent_status(&mut statuses, other_surface, &start("one", "worker"));
+        assert_eq!(statuses.len(), 3);
+
+        apply_claude_subagent_status(&mut statuses, surface, &stop("one", "worker"));
+        assert_eq!(statuses.len(), 2);
+        assert!(
+            statuses
+                .values()
+                .all(|status| status.surface == other_surface)
+        );
+
+        let session_end = wmcterm_agent::normalize_claude_hook_event(
+            Some("SessionEnd"),
+            &json!({
+                "hook_event_name": "SessionEnd",
+                "session_id": "two",
+                "reason": "logout"
+            }),
+        )
+        .unwrap();
+        apply_claude_subagent_status(&mut statuses, other_surface, &session_end);
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses.values().next().unwrap().session_id, "one");
+
+        let final_end = wmcterm_agent::normalize_claude_hook_event(
+            Some("SessionEnd"),
+            &json!({
+                "hook_event_name": "SessionEnd",
+                "session_id": "one",
+                "reason": "logout"
+            }),
+        )
+        .unwrap();
+        apply_claude_subagent_status(&mut statuses, other_surface, &final_end);
+        assert!(statuses.is_empty());
+    }
+
+    #[test]
+    fn physical_letters_recover_control_keys_from_linux_input() {
+        assert_eq!(
+            physical_ascii_character(PhysicalKey::Code(KeyCode::KeyC)),
+            Some('c')
+        );
+        assert_eq!(
+            physical_ascii_character(PhysicalKey::Code(KeyCode::KeyD)),
+            Some('d')
+        );
+    }
+
+    #[test]
+    fn named_space_is_forwarded_to_the_terminal() {
+        assert_eq!(
+            terminal_input_key(&Key::Named(NamedKey::Space), None),
+            Some(InputKey::Space)
+        );
+    }
+
+    #[test]
+    fn window_switch_shortcuts_are_not_forwarded_to_the_terminal() {
+        let tab = Key::Named(NamedKey::Tab);
+        assert!(is_window_switch_shortcut(&tab, ModifiersState::ALT));
+        assert!(is_window_switch_shortcut(&tab, ModifiersState::SUPER));
+        assert!(is_window_switch_shortcut(
+            &tab,
+            ModifiersState::ALT | ModifiersState::SHIFT
+        ));
+        assert!(!is_window_switch_shortcut(&tab, ModifiersState::CONTROL));
+        assert!(!is_window_switch_shortcut(
+            &Key::Named(NamedKey::Enter),
+            ModifiersState::ALT
+        ));
+    }
+
+    #[test]
+    fn integrated_codex_launcher_uses_the_subagent_pane_bridge() {
+        assert!(codex_teams_command().ends_with(" codex-teams"));
+    }
+
+    #[test]
+    fn finds_and_resizes_nested_divider() {
+        let first = PaneId::new_v4();
+        let second = PaneId::new_v4();
+        let mut root = PaneNode::leaf(first);
+        root.split(first, second, SplitAxis::Vertical, 0.5).unwrap();
+        let area = Rect {
+            x: 100.0,
+            y: 40.0,
+            width: 800.0,
+            height: 500.0,
+        };
+        let drag = divider_at(&root, area, 500.0, 200.0, &mut Vec::new()).unwrap();
+        assert_eq!(drag.axis, SplitAxis::Vertical);
+        set_split_ratio(&mut root, &drag.path, 0.7);
+        assert!(matches!(root, PaneNode::Split { ratio, .. } if ratio == 0.7));
+    }
+
+    #[test]
+    fn lays_out_visible_lines_for_both_split_axes() {
+        let first = PaneId::new_v4();
+        let second = PaneId::new_v4();
+        let third = PaneId::new_v4();
+        let mut root = PaneNode::leaf(first);
+        root.split(first, second, SplitAxis::Vertical, 0.5).unwrap();
+        root.split(second, third, SplitAxis::Horizontal, 0.5)
+            .unwrap();
+        let area = Rect {
+            x: 100.0,
+            y: 40.0,
+            width: 800.0,
+            height: 500.0,
+        };
+        let mut dividers = Vec::new();
+        collect_dividers(&root, area, &mut Vec::new(), &mut dividers);
+
+        assert_eq!(dividers.len(), 2);
+        let vertical = divider_line(&dividers[0], 1.0);
+        assert_eq!(vertical.x, 499.5);
+        assert_eq!(vertical.y, 40.0);
+        assert_eq!(vertical.width, 1.0);
+        assert_eq!(vertical.height, 500.0);
+
+        let horizontal = divider_line(&dividers[1], 2.0);
+        assert_eq!(horizontal.x, 503.0);
+        assert_eq!(horizontal.y, 289.0);
+        assert_eq!(horizontal.width, 397.0);
+        assert_eq!(horizontal.height, 2.0);
+    }
+
+    #[test]
+    fn terminal_workspace_uses_the_removed_footer_space() {
+        let area = terminal_workspace_area(1000.0, 650.0, 240.0);
+        assert_eq!(area.x, 252.0);
+        assert_eq!(area.y, 40.0);
+        assert_eq!(area.width, 736.0);
+        assert_eq!(area.height, 606.0);
+        assert_eq!(area.y + area.height, 646.0);
+    }
+
+    #[test]
+    fn terminal_content_hit_excludes_chrome_and_includes_the_terminal_body() {
+        let pane = Rect {
+            x: 252.0,
+            y: 40.0,
+            width: 736.0,
+            height: 606.0,
+        };
+
+        assert!(!terminal_content_contains(pane, 120.0, 200.0));
+        assert!(!terminal_content_contains(pane, 400.0, 64.0));
+        assert!(!terminal_content_contains(pane, 259.0, 100.0));
+        assert!(terminal_content_contains(pane, 260.0, 65.0));
+    }
+
+    #[test]
+    fn selection_redraws_are_coalesced_to_frame_rate() {
+        let start = std::time::Instant::now();
+        assert!(selection_redraw_due(None, start));
+        assert!(!selection_redraw_due(
+            Some(start),
+            start + std::time::Duration::from_millis(15)
+        ));
+        assert!(selection_redraw_due(
+            Some(start),
+            start + std::time::Duration::from_millis(16)
+        ));
+    }
+
+    #[test]
+    fn selection_autoscroll_accelerates_beyond_both_vertical_edges() {
+        assert_eq!(
+            selection_autoscroll_lines(99.0, 100.0, 500.0, 20.0),
+            Some(-1)
+        );
+        assert_eq!(
+            selection_autoscroll_lines(39.0, 100.0, 500.0, 20.0),
+            Some(-4)
+        );
+        assert_eq!(selection_autoscroll_lines(100.0, 100.0, 500.0, 20.0), None);
+        assert_eq!(selection_autoscroll_lines(499.9, 100.0, 500.0, 20.0), None);
+        assert_eq!(
+            selection_autoscroll_lines(500.0, 100.0, 500.0, 20.0),
+            Some(1)
+        );
+        assert_eq!(
+            selection_autoscroll_lines(1000.0, 100.0, 500.0, 20.0),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn foreground_terminal_notifications_arrive_read_only_while_focused() {
+        let terminal = uuid::Uuid::new_v4();
+        assert!(notification_arrives_read(true, Some(terminal), terminal));
+        assert!(!notification_arrives_read(false, Some(terminal), terminal));
+        assert!(!notification_arrives_read(
+            true,
+            Some(uuid::Uuid::new_v4()),
+            terminal
+        ));
+    }
+
+    #[test]
+    fn approval_uses_native_notification_when_target_is_not_being_viewed() {
+        let target = uuid::Uuid::new_v4();
+        assert!(approval_needs_native_notification(
+            true,
+            false,
+            Some(target),
+            target
+        ));
+        assert!(approval_needs_native_notification(
+            true,
+            true,
+            Some(uuid::Uuid::new_v4()),
+            target
+        ));
+        assert!(!approval_needs_native_notification(
+            true,
+            true,
+            Some(target),
+            target
+        ));
+        assert!(!approval_needs_native_notification(
+            false, false, None, target
+        ));
+    }
+
+    #[test]
+    fn terminal_interaction_reads_only_notifications_for_its_surface() {
+        let workspace = uuid::Uuid::new_v4();
+        let target = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+        let make_notification = |surface, read| Notification {
+            id: uuid::Uuid::new_v4(),
+            workspace,
+            surface,
+            title: "test".into(),
+            body: "body".into(),
+            attention: AttentionState::Activity,
+            created_at_unix_ms: 0,
+            read,
+        };
+        let mut notifications = vec![
+            make_notification(target, false),
+            make_notification(target, true),
+            make_notification(other, false),
+        ];
+
+        assert!(mark_surface_notifications_read(&mut notifications, target));
+        assert!(notifications[0].read);
+        assert!(notifications[1].read);
+        assert!(!notifications[2].read);
+        assert!(!mark_surface_notifications_read(&mut notifications, target));
+    }
+
+    #[test]
+    fn normalizes_reverse_terminal_selection() {
+        assert_eq!(ordered_cells((8, 4), (2, 1)), ((2, 1), (8, 4)));
+        assert_eq!(ordered_cells((1, 2), (5, 2)), ((1, 2), (5, 2)));
+    }
+
+    #[test]
+    fn markdown_blocks_map_to_distinct_visual_styles() {
+        let document = MarkdownDocument::parse(
+            "# Heading\n\nParagraph\n\n- item\n\n```rust\nlet x = 1;\n```\n\n> quote",
+        );
+        let lines = markdown_lines(&document, neutral_document_colors());
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text == "▌ Heading" && line.bold)
+        );
+        assert!(lines.iter().any(|line| line.text == "  • item"));
+        assert!(lines.iter().any(|line| line.text == "│ let x = 1;"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.text == "│ quote" && line.italic)
+        );
+    }
+
+    #[test]
+    fn log_levels_map_to_severity_colors() {
+        let colors = neutral_document_colors();
+        assert_eq!(log_level_color(LogLevel::Debug, colors), colors.muted);
+        assert_eq!(log_level_color(LogLevel::Warn, colors), colors.warning);
+        assert_eq!(log_level_color(LogLevel::Error, colors), colors.error);
+    }
+
+    #[test]
+    fn log_filter_prompt_parses_and_round_trips() {
+        let filter = parse_log_filter("level:error,warn request failed");
+        assert_eq!(filter.query.as_deref(), Some("request failed"));
+        assert_eq!(
+            filter.levels.as_deref(),
+            Some([LogLevel::Error, LogLevel::Warn].as_slice())
+        );
+        assert_eq!(
+            format_log_filter(&filter),
+            "level:error,warn request failed"
+        );
+    }
+
+    #[test]
+    fn document_search_offsets_match_filtered_visual_rows() {
+        let mut logs = LogSurface::new("test", 10);
+        logs.push("INFO hidden");
+        logs.push("ERROR first match");
+        logs.push("WARN hidden");
+        logs.push("ERROR second match");
+        logs.set_filter(LogFilter {
+            query: None,
+            levels: Some(vec![LogLevel::Error]),
+        });
+        assert_eq!(document_search_offsets(&logs, "match"), vec![0, 1]);
+    }
+
+    #[test]
+    fn tab_context_allows_closing_the_final_tab() {
+        assert!(tab_context_action_enabled(TabContextAction::Close, 1));
+        assert!(!tab_context_action_enabled(
+            TabContextAction::CloseOthers,
+            1
+        ));
+        assert!(tab_context_action_enabled(TabContextAction::NewSurface, 1));
+        assert!(tab_context_action_enabled(TabContextAction::Close, 2));
+    }
+
+    #[test]
+    fn workspace_context_allows_closing_the_final_workspace() {
+        assert!(workspace_context_action_enabled(
+            WorkspaceContextAction::Close,
+            1
+        ));
+        assert!(workspace_context_action_enabled(
+            WorkspaceContextAction::Close,
+            2
+        ));
+        assert!(workspace_context_action_enabled(
+            WorkspaceContextAction::Rename,
+            1
+        ));
+    }
+
+    #[test]
+    fn unread_notification_routes_to_its_workspace_pane_and_tab() {
+        let mut state = AppState::default();
+        let workspace = state.workspaces[0].id;
+        let pane = state.workspaces[0].active_pane;
+        let surface = state.panes[&pane].surfaces[0];
+        state
+            .execute(AppCommand::Workspace(WorkspaceCommand::Create {
+                name: "other".into(),
+                cwd: std::path::PathBuf::from("/tmp"),
+            }))
+            .unwrap();
+        let notification = uuid::Uuid::new_v4();
+        state.push_notification(Notification {
+            id: notification,
+            workspace,
+            surface,
+            title: "Needs input".into(),
+            body: "approve command".into(),
+            attention: AttentionState::NeedsInput,
+            created_at_unix_ms: 0,
+            read: false,
+        });
+
+        assert_eq!(
+            notification_destination(&state, notification),
+            Some(NotificationDestination {
+                workspace_index: 0,
+                pane: Some((pane, 0)),
+                surface,
+            })
+        );
+    }
+
+    #[test]
+    fn terminal_bells_only_notify_for_the_configured_context_and_are_debounced() {
+        let debounce = std::time::Duration::from_secs(1);
+        assert!(!should_notify_terminal_bell(
+            BellNotificationMode::Background,
+            true,
+            true,
+            None,
+            debounce,
+        ));
+        assert!(should_notify_terminal_bell(
+            BellNotificationMode::Background,
+            true,
+            false,
+            None,
+            debounce,
+        ));
+        assert!(should_notify_terminal_bell(
+            BellNotificationMode::Background,
+            false,
+            true,
+            None,
+            debounce,
+        ));
+        assert!(!should_notify_terminal_bell(
+            BellNotificationMode::Always,
+            false,
+            false,
+            Some(std::time::Duration::from_millis(999)),
+            debounce,
+        ));
+        assert!(should_notify_terminal_bell(
+            BellNotificationMode::Always,
+            true,
+            true,
+            Some(debounce),
+            debounce,
+        ));
+        assert!(!should_notify_terminal_bell(
+            BellNotificationMode::Never,
+            false,
+            false,
+            None,
+            debounce,
+        ));
+    }
+
+    #[test]
+    fn command_palette_shortcut_hints_are_human_readable() {
+        assert_eq!(
+            format_shortcut_hint(&"ctrl+shift+p".parse().unwrap()),
+            "Ctrl+Shift+P"
+        );
+        assert_eq!(format_shortcut_hint(&"alt+left".parse().unwrap()), "Alt+←");
+        assert_eq!(
+            format_shortcut_hint(&"super+pageup".parse().unwrap()),
+            "Super+PageUp"
+        );
+    }
+
+    #[test]
+    fn workspace_close_confirmation_matches_terminal_safety_rules() {
+        assert!(!workspace_requires_close_confirmation(0, 0));
+        assert!(!workspace_requires_close_confirmation(1, 0));
+        assert!(workspace_requires_close_confirmation(1, 1));
+        assert!(workspace_requires_close_confirmation(2, 0));
+    }
+
+    #[test]
+    fn application_close_confirmation_protects_processes_and_agent_requests() {
+        assert!(!application_requires_close_confirmation(0, 0));
+        assert!(application_requires_close_confirmation(1, 0));
+        assert!(application_requires_close_confirmation(0, 1));
+    }
+
+    #[test]
+    fn workspace_unread_badge_hides_zero_and_caps_large_counts() {
+        assert_eq!(unread_badge_label(0), None);
+        assert_eq!(unread_badge_label(1).as_deref(), Some("1"));
+        assert_eq!(unread_badge_label(42).as_deref(), Some("42"));
+        assert_eq!(unread_badge_label(100).as_deref(), Some("99+"));
+    }
+
+    #[test]
+    fn workspace_sidebar_height_only_reserves_existing_git_row() {
+        assert_eq!(workspace_sidebar_row_height(false, false), 48.0);
+        assert_eq!(workspace_sidebar_row_height(true, false), 67.0);
+        assert_eq!(workspace_sidebar_row_height(false, true), 67.0);
+        assert_eq!(workspace_sidebar_row_height(true, true), 86.0);
+    }
+
+    #[test]
+    fn workspace_agent_state_prioritizes_active_agents_until_all_are_quiet() {
+        use wmcterm_core::AgentState;
+
+        assert_eq!(aggregate_agent_priority([]), 0);
+        assert_eq!(aggregate_agent_priority([AgentState::Idle]), 1);
+        assert_eq!(
+            aggregate_agent_priority([AgentState::Idle, AgentState::Completed]),
+            2
+        );
+        assert_eq!(
+            aggregate_agent_priority([
+                AgentState::Completed,
+                AgentState::Running,
+                AgentState::Idle,
+            ]),
+            3
+        );
+        assert_eq!(
+            aggregate_agent_priority([AgentState::Running, AgentState::WaitingForInput]),
+            4
+        );
+        assert_eq!(
+            aggregate_agent_priority([AgentState::Running, AgentState::Error]),
+            5
+        );
+    }
+
+    #[test]
+    fn terminal_context_contains_workspace_pane_and_surface_ids() {
+        let state = AppState::default();
+        let workspace = &state.workspaces[0];
+        let pane = workspace.active_pane;
+        let surface = state.panes[&pane].active_surface().unwrap();
+        let SurfaceKind::Terminal(terminal) = state.surfaces[&surface].kind else {
+            panic!("default surface should be a terminal");
+        };
+
+        assert_eq!(
+            terminal_context_ids(&state, terminal),
+            Some((workspace.id, pane, surface))
+        );
+        assert_eq!(terminal_context_ids(&state, uuid::Uuid::new_v4()), None);
+    }
+
+    #[test]
+    fn agent_lifecycle_rejects_stale_hooks_and_accepts_legacy_hooks() {
+        assert_eq!(
+            effective_agent_lifecycle("life-current", None).unwrap(),
+            "life-current"
+        );
+        assert_eq!(
+            effective_agent_lifecycle("life-current", Some("life-current")).unwrap(),
+            "life-current"
+        );
+        assert!(
+            effective_agent_lifecycle("life-current", Some("life-old"))
+                .unwrap_err()
+                .contains("stale agent event")
+        );
+    }
+
+    #[test]
+    fn agent_hook_events_map_to_authoritative_session_events() {
+        let permission = agent_session_event_kind(
+            &AgentEvent::PermissionRequest {
+                message: "allow shell?".into(),
+            },
+            "17",
+        )
+        .unwrap();
+        assert!(matches!(
+            permission,
+            AgentSessionEventKind::ActionRequired(AgentActionRequest {
+                request_id,
+                kind: AgentRequestKind::Permission,
+                message,
+                ..
+            }) if request_id == "permission:17" && message == "allow shell?"
+        ));
+
+        let input = agent_session_event_kind(
+            &AgentEvent::NeedsInput {
+                message: "choose target".into(),
+            },
+            "18",
+        )
+        .unwrap();
+        assert!(matches!(
+            input,
+            AgentSessionEventKind::ActionRequired(AgentActionRequest {
+                request_id,
+                kind: AgentRequestKind::Input,
+                ..
+            }) if request_id == "input:18"
+        ));
+
+        assert!(matches!(
+            agent_session_event_kind(
+                &AgentEvent::ToolUse {
+                    tool: "cargo test".into()
+                },
+                "19"
+            ),
+            Some(AgentSessionEventKind::Telemetry(AgentTelemetry::Activity {
+                summary: Some(summary)
+            })) if summary == "cargo test"
+        ));
+        assert!(matches!(
+            agent_session_event_kind(
+                &AgentEvent::Stop {
+                    success: false,
+                    message: Some("failed".into())
+                },
+                "20"
+            ),
+            Some(AgentSessionEventKind::Lifecycle(AgentLifecycleEvent::Exited {
+                success: false,
+                message: Some(message)
+            })) if message == "failed"
+        ));
+        assert!(
+            agent_session_event_kind(
+                &AgentEvent::SessionStart {
+                    agent: "codex".into(),
+                    session_id: None
+                },
+                "21"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn focus_false_preserves_active_pane_and_surface() {
+        let mut state = AppState::default();
+        let pane = state.workspaces[0].active_pane;
+        let original_surface = state.panes[&pane].active_surface().unwrap();
+        let new_surface = wmcterm_core::Surface::terminal("background");
+        let new_surface_id = new_surface.id;
+        state.surfaces.insert(new_surface_id, new_surface);
+        state
+            .panes
+            .get_mut(&pane)
+            .unwrap()
+            .surfaces
+            .push(new_surface_id);
+
+        focus_created_surface(&mut state, 0, pane, Some(new_surface_id), false);
+        assert_eq!(state.panes[&pane].active_surface(), Some(original_surface));
+
+        focus_created_surface(&mut state, 0, pane, Some(new_surface_id), true);
+        assert_eq!(state.panes[&pane].active_surface(), Some(new_surface_id));
+    }
+
+    #[test]
+    fn rpc_environment_rejects_reserved_and_malformed_values() {
+        assert!(parse_environment(Some(&json!({"SAFE_NAME": "value"}))).is_ok());
+        for environment in [
+            json!({"WMCTERM_SURFACE_ID": "spoof"}),
+            json!({"LD_PRELOAD": "/tmp/library.so"}),
+            json!({"BAD-NAME": "value"}),
+            json!({"OK": 7}),
+        ] {
+            assert!(parse_environment(Some(&environment)).is_err());
+        }
+    }
+
+    #[test]
+    fn spawned_terminals_advertise_color_capabilities() {
+        assert_eq!(TERMINAL_TERM, "xterm-256color");
+        assert_eq!(TERMINAL_COLORTERM, "truecolor");
+        assert_eq!(TERMINAL_PROGRAM, "wmcterm");
+    }
+
+    #[test]
+    fn rpc_create_options_validate_direction_title_and_cwd() {
+        assert_eq!(
+            split_direction(&json!({"direction": "down"})).unwrap(),
+            SplitPlacement {
+                axis: SplitAxis::Horizontal,
+                new_first: false,
+            }
+        );
+        assert!(split_direction(&json!({"direction": "diagonal"})).is_err());
+        assert!(parse_terminal_create_options(&json!({"title": "bad\nname"})).is_err());
+        assert!(
+            parse_terminal_create_options(&json!({"cwd": "/path/that/does/not/exist"})).is_err()
+        );
+    }
+
+    #[test]
+    fn rpc_create_target_uses_explicit_workspace_without_ui_focus_fallback() {
+        let mut state = AppState::new("first", std::path::PathBuf::from("/first"));
+        state
+            .execute(AppCommand::Workspace(WorkspaceCommand::Create {
+                name: "second".into(),
+                cwd: std::path::PathBuf::from("/second"),
+            }))
+            .unwrap();
+        let second = state.workspaces[1].id;
+        let second_pane = state.workspaces[1].active_pane;
+        state.active_workspace = 0;
+
+        assert_eq!(
+            rpc_target_pane_in_state(&state, &json!({"workspace": second})).unwrap(),
+            (1, second_pane)
+        );
+        assert!(rpc_target_pane_in_state(&state, &Value::Null).is_err());
+        assert!(
+            rpc_target_pane_in_state(
+                &state,
+                &json!({"workspace": state.workspaces[0].id, "pane": second_pane})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn agent_terminal_rpc_requires_an_explicit_valid_target() {
+        let surface = SurfaceId::new_v4();
+        assert_eq!(
+            explicit_terminal_target(&json!({"surface": surface})).unwrap(),
+            (None, Some(surface))
+        );
+        assert!(explicit_terminal_target(&Value::Null).is_err());
+        assert!(explicit_terminal_target(&json!({"surface": "not-a-uuid"})).is_err());
+    }
+
+    #[test]
+    fn left_and_up_splits_place_the_new_pane_first() {
+        let target = PaneId::new_v4();
+        let new_pane = PaneId::new_v4();
+        let mut root = PaneNode::leaf(target);
+        root.split(target, new_pane, SplitAxis::Vertical, 0.5)
+            .unwrap();
+        assert!(place_new_split_first(&mut root, target, new_pane));
+        let mut leaves = Vec::new();
+        root.leaves(&mut leaves);
+        assert_eq!(leaves, vec![new_pane, target]);
+    }
+
+    #[test]
+    fn new_workspace_directory_priority_is_inherit_then_default_then_process() {
+        let active = std::path::Path::new("/active");
+        let default = std::path::Path::new("/default");
+        let process = std::path::Path::new("/process");
+        assert_eq!(
+            select_new_workspace_cwd(true, Some(active), Some(default), process),
+            active
+        );
+        assert_eq!(
+            select_new_workspace_cwd(true, None, Some(default), process),
+            default
+        );
+        assert_eq!(
+            select_new_workspace_cwd(false, Some(active), Some(default), process),
+            default
+        );
+        assert_eq!(
+            select_new_workspace_cwd(false, Some(active), None, process),
+            process
+        );
+    }
+
+    #[test]
+    fn workspace_directory_resolution_expands_home_and_rejects_non_directories() {
+        let process = std::env::current_dir().unwrap();
+        assert_eq!(resolve_existing_directory(".", &process).unwrap(), process);
+        assert!(resolve_existing_directory("", &process).is_err());
+        assert!(resolve_existing_directory("Cargo.toml", &process).is_err());
+
+        let home = wmcterm_config::expand_home_path(std::path::Path::new("~"));
+        if home.is_dir() {
+            assert_eq!(
+                resolve_existing_directory("~", &process).unwrap(),
+                home.canonicalize().unwrap()
+            );
+        }
+    }
+}

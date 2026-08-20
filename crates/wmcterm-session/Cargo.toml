@@ -1,0 +1,13 @@
+[package]
+name = "wmcterm-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+directories.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+wmcterm-core = { path = "../wmcterm-core" }
+thiserror.workspace = true
