@@ -1332,7 +1332,12 @@ pub struct AgentTransition {
 
 pub fn reduce(event: &AgentEvent) -> AgentTransition {
     match event {
-        AgentEvent::SessionStart { .. } | AgentEvent::ToolUse { .. } => AgentTransition {
+        AgentEvent::SessionStart { .. } => AgentTransition {
+            state: AgentState::Idle,
+            attention: AttentionState::None,
+            notification: None,
+        },
+        AgentEvent::ToolUse { .. } => AgentTransition {
             state: AgentState::Running,
             attention: AttentionState::Activity,
             notification: None,
@@ -1550,6 +1555,23 @@ fn parse_osc777_notification(payload: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_start_is_idle_until_activity_begins() {
+        let started = reduce(&AgentEvent::SessionStart {
+            agent: "codex".into(),
+            session_id: Some("session-1".into()),
+        });
+        assert_eq!(started.state, AgentState::Idle);
+        assert_eq!(started.attention, AttentionState::None);
+
+        let active = reduce(&AgentEvent::ToolUse {
+            tool: "cargo test".into(),
+        });
+        assert_eq!(active.state, AgentState::Running);
+        assert_eq!(active.attention, AttentionState::Activity);
+    }
+
     #[test]
     fn permission_event_requires_attention() {
         let event = parse_osc777("wmcterm;permission;Approve shell?").unwrap();

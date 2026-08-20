@@ -480,16 +480,74 @@ pub(crate) fn notification_preview(
 
 /// Build the exact monospace label rendered in a surface tab. Titles are
 /// bounded by display columns so CJK and Latin labels consume equal geometry.
-pub(crate) fn surface_tab_label(title: &str, index: usize) -> String {
-    format!("{} {}", truncate_display_width(title, 14), index + 1)
+#[cfg(test)]
+fn surface_tab_label(title: &str, index: usize, agent: bool) -> String {
+    format!("{} {}", surface_tab_title(title, agent), index + 1)
+}
+
+/// Keep an Agent's transient braille spinner in a fixed two-column slot. The
+/// slot remains reserved between frames (and while idle), so OSC title changes
+/// do not resize the tab or displace the stable title.
+pub(crate) fn surface_tab_title(title: &str, agent: bool) -> String {
+    let (spinner, stable) = split_agent_spinner(title);
+    let stable = truncate_display_width(stable, 14);
+    if agent || spinner.is_some() {
+        format!("{} {}", spinner.unwrap_or(' '), stable)
+    } else {
+        stable
+    }
+}
+
+/// Fit the title to the tab's current text bounds before it reaches the text
+/// shaper. This prevents a squeezed trailing word from wrapping onto a clipped
+/// second line and leaving the visible first line mostly empty.
+pub(crate) fn surface_tab_visible_title(
+    title: &str,
+    agent: bool,
+    available_width: f32,
+    cell_width: f32,
+) -> String {
+    let max_columns = (available_width / cell_width.max(1.0)).floor().max(1.0) as usize;
+    truncate_display_width(&surface_tab_title(title, agent), max_columns)
+}
+
+fn split_agent_spinner(title: &str) -> (Option<char>, &str) {
+    let trimmed = title.trim_start();
+    let mut characters = trimmed.chars();
+    let Some(first) = characters.next() else {
+        return (None, trimmed);
+    };
+    let remainder = characters.as_str();
+    if ('\u{2800}'..='\u{28ff}').contains(&first)
+        && remainder.chars().next().is_some_and(char::is_whitespace)
+        && !remainder.trim().is_empty()
+    {
+        (Some(first), remainder.trim_start())
+    } else {
+        (None, trimmed)
+    }
 }
 
 /// Size the visible label plus its leading inset, a small trailing gap, and
 /// the close target. Keeping this beside the label prevents empty click areas
 /// when a title is short or contains wide characters.
-pub(crate) fn surface_tab_width_at(title: &str, index: usize, cell_width: f32) -> f32 {
-    let label_columns = display_width(&surface_tab_label(title, index));
-    (label_columns as f32 * cell_width + 32.0).max(64.0)
+const SURFACE_TAB_LEFT_INSET: f32 = 7.0;
+const SURFACE_TAB_TITLE_NUMBER_GAP: f32 = 4.0;
+const SURFACE_TAB_NUMBER_CLOSE_GAP: f32 = 4.0;
+const SURFACE_TAB_NUMBER_SLACK: f32 = 4.0;
+const SURFACE_TAB_MAX_CLOSE_WIDTH: f32 = 24.0;
+
+pub(crate) fn surface_tab_width_at(title: &str, index: usize, cell_width: f32, agent: bool) -> f32 {
+    let title_columns = display_width(&surface_tab_title(title, agent)) as f32;
+    let number_columns = display_width(&(index + 1).to_string()) as f32;
+    (SURFACE_TAB_LEFT_INSET
+        + title_columns * cell_width
+        + SURFACE_TAB_TITLE_NUMBER_GAP
+        + number_columns * cell_width
+        + SURFACE_TAB_NUMBER_SLACK
+        + SURFACE_TAB_NUMBER_CLOSE_GAP
+        + SURFACE_TAB_MAX_CLOSE_WIDTH)
+        .max(64.0)
 }
 
 pub(crate) fn surface_tab_text_bounds(
@@ -498,25 +556,20 @@ pub(crate) fn surface_tab_text_bounds(
     index: usize,
     cell_width: f32,
 ) -> (Bounds, Bounds) {
-    const LEFT_INSET: f32 = 7.0;
-    const TITLE_NUMBER_GAP: f32 = 4.0;
-    const NUMBER_CLOSE_GAP: f32 = 4.0;
-    const NUMBER_SLACK: f32 = 4.0;
-
     let tab_right = tab.x + tab.width;
     let close_left = close
         .map_or(tab_right, |close| close.x)
         .clamp(tab.x, tab_right);
     let number_columns = display_width(&(index + 1).to_string()) as f32;
-    let number_width = (number_columns * cell_width + NUMBER_SLACK)
-        .min((close_left - tab.x - NUMBER_CLOSE_GAP).max(1.0));
-    let number_left = (close_left - NUMBER_CLOSE_GAP - number_width).max(tab.x);
-    let title_left = (tab.x + LEFT_INSET).min(number_left);
+    let number_width = (number_columns * cell_width + SURFACE_TAB_NUMBER_SLACK)
+        .min((close_left - tab.x - SURFACE_TAB_NUMBER_CLOSE_GAP).max(1.0));
+    let number_left = (close_left - SURFACE_TAB_NUMBER_CLOSE_GAP - number_width).max(tab.x);
+    let title_left = (tab.x + SURFACE_TAB_LEFT_INSET).min(number_left);
     (
         Bounds {
             x: title_left,
             y: tab.y,
-            width: (number_left - TITLE_NUMBER_GAP - title_left).max(1.0),
+            width: (number_left - SURFACE_TAB_TITLE_NUMBER_GAP - title_left).max(1.0),
             height: tab.height,
         },
         Bounds {
@@ -992,6 +1045,40 @@ mod tests {
     }
 
     #[test]
+    fn agent_spinner_uses_a_stable_slot_without_hiding_the_title() {
+        assert_eq!(
+            surface_tab_title("⠋ compiling wmcterm workspace", true),
+            "⠋ compiling wmc…"
+        );
+        assert_eq!(surface_tab_title("⠙ 中文终端标题", true), "⠙ 中文终端标题");
+        assert_eq!(surface_tab_title("wmcterm", true), "  wmcterm");
+        assert_eq!(surface_tab_title("⠋braille-title", false), "⠋braille-title");
+        assert_eq!(
+            surface_tab_label("⠹ fixing tests", 2, true),
+            "⠹ fixing tests 3"
+        );
+        assert_eq!(
+            surface_tab_width_at("wmcterm", 0, 8.0, true),
+            surface_tab_width_at("⠼ wmcterm", 0, 8.0, true)
+        );
+        let width = surface_tab_width_at("⠼ wmcterm", 0, 7.2, true);
+        let tab = Bounds {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height: 25.0,
+        };
+        let close = Bounds {
+            x: width - SURFACE_TAB_MAX_CLOSE_WIDTH,
+            y: 0.0,
+            width: SURFACE_TAB_MAX_CLOSE_WIDTH,
+            height: 25.0,
+        };
+        let (title, _) = surface_tab_text_bounds(tab, Some(close), 0, 7.2);
+        assert!(title.width >= display_width(&surface_tab_title("⠼ wmcterm", true)) as f32 * 7.2);
+    }
+
+    #[test]
     fn notification_preview_wraps_two_lines_and_marks_hidden_tail() {
         assert_eq!(
             notification_preview("一二三四五六七八九十", 6, 2, None),
@@ -1017,23 +1104,50 @@ mod tests {
 
     #[test]
     fn tab_hit_width_tracks_truncation_and_font_size() {
-        let long = surface_tab_width_at("a title that is much longer than the visible tab", 0, 8.0);
-        let equally_visible = surface_tab_width_at("a title that …", 0, 8.0);
-        assert_eq!(long, equally_visible);
-        assert_eq!(surface_tab_label("terminal", 0), "terminal 1");
-        assert_eq!(surface_tab_width_at("tab", 0, 8.0), 72.0);
-        assert_eq!(
-            surface_tab_width_at("终端", 0, 8.0),
-            surface_tab_width_at("term", 0, 8.0)
+        let long = surface_tab_width_at(
+            "a title that is much longer than the visible tab",
+            0,
+            8.0,
+            false,
         );
-        assert!(surface_tab_width_at("tab", 0, 12.0) > surface_tab_width_at("tab", 0, 8.0));
-        assert!(surface_tab_width_at("tab", 9, 8.0) > surface_tab_width_at("tab", 0, 8.0));
+        let equally_visible = surface_tab_width_at("a title that …", 0, 8.0, false);
+        assert_eq!(long, equally_visible);
+        assert_eq!(surface_tab_label("terminal", 0, false), "terminal 1");
+        assert_eq!(surface_tab_width_at("tab", 0, 8.0, false), 75.0);
+        assert_eq!(
+            surface_tab_width_at("终端", 0, 8.0, false),
+            surface_tab_width_at("term", 0, 8.0, false)
+        );
+        assert!(
+            surface_tab_width_at("tab", 0, 12.0, false)
+                > surface_tab_width_at("tab", 0, 8.0, false)
+        );
+        assert!(
+            surface_tab_width_at("tab", 9, 8.0, false) > surface_tab_width_at("tab", 0, 8.0, false)
+        );
+    }
+
+    #[test]
+    fn squeezed_tab_title_is_truncated_before_word_wrapping() {
+        assert_eq!(
+            surface_tab_visible_title("terminal workspace", false, 8.0 * 8.0, 8.0),
+            "termina…"
+        );
+        assert_eq!(
+            display_width(&surface_tab_visible_title(
+                "中文 terminal",
+                false,
+                6.0 * 8.0,
+                8.0,
+            )),
+            6
+        );
     }
 
     #[test]
     fn tab_numbers_keep_independent_space_before_the_close_target() {
         for index in [7, 8, 9, 10] {
-            let width = surface_tab_width_at("long terminal title", index, 7.2);
+            let width = surface_tab_width_at("long terminal title", index, 7.2, false);
             let tab = Bounds {
                 x: 100.0,
                 y: 40.0,

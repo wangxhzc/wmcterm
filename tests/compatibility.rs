@@ -53,7 +53,7 @@ fn vim_alternate_screen_starts_and_exits() {
         return;
     }
     let session = TerminalSession::spawn(
-        CommandSpec::new("vim").args(["-Nu", "NONE", "-n"]),
+        CommandSpec::new("vim").args(["-Nu", "NONE", "-n", "-i", "NONE"]),
         TerminalSize::new(80, 24).unwrap(),
     )
     .unwrap();

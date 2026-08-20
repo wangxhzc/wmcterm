@@ -2046,3 +2046,146 @@ cargo build --release --bin wmcterm
 `scripts/window-state-smoke.sh`、`scripts/test-update-agent-integration.sh`、
 Windows cross-check 或 `scripts/package-release.sh`。这些属于环境相关验证，不能
 用纯单元测试的通过替代。
+
+## 33.6 已修复缺陷：跨工作区审批阻塞模态编辑
+
+修复状态（2026-08-20）：审批注册仅在请求属于当前 Surface 且没有活动文本
+编辑器时自动展开通知面板；键盘路由同时保证 `TextPrompt`、工作区搜索、命令
+面板和终端查找优先于异步展开的通知面板。非当前 Surface 的请求仍更新对应
+Agent/Workspace attention，并按配置发送原生通知，但不会抢占键盘或 IME。
+
+已知问题：用户正在修改当前工作区路径时，如果其他工作区存在待审批的
+Agent 请求，当前路径编辑窗口可能卡死或无法继续输入、提交、取消及执行
+其他操作。这是错误的跨工作区交互耦合：非当前工作区的待处理请求可以触发
+attention 和通知更新，但不应抢占当前模态编辑器的输入归属，也不应使其进入
+不可退出状态。
+
+修复时需要同时检查同类问题，不应只覆盖“修改工作区路径”一个入口：
+
+- 审计待审批请求注册、更新、超时、取消和 Agent 状态重算时的焦点与模态层
+  切换，确保状态更新按请求所属 Workspace/Pane/Surface 隔离。
+- 覆盖重命名、描述、路径、目录查找、日志过滤等共用 `TextPrompt` 的入口，以及
+  工作区搜索、命令面板和终端查找等其他文本编辑状态。
+- 检查通知中心、Agent 审批卡片、关闭确认和其他模态层在非当前工作区事件到达时
+  是否也会错误抢占键盘、IME、鼠标或 Escape/Enter 路由。
+- 增加至少两个工作区的回归测试：在工作区 A 保持编辑器打开并输入未提交文本，
+  在工作区 B 注册、更新和解决审批请求；验证 A 的焦点、文本、IME 预编辑、光标与
+  提交/取消行为始终不受影响，而 B 的审批状态仍正确可见、可操作。
+
+验收条件是：任意非当前工作区的 Agent 请求生命周期变化都不会中断当前文本
+编辑会话；当前工作区的审批仍按明确的交互规则呈现，且所有审批决策继续
+fail closed。
+
+## 33.7 已修复缺陷：异步诊断输出覆盖 Codex 输入框
+
+修复状态（2026-08-20）：确认示例中的日志来自 `wmcterm codex-teams` 启动的私有
+Codex app-server；该辅助进程此前继承了交互式 PTY 的 stderr。现在其 stdin、
+stdout 和 stderr 均不连接前台 PTY，延迟模型刷新诊断不会再注入根 Codex TUI
+或其他终端。根 Codex 进程本身仍保留标准流继承，以维持正常交互。
+
+已知问题：Codex 完成一次任务并恢复输入框后，后台模型刷新子进程的延迟
+错误输出会直接写入当前终端，例如：
+
+```text
+2026-08-20T03:08:09.769966Z ERROR codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit
+```
+
+该行会覆盖 Codex 的输入框，造成输入区域视觉损坏，并可能使 TUI 内部布局与
+wmcterm 当前显示的 VT 状态不一致。需先区分该日志是 Codex 本身向 PTY 写入的
+普通字节，还是 wmcterm 的 Agent 集成、watcher 或子进程管理将诊断误路由到了前台
+Terminal Surface。
+
+后续观察到相同的 `codex_models_manager::manager` 超时日志会在等待一段时间后出现在
+其他终端中。因此不能把该问题仅归因于单个 Codex TUI 未重绘；还需优先检查
+共享或全局模型刷新任务的输出是否被广播到多个 Surface，或子进程是否继承了
+错误的 PTY/stdout/stderr 文件描述符。调查时应记录日志实际出现的 Workspace、
+Pane、Surface、Terminal lifecycle 和前台进程，并与发起刷新任务的 Agent 归属对比。
+
+修复与排查范围：
+
+- 确认受管 Codex、app-server watcher 及模型刷新子进程的 stdout/stderr 归属，
+  防止辅助进程的日志注入交互式 PTY。
+- 审计子进程 spawn 时的 stdin/stdout/stderr 文件描述符继承、全局日志 subscriber/writer 和
+  跨 Surface 消息分发，确保诊断只进入明确指定的日志目标，不依赖当时 UI 焦点。
+- 如果该字节确属 Codex TUI 输出，检查 VT 光标保存/恢复、备用屏、擦除、换行、
+  延迟重绘和快照合并的处理，并确认 TUI 能在异步输出后完整重绘输入区。
+- 检查完成、审批解决、超时、模型列表刷新、watcher 重连和子进程退出等延迟
+  事件是否会在前台 TUI 进入输入态后产生同类输出。
+- 增加多终端回归测试：在 Codex 恢复输入框后注入延迟 stderr 或诊断事件，
+  验证所属 Surface 的输入文本、光标、提示区和后续键盘操作都正确，且其他
+  Workspace/Pane/Surface 不会收到该字节；同时覆盖焦点切换、窗口 resize、长行
+  换行和连续异步输出。
+
+验收条件是：辅助进程诊断不会泄漏到任何前台交互式 PTY，也不会跨终端、
+跨 Pane 或跨 Workspace 广播；对于应当显示的异步
+TUI 输出，wmcterm 能正确解析和重绘，不会留下被覆盖的输入框、错位光标或
+不可操作状态。
+
+## 33.8 已修复缺陷：Codex 完成本轮后 Workspace 仍显示运行中
+
+修复状态（2026-08-20）：Hook `Stop` 现在归一化为本轮状态观测
+`Completed`/`Error`，不再错误映射为长生命周期进程 `Exited`。真实 PTY 退出仍是
+关闭 Agent lifecycle 的唯一入口；交互式 Codex 恢复输入框后可以显示完成状态，
+下一次活动又能在同一 lifecycle 中回到运行中。
+
+已知问题：Codex 已经完成输出并恢复可输入提示符后，Workspace 状态仍长时间
+显示“运行中”。这不符合当前状态模型：用户提交输入时可先乐观设置
+`AgentState::Running`，但本轮完成事件到达后应转为 `AgentState::Completed`，
+并聚合为 `WorkspaceStatus::Completed`。
+
+排查与修复范围：
+
+- 确认 Codex `Stop`/`AgentTurnComplete` Hook 以及 app-server `turn/completed` 等完成信号是否
+  都能归一化为当前 Surface 的本轮完成事件。
+- 检查完成事件是否因 Terminal lifecycle、session/thread ID、sequence 或重复事件校验而被
+  拒绝，并让被拒绝原因可诊断。
+- 区分“Codex 进程仍存活”与“当前 turn 正在执行”；交互式进程留在输入框
+  不应使 Workspace 永久保持运行中。
+- 增加“提交提示 -> 执行 -> 完成输出 -> 恢复输入框”回归测试，覆盖 Hook、
+  app-server watcher、有无待审批请求和完成信号重复到达。
+
+验收条件是：Codex 每次开始执行时及时显示运行中，每次恢复等待下一次用户
+输入时及时离开运行中；进程存活状态与 turn 状态不再混用。
+
+## 33.9 已修复缺陷：Agent 动态标题前缀使终端标签正文不可见
+
+修复状态（2026-08-20）：Surface 继续保存完整原始 OSC title。受管 Agent 标签为
+“单个 braille spinner + 空白”预留固定两列：运行时保留并显示 Codex/Claude 自带
+spinner，空闲帧使用等宽空槽，因此动态帧不会改变标签宽度或挤掉稳定标题。
+标题、编号、间距和关闭按钮使用同一组几何常量计算显示与命中区域；英文、CJK、
+动态 spinner 及运行/空闲等宽切换已有共同回归用例。
+
+已知问题：终端标签根据已生成的标题确定长度后，Codex 在运行期间会向终端
+标题最前面加入类似转圈的动态进度字符，此后标签中原本应显示的后续文字可能
+全部不可见。修复前实现会将每次 VT title change 整段替换到 `Surface.title`，
+然后固定从字符串开头截断到 14 个显示列；没有区分稳定标题和瞬时进度前缀。
+
+Claude 与 Codex 在 wmcterm 中共用完全相同的 VT title 接收、`Surface.title` 替换、
+显示宽度计算和截断路径。因此，如果 Claude Code 也发送“动态字符 + 长标题”
+的 OSC title，同一缺陷会出现。当前代码与测试只能确认 Claude 具有相同的受影响
+条件，尚不能证明当前 Claude 版本必然会发送这种标题序列。
+
+排查与修复范围：
+
+- 捕获 Codex 和 Claude 在 idle、running、waiting 和 completed 阶段发送的原始 OSC title
+  字节、解析后字符串、Unicode 显示宽度与实际字形边界。
+- 检查 braille/block spinner、variation selector、emoji、组合字符、零宽字符与 ANSI/控制字符
+  对 `truncate_display_width`、标签宽度和 glyphon clip bounds 的影响。
+- 产品策略采用固定进度槽，保留 Agent 自带 spinner，同时保证稳定标题拥有独立、
+  不随 spinner 帧变化的显示宽度。
+- 增加 Codex 和 Claude 共用回归用例，覆盖短/长英文、CJK、emoji、组合字符、
+  动态 spinner 帧和高频 title change，验证标签宽度、命中区域、关闭按钮与可见文本
+  始终一致。
+
+验收条件是：无论 Agent 是否动态更新终端标题，标签都至少保留可识别的
+稳定标题文本；动态状态不会改变或破坏标签的布局与可操作区域。
+
+## 33.10 已修复缺陷：新启动 Codex 被误标为运行中
+
+修复状态（2026-08-20）：Agent lifecycle `Started`、前台 Agent 进程自动识别和
+`SessionStart` 只表示交互式进程已经建立，初始 turn 状态统一为 `Idle`。用户提交
+Enter、收到 ToolUse/Activity 或明确的运行状态观测后才进入 `Running`；审批、输入、
+完成、错误和真实进程退出仍沿用各自独立的状态转换。
+
+生命周期 `Running` 仅表示 Codex/Claude 进程仍存活，不能直接聚合为工作区“运行中”。
+新打开 Agent 并停在输入框时工作区显示空闲，避免把等待首次输入误报为正在执行任务。

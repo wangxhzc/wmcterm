@@ -545,7 +545,10 @@ impl AgentSession {
                 self.transcript.clone_from(&launch.transcript);
                 self.launch_command.clone_from(&launch.launch_command);
                 self.pending_requests.clear();
-                self.state = AgentState::Running;
+                // A live interactive Agent process is not necessarily
+                // executing a turn. Activity telemetry owns the transition
+                // to Running after the user submits work.
+                self.state = AgentState::Idle;
             }
             kind => {
                 self.require_current_running_lifecycle(event.lifecycle_generation)?;
@@ -1638,8 +1641,52 @@ mod tests {
         assert_eq!(session.session_id.as_deref(), Some("session-1"));
         assert_eq!(session.pid, Some(4201));
         assert_eq!(session.cwd.as_deref(), Some(std::path::Path::new("/work")));
-        assert_eq!(session.state, AgentState::Running);
+        assert_eq!(session.state, AgentState::Idle);
         assert_eq!(session.last_activity_unix_ms, 100);
+
+        session
+            .apply_event(&agent_event(
+                "first-turn",
+                1,
+                101,
+                AgentSessionEventKind::Telemetry(AgentTelemetry::Activity {
+                    summary: Some("first prompt".into()),
+                }),
+            ))
+            .unwrap();
+        assert_eq!(session.state, AgentState::Running);
+    }
+
+    #[test]
+    fn completed_turn_keeps_interactive_lifecycle_open_for_the_next_turn() {
+        let mut session = AgentSession::new(SurfaceId::new_v4());
+        session.apply_event(&agent_start("start", 1, 100)).unwrap();
+        session
+            .apply_event(&agent_event(
+                "turn-completed",
+                1,
+                101,
+                AgentSessionEventKind::Telemetry(AgentTelemetry::StateObserved {
+                    state: AgentState::Completed,
+                }),
+            ))
+            .unwrap();
+
+        assert_eq!(session.state, AgentState::Completed);
+        assert_eq!(session.lifecycle.phase, AgentLifecyclePhase::Running);
+
+        session
+            .apply_event(&agent_event(
+                "next-turn",
+                1,
+                102,
+                AgentSessionEventKind::Telemetry(AgentTelemetry::Activity {
+                    summary: Some("next prompt".into()),
+                }),
+            ))
+            .unwrap();
+        assert_eq!(session.state, AgentState::Running);
+        assert_eq!(session.lifecycle.phase, AgentLifecyclePhase::Running);
     }
 
     #[test]

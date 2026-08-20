@@ -1195,7 +1195,9 @@ pub fn launch_codex_teams(
         .args(&plan.app_server_args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::inherit())
+        // This auxiliary server must not inject delayed diagnostics into the
+        // interactive Codex PTY and overwrite its input area.
+        .stderr(Stdio::null())
         .spawn()?;
     if let Err(error) = wait_for_app_server(&config.endpoint, &mut app_server) {
         let _ = app_server.kill();

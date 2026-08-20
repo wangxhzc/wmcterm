@@ -91,6 +91,8 @@ enum UserEvent {
     WorkspaceMetadata(Vec<WorkspaceMetadata>),
 }
 
+const UNMODIFIED_TAB_FOCUS_GRACE: std::time::Duration = std::time::Duration::from_millis(120);
+
 #[derive(Debug)]
 struct WorkspaceMetadata {
     id: wmcterm_core::WorkspaceId,
@@ -470,6 +472,8 @@ struct WmctermApplication {
     wake_pending: Arc<AtomicBool>,
     proxy: EventLoopProxy<UserEvent>,
     modifiers: ModifiersState,
+    physical_alt_pressed: bool,
+    pending_unmodified_tab: Option<(KeyEvent, std::time::Instant)>,
     palette_visible: bool,
     palette_index: usize,
     palette_scroll: usize,
@@ -529,7 +533,9 @@ struct WmctermApplication {
     terminal_processes: HashMap<TerminalId, Vec<String>>,
     foreground_agents: HashMap<TerminalId, AgentKind>,
     automatic_agent_status: HashSet<TerminalId>,
+    foreground_agent_input: HashMap<TerminalId, String>,
     window_focused: bool,
+    window_focus_gained_at: std::time::Instant,
     last_bell_notifications: HashMap<TerminalId, std::time::Instant>,
     agent_sessions: HashMap<SurfaceId, AgentSession>,
     pending_agent_requests: PendingAgentRequests,
@@ -609,6 +615,8 @@ impl WmctermApplication {
             wake_pending,
             proxy,
             modifiers: ModifiersState::empty(),
+            physical_alt_pressed: false,
+            pending_unmodified_tab: None,
             palette_visible: false,
             palette_index: 0,
             palette_scroll: 0,
@@ -670,7 +678,9 @@ impl WmctermApplication {
             terminal_processes: HashMap::new(),
             foreground_agents: HashMap::new(),
             automatic_agent_status: HashSet::new(),
+            foreground_agent_input: HashMap::new(),
             window_focused: true,
+            window_focus_gained_at: std::time::Instant::now(),
             last_bell_notifications: HashMap::new(),
             agent_sessions: restored_agent_sessions,
             pending_agent_requests: PendingAgentRequests::new(256)
@@ -1527,6 +1537,7 @@ impl WmctermApplication {
         match detected {
             Some(agent) => {
                 self.foreground_agents.insert(terminal, agent);
+                self.foreground_agent_input.remove(&terminal);
                 let should_update = self.automatic_agent_status.contains(&terminal)
                     || self
                         .state
@@ -1543,17 +1554,13 @@ impl WmctermApplication {
                 if let Some(surface) = self.state.surfaces.values_mut().find(
                     |surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal),
                 ) {
-                    surface.agent = Some(wmcterm_core::AgentMetadata {
-                        name: agent.as_str().to_owned(),
-                        state: wmcterm_core::AgentState::Running,
-                        session_id: None,
-                    });
+                    surface.agent = Some(detected_foreground_agent_metadata(agent));
                     surface.attention = AttentionState::None;
                 }
                 if let Some(index) = self.workspace_for_terminal(terminal)
                     && let Some(workspace) = self.state.workspaces.get_mut(index)
                 {
-                    workspace.status = wmcterm_core::WorkspaceStatus::Running;
+                    workspace.status = wmcterm_core::WorkspaceStatus::Idle;
                 }
                 if let Some(surface) = self.surface_for_terminal(terminal) {
                     self.sync_surface_agent_request_state(surface);
@@ -1562,6 +1569,7 @@ impl WmctermApplication {
             }
             None => {
                 self.foreground_agents.remove(&terminal);
+                self.foreground_agent_input.remove(&terminal);
                 if !self.automatic_agent_status.remove(&terminal) {
                     return false;
                 }
@@ -1612,12 +1620,83 @@ impl WmctermApplication {
             workspace.status = wmcterm_core::WorkspaceStatus::Running;
         }
         if let Some(surface) = self.surface_for_terminal(terminal) {
+            self.observe_agent_session_state(surface, wmcterm_core::AgentState::Running);
             self.sync_surface_agent_request_state(surface);
         }
     }
 
+    fn mark_foreground_agent_idle(&mut self, terminal: TerminalId) {
+        let Some(agent) = self.foreground_agents.get(&terminal).copied() else {
+            return;
+        };
+        self.automatic_agent_status.insert(terminal);
+        if let Some(surface) = self
+            .state
+            .surfaces
+            .values_mut()
+            .find(|surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal))
+        {
+            let session_id = surface
+                .agent
+                .as_ref()
+                .and_then(|metadata| metadata.session_id.clone());
+            surface.agent = Some(wmcterm_core::AgentMetadata {
+                name: agent.as_str().to_owned(),
+                state: wmcterm_core::AgentState::Idle,
+                session_id,
+            });
+            surface.attention = AttentionState::None;
+        }
+        if let Some(index) = self.workspace_for_terminal(terminal)
+            && let Some(workspace) = self.state.workspaces.get_mut(index)
+        {
+            workspace.status = wmcterm_core::WorkspaceStatus::Idle;
+        }
+        if let Some(surface) = self.surface_for_terminal(terminal) {
+            self.observe_agent_session_state(surface, wmcterm_core::AgentState::Idle);
+            self.sync_surface_agent_request_state(surface);
+        }
+    }
+
+    fn observe_agent_session_state(&mut self, surface: SurfaceId, state: wmcterm_core::AgentState) {
+        let Some(session) = self.agent_sessions.get_mut(&surface) else {
+            return;
+        };
+        let event = AgentSessionEvent {
+            event_id: format!("terminal-input:{}", uuid::Uuid::new_v4()),
+            lifecycle_generation: session.lifecycle.generation,
+            lifecycle_id: session.lifecycle.external_id.clone(),
+            sequence: None,
+            occurred_at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|value| value.as_millis() as u64)
+                .unwrap_or_default(),
+            kind: AgentSessionEventKind::Telemetry(AgentTelemetry::StateObserved { state }),
+        };
+        let _ = session.apply_event(&event);
+    }
+
     fn send_key(&mut self, event: &KeyEvent) {
+        if matches!(
+            event.physical_key,
+            PhysicalKey::Code(KeyCode::AltLeft | KeyCode::AltRight)
+        ) {
+            self.physical_alt_pressed = event.state == ElementState::Pressed;
+        }
         if event.state != ElementState::Pressed {
+            return;
+        }
+        // Focus transitions are allowed to race keyboard delivery on several
+        // desktop backends. Never route a late key press from an unfocused
+        // window, and consume the physical Tab from Alt/Super+Tab before any
+        // overlay, editor, or terminal gets a chance to interpret it.
+        if should_suppress_focus_transition_key(
+            self.window_focused,
+            &event.logical_key,
+            event.physical_key,
+            self.modifiers,
+            self.physical_alt_pressed,
+        ) {
             return;
         }
         if let Some((_, scroll)) = &mut self.agent_request_detail {
@@ -1655,7 +1734,10 @@ impl WmctermApplication {
             self.rebuild_scene();
             return;
         }
-        if self.notifications_visible {
+        // Approval state can change asynchronously. A floating notification
+        // panel must never take keyboard ownership from an editor that the
+        // user explicitly opened.
+        if self.notifications_visible && !self.text_editor_active() {
             let pending = self.pending_agent_request_list();
             if !pending.is_empty() {
                 match event.logical_key {
@@ -2279,26 +2361,52 @@ impl WmctermApplication {
                 return;
             }
         }
-        // Window managers commonly deliver the Tab press to the currently
-        // focused window before Alt+Tab or Super+Tab transfers focus.  Do not
-        // leak that system shortcut into the PTY, where interactive programs
-        // may interpret it as completion or submission.
-        if is_window_switch_shortcut(&event.logical_key, self.modifiers) {
-            return;
-        }
         let physical_character = physical_ascii_character(event.physical_key);
         let key = terminal_input_key(&event.logical_key, physical_character);
         if let (Some(id), Some(key)) = (self.active_terminal_id(), key) {
             let notifications_changed = self.mark_terminal_notifications_read(id);
-            if matches!(key, InputKey::Enter)
+            let control_c = is_agent_interrupt(event.physical_key, self.modifiers);
+            if control_c && self.foreground_agents.contains_key(&id) {
+                self.foreground_agent_input.remove(&id);
+                self.mark_foreground_agent_idle(id);
+                self.rebuild_scene();
+            } else if matches!(key, InputKey::Enter)
                 && !self.modifiers.control_key()
                 && !self.modifiers.alt_key()
                 && !self.modifiers.super_key()
             {
-                self.mark_foreground_agent_running(id);
-                self.rebuild_scene();
+                let input = self.foreground_agent_input.remove(&id).unwrap_or_default();
+                if agent_submission_starts_turn(&input) {
+                    self.mark_foreground_agent_running(id);
+                    self.rebuild_scene();
+                } else if notifications_changed {
+                    self.rebuild_scene();
+                }
             } else if notifications_changed {
                 self.rebuild_scene();
+            }
+            if self.foreground_agents.contains_key(&id)
+                && !self.modifiers.control_key()
+                && !self.modifiers.alt_key()
+                && !self.modifiers.super_key()
+            {
+                match key {
+                    InputKey::Character(character) => {
+                        self.foreground_agent_input
+                            .entry(id)
+                            .or_default()
+                            .push(character);
+                    }
+                    InputKey::Space => {
+                        self.foreground_agent_input.entry(id).or_default().push(' ');
+                    }
+                    InputKey::Backspace => {
+                        if let Some(input) = self.foreground_agent_input.get_mut(&id) {
+                            input.pop();
+                        }
+                    }
+                    _ => {}
+                }
             }
             let Some(runtime) = self.terminals.get_mut(&id) else {
                 return;
@@ -2327,6 +2435,17 @@ impl WmctermApplication {
                 repeat: event.repeat,
             };
             let _ = runtime.session.send(SessionCommand::Key(input));
+        }
+    }
+
+    fn flush_pending_unmodified_tab(&mut self) {
+        let Some((event, queued_at)) = self.pending_unmodified_tab.take() else {
+            return;
+        };
+        if self.window_focused && queued_at.elapsed() >= UNMODIFIED_TAB_FOCUS_GRACE {
+            self.send_key(&event);
+        } else {
+            self.pending_unmodified_tab = Some((event, queued_at));
         }
     }
 
@@ -2362,6 +2481,13 @@ impl WmctermApplication {
                 self.rebuild_scene();
             }
         }
+    }
+
+    fn text_editor_active(&self) -> bool {
+        self.workspace_search_focused
+            || self.prompt.is_some()
+            || self.search_visible
+            || self.palette_visible
     }
 
     fn update_ime_preedit(&mut self, text: &str) {
@@ -3126,7 +3252,14 @@ impl WmctermApplication {
                 self.state
                     .surfaces
                     .get(surface)
-                    .map(|surface| ui::surface_tab_width_at(&surface.title, index, cell_width))
+                    .map(|surface| {
+                        ui::surface_tab_width_at(
+                            &surface.title,
+                            index,
+                            cell_width,
+                            surface.agent.is_some(),
+                        )
+                    })
                     .unwrap_or(64.0)
             })
             .collect();
@@ -7021,7 +7154,12 @@ impl WmctermApplication {
                     blocks.push(TextBlock {
                         text: String::new(),
                         spans: vec![TextSpan {
-                            text: ui::truncate_display_width(&surface.title, 14),
+                            text: ui::surface_tab_visible_title(
+                                &surface.title,
+                                surface.agent.is_some(),
+                                title_bounds.width,
+                                tab_font_size * 0.6,
+                            ),
                             color: if selected { theme_text } else { theme_subtext },
                             bold: selected,
                             italic: false,
@@ -8742,7 +8880,13 @@ impl WmctermApplication {
             }
             wmcterm_ipc::RegisterOutcome::Inserted => {
                 self.sync_surface_agent_request_state(surface_id);
-                self.notifications_visible = true;
+                if approval_should_reveal_panel(
+                    self.text_editor_active(),
+                    self.active_surface_id(),
+                    surface_id,
+                ) {
+                    self.notifications_visible = true;
+                }
                 if approval_needs_native_notification(
                     self.config.agent.notifications,
                     self.window_focused,
@@ -8756,7 +8900,13 @@ impl WmctermApplication {
             }
             wmcterm_ipc::RegisterOutcome::DuplicatePending => {
                 self.sync_surface_agent_request_state(surface_id);
-                self.notifications_visible = true;
+                if approval_should_reveal_panel(
+                    self.text_editor_active(),
+                    self.active_surface_id(),
+                    surface_id,
+                ) {
+                    self.notifications_visible = true;
+                }
                 self.rebuild_scene();
                 Ok(json!({"status":"pending","approval_id":approval_id}))
             }
@@ -9432,6 +9582,7 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.flush_pending_unmodified_tab();
         self.reload_config_if_changed();
         if self.expire_agent_requests() {
             self.rebuild_scene();
@@ -9452,6 +9603,9 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
             self.rebuild_scene();
         }
         let mut wait = std::time::Duration::from_secs(1);
+        if let Some((_, queued_at)) = &self.pending_unmodified_tab {
+            wait = wait.min(UNMODIFIED_TAB_FOCUS_GRACE.saturating_sub(queued_at.elapsed()));
+        }
         if self.update_selection_autoscroll() {
             wait = wait.min(std::time::Duration::from_millis(16));
         }
@@ -9511,7 +9665,14 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
             WindowEvent::Ime(Ime::Disabled) => self.update_ime_preedit(""),
             WindowEvent::Focused(focused) => {
                 self.window_focused = focused;
-                if !focused {
+                if focused {
+                    self.window_focus_gained_at = std::time::Instant::now();
+                } else {
+                    // A window manager may consume the matching Alt release
+                    // after Alt+Tab has transferred focus.
+                    self.physical_alt_pressed = false;
+                    self.modifiers = ModifiersState::empty();
+                    self.pending_unmodified_tab = None;
                     if self.notifications_visible {
                         self.notifications_visible = false;
                         self.notification_scroll = 0;
@@ -9706,6 +9867,25 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                 }
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                if should_suppress_recent_focus_tab(
+                    event.state,
+                    event.physical_key,
+                    self.window_focus_gained_at.elapsed(),
+                ) {
+                    return;
+                }
+                if should_defer_unmodified_tab(
+                    self.window_focused,
+                    &event,
+                    self.modifiers,
+                    self.physical_alt_pressed,
+                ) {
+                    self.pending_unmodified_tab = Some((event, std::time::Instant::now()));
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(
+                        std::time::Instant::now() + UNMODIFIED_TAB_FOCUS_GRACE,
+                    ));
+                    return;
+                }
                 self.send_key(&event);
                 if self.quit_requested {
                     event_loop.exit();
@@ -10606,9 +10786,50 @@ fn terminal_input_key(logical_key: &Key, physical_character: Option<char>) -> Op
     }
 }
 
-fn is_window_switch_shortcut(logical_key: &Key, modifiers: ModifiersState) -> bool {
-    matches!(logical_key, Key::Named(NamedKey::Tab))
-        && (modifiers.alt_key() || modifiers.super_key())
+fn is_window_switch_shortcut(
+    logical_key: &Key,
+    physical_key: PhysicalKey,
+    modifiers: ModifiersState,
+    physical_alt_pressed: bool,
+) -> bool {
+    let tab = matches!(logical_key, Key::Named(NamedKey::Tab))
+        || matches!(physical_key, PhysicalKey::Code(KeyCode::Tab));
+    tab && (modifiers.alt_key() || modifiers.super_key() || physical_alt_pressed)
+}
+
+fn should_suppress_focus_transition_key(
+    window_focused: bool,
+    logical_key: &Key,
+    physical_key: PhysicalKey,
+    modifiers: ModifiersState,
+    physical_alt_pressed: bool,
+) -> bool {
+    !window_focused
+        || is_window_switch_shortcut(logical_key, physical_key, modifiers, physical_alt_pressed)
+}
+
+fn should_defer_unmodified_tab(
+    window_focused: bool,
+    event: &KeyEvent,
+    modifiers: ModifiersState,
+    physical_alt_pressed: bool,
+) -> bool {
+    window_focused
+        && event.state == ElementState::Pressed
+        && matches!(event.physical_key, PhysicalKey::Code(KeyCode::Tab))
+        && !modifiers.alt_key()
+        && !modifiers.super_key()
+        && !physical_alt_pressed
+}
+
+fn should_suppress_recent_focus_tab(
+    state: ElementState,
+    physical_key: PhysicalKey,
+    focused_for: std::time::Duration,
+) -> bool {
+    state == ElementState::Pressed
+        && matches!(physical_key, PhysicalKey::Code(KeyCode::Tab))
+        && focused_for < UNMODIFIED_TAB_FOCUS_GRACE
 }
 
 fn text_edit_shortcut(event: &KeyEvent, modifiers: ModifiersState) -> Option<TextEditShortcut> {
@@ -10727,6 +10948,26 @@ fn agent_state_priority(state: wmcterm_core::AgentState) -> u8 {
         wmcterm_core::AgentState::Completed => 2,
         wmcterm_core::AgentState::Idle | wmcterm_core::AgentState::Unknown => 1,
     }
+}
+
+fn detected_foreground_agent_metadata(agent: AgentKind) -> wmcterm_core::AgentMetadata {
+    wmcterm_core::AgentMetadata {
+        name: agent.as_str().to_owned(),
+        state: wmcterm_core::AgentState::Idle,
+        session_id: None,
+    }
+}
+
+fn agent_submission_starts_turn(input: &str) -> bool {
+    let input = input.trim_start();
+    !input.is_empty() && !input.starts_with('/')
+}
+
+fn is_agent_interrupt(physical_key: PhysicalKey, modifiers: ModifiersState) -> bool {
+    matches!(physical_key, PhysicalKey::Code(KeyCode::KeyC))
+        && modifiers.control_key()
+        && !modifiers.alt_key()
+        && !modifiers.super_key()
 }
 
 fn pending_agent_state_for_surface(
@@ -11054,6 +11295,14 @@ fn approval_needs_native_notification(
     notifications_enabled && (!window_focused || active_surface != Some(target_surface))
 }
 
+fn approval_should_reveal_panel(
+    text_editor_active: bool,
+    active_surface: Option<SurfaceId>,
+    request_surface: SurfaceId,
+) -> bool {
+    !text_editor_active && active_surface == Some(request_surface)
+}
+
 fn mark_surface_notifications_read(notifications: &mut [Notification], surface: SurfaceId) -> bool {
     let mut changed = false;
     for notification in notifications
@@ -11133,10 +11382,16 @@ fn agent_session_event_kind(
                 choices: Vec::new(),
             }))
         }
-        AgentEvent::Stop { success, message } => Some(AgentSessionEventKind::Lifecycle(
-            AgentLifecycleEvent::Exited {
-                success: *success,
-                message: message.clone(),
+        // Hook Stop means the current turn has returned to the interactive
+        // prompt; it does not mean that the long-lived Agent process exited.
+        // The PTY exit path owns the actual lifecycle transition.
+        AgentEvent::Stop { success, .. } => Some(AgentSessionEventKind::Telemetry(
+            AgentTelemetry::StateObserved {
+                state: if *success {
+                    wmcterm_core::AgentState::Completed
+                } else {
+                    wmcterm_core::AgentState::Error
+                },
             },
         )),
     }
@@ -11840,6 +12095,33 @@ mod tests {
     }
 
     #[test]
+    fn newly_detected_foreground_agent_is_idle_until_work_is_submitted() {
+        let metadata = detected_foreground_agent_metadata(AgentKind::Codex);
+        assert_eq!(metadata.name, "codex");
+        assert_eq!(metadata.state, AgentState::Idle);
+        assert_eq!(
+            workspace_status_for_agent_priority(agent_state_priority(metadata.state)),
+            wmcterm_core::WorkspaceStatus::Idle
+        );
+    }
+
+    #[test]
+    fn codex_local_commands_do_not_start_an_agent_turn() {
+        assert!(!agent_submission_starts_turn(""));
+        assert!(!agent_submission_starts_turn("   /model"));
+        assert!(!agent_submission_starts_turn("/compact now"));
+        assert!(agent_submission_starts_turn("explain this failure"));
+        assert!(is_agent_interrupt(
+            PhysicalKey::Code(KeyCode::KeyC),
+            ModifiersState::CONTROL
+        ));
+        assert!(!is_agent_interrupt(
+            PhysicalKey::Code(KeyCode::KeyC),
+            ModifiersState::CONTROL | ModifiersState::ALT
+        ));
+    }
+
+    #[test]
     fn agent_approval_result_cache_is_bounded_and_updates_in_place() {
         let mut results = HashMap::new();
         let mut order = VecDeque::new();
@@ -12024,16 +12306,86 @@ mod tests {
     #[test]
     fn window_switch_shortcuts_are_not_forwarded_to_the_terminal() {
         let tab = Key::Named(NamedKey::Tab);
-        assert!(is_window_switch_shortcut(&tab, ModifiersState::ALT));
-        assert!(is_window_switch_shortcut(&tab, ModifiersState::SUPER));
+        let physical_tab = PhysicalKey::Code(KeyCode::Tab);
         assert!(is_window_switch_shortcut(
             &tab,
-            ModifiersState::ALT | ModifiersState::SHIFT
+            physical_tab,
+            ModifiersState::ALT,
+            false
         ));
-        assert!(!is_window_switch_shortcut(&tab, ModifiersState::CONTROL));
+        assert!(is_window_switch_shortcut(
+            &tab,
+            physical_tab,
+            ModifiersState::SUPER,
+            false
+        ));
+        assert!(is_window_switch_shortcut(
+            &tab,
+            physical_tab,
+            ModifiersState::ALT | ModifiersState::SHIFT,
+            false
+        ));
+        // Some window managers deliver Tab before ModifiersChanged reports
+        // Alt. The physical Alt state must still keep it out of the PTY.
+        assert!(is_window_switch_shortcut(
+            &tab,
+            physical_tab,
+            ModifiersState::empty(),
+            true
+        ));
+        assert!(is_window_switch_shortcut(
+            &Key::Unidentified(winit::keyboard::NativeKey::Unidentified),
+            physical_tab,
+            ModifiersState::empty(),
+            true
+        ));
+        assert!(!is_window_switch_shortcut(
+            &tab,
+            physical_tab,
+            ModifiersState::CONTROL,
+            false
+        ));
         assert!(!is_window_switch_shortcut(
             &Key::Named(NamedKey::Enter),
-            ModifiersState::ALT
+            PhysicalKey::Code(KeyCode::Enter),
+            ModifiersState::ALT,
+            true
+        ));
+        assert!(should_suppress_focus_transition_key(
+            false,
+            &Key::Named(NamedKey::Enter),
+            PhysicalKey::Code(KeyCode::Enter),
+            ModifiersState::empty(),
+            false
+        ));
+        assert!(should_suppress_focus_transition_key(
+            true,
+            &Key::Character("\t".into()),
+            physical_tab,
+            ModifiersState::empty(),
+            true
+        ));
+        assert!(!should_suppress_focus_transition_key(
+            true,
+            &Key::Named(NamedKey::Enter),
+            PhysicalKey::Code(KeyCode::Enter),
+            ModifiersState::empty(),
+            false
+        ));
+        assert!(should_suppress_recent_focus_tab(
+            ElementState::Pressed,
+            physical_tab,
+            std::time::Duration::from_millis(20)
+        ));
+        assert!(!should_suppress_recent_focus_tab(
+            ElementState::Pressed,
+            physical_tab,
+            UNMODIFIED_TAB_FOCUS_GRACE
+        ));
+        assert!(!should_suppress_recent_focus_tab(
+            ElementState::Pressed,
+            PhysicalKey::Code(KeyCode::Enter),
+            std::time::Duration::from_millis(20)
         ));
     }
 
@@ -12189,6 +12541,17 @@ mod tests {
         assert!(!approval_needs_native_notification(
             false, false, None, target
         ));
+    }
+
+    #[test]
+    fn cross_surface_approval_does_not_reveal_panel_or_steal_an_editor() {
+        let active = uuid::Uuid::new_v4();
+        let other = uuid::Uuid::new_v4();
+
+        assert!(!approval_should_reveal_panel(false, Some(active), other));
+        assert!(!approval_should_reveal_panel(true, Some(active), active));
+        assert!(!approval_should_reveal_panel(true, Some(active), other));
+        assert!(approval_should_reveal_panel(false, Some(active), active));
     }
 
     #[test]
@@ -12549,10 +12912,25 @@ mod tests {
                 },
                 "20"
             ),
-            Some(AgentSessionEventKind::Lifecycle(AgentLifecycleEvent::Exited {
-                success: false,
-                message: Some(message)
-            })) if message == "failed"
+            Some(AgentSessionEventKind::Telemetry(
+                AgentTelemetry::StateObserved {
+                    state: AgentState::Error
+                }
+            ))
+        ));
+        assert!(matches!(
+            agent_session_event_kind(
+                &AgentEvent::Stop {
+                    success: true,
+                    message: Some("done".into())
+                },
+                "21"
+            ),
+            Some(AgentSessionEventKind::Telemetry(
+                AgentTelemetry::StateObserved {
+                    state: AgentState::Completed
+                }
+            ))
         ));
         assert!(
             agent_session_event_kind(
@@ -12560,7 +12938,7 @@ mod tests {
                     agent: "codex".into(),
                     session_id: None
                 },
-                "21"
+                "22"
             )
             .is_none()
         );
