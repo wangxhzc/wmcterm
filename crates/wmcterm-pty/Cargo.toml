@@ -10,3 +10,6 @@ anyhow.workspace = true
 flume.workspace = true
 portable-pty.workspace = true
 thiserror.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

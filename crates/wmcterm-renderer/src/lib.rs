@@ -10,7 +10,6 @@ use glyphon::{
     SwashCache, TextArea, TextAtlas, TextBounds, TextRenderer, Viewport, Weight,
 };
 use unicode_script::Script;
-use wgpu::util::DeviceExt;
 use wgpu::{
     CommandEncoderDescriptor, CompositeAlphaMode, DeviceDescriptor, Instance, InstanceDescriptor,
     LoadOp, MultisampleState, Operations, PresentMode, RenderPassColorAttachment,
@@ -28,7 +27,7 @@ pub struct CellMetrics {
     pub underline_y: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextBlock {
     pub text: String,
     pub spans: Vec<TextSpan>,
@@ -41,7 +40,7 @@ pub struct TextBlock {
     pub line_height: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct TextSpan {
     pub text: String,
     pub color: [u8; 4],
@@ -49,7 +48,7 @@ pub struct TextSpan {
     pub italic: bool,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct RectBlock {
     pub left: f32,
     pub top: f32,
@@ -59,7 +58,7 @@ pub struct RectBlock {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
+#[derive(Debug, Clone, Copy, PartialEq, Pod, Zeroable)]
 struct RectVertex {
     position: [f32; 2],
     color: [f32; 4],
@@ -200,11 +199,20 @@ pub struct GpuRenderer {
     font_family: String,
     blocks: Vec<PreparedBlock>,
     overlay_blocks: Vec<PreparedBlock>,
+    scene_blocks: Option<Vec<TextBlock>>,
+    scene_rectangles: Option<Vec<RectBlock>>,
+    scene_overlay_blocks: Option<Vec<TextBlock>>,
+    scene_overlay_rectangles: Option<Vec<RectBlock>>,
     rect_pipeline: wgpu::RenderPipeline,
     rect_buffer: wgpu::Buffer,
     rect_vertex_count: u32,
     overlay_rect_buffer: wgpu::Buffer,
     overlay_rect_vertex_count: u32,
+    rect_buffer_capacity: usize,
+    overlay_rect_buffer_capacity: usize,
+    supported_alpha_modes: Vec<CompositeAlphaMode>,
+    transparent: bool,
+    scale_factor: f64,
     window: Arc<Window>,
 }
 
@@ -213,16 +221,27 @@ impl GpuRenderer {
         window: Arc<Window>,
         event_loop: &ActiveEventLoop,
         font_family: impl Into<String>,
+        transparent: bool,
+        scale_factor: f64,
     ) -> Result<Self> {
-        pollster::block_on(Self::new_async(window, event_loop, font_family.into()))
+        pollster::block_on(Self::new_async(
+            window,
+            event_loop,
+            font_family.into(),
+            transparent,
+            scale_factor,
+        ))
     }
 
     async fn new_async(
         window: Arc<Window>,
         event_loop: &ActiveEventLoop,
         font_family: String,
+        transparent: bool,
+        scale_factor: f64,
     ) -> Result<Self> {
         let size = window.inner_size();
+        window.set_transparent(transparent);
         let instance = Instance::new(InstanceDescriptor::new_with_display_handle_from_env(
             Box::new(event_loop.owned_display_handle()),
         ));
@@ -237,14 +256,17 @@ impl GpuRenderer {
         let surface = instance
             .create_surface(window.clone())
             .context("creating window surface")?;
+        let surface_capabilities = surface.get_capabilities(&adapter);
+        let supported_alpha_modes = surface_capabilities.alpha_modes;
         let format = TextureFormat::Bgra8UnormSrgb;
+        let alpha_mode = select_alpha_mode(transparent, &supported_alpha_modes);
         let config = SurfaceConfiguration {
             usage: TextureUsages::RENDER_ATTACHMENT,
             format,
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode: PresentMode::Fifo,
-            alpha_mode: CompositeAlphaMode::Opaque,
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
             color_space: SurfaceColorSpace::Auto,
@@ -314,22 +336,8 @@ impl GpuRenderer {
             multiview_mask: None,
             cache: None,
         });
-        let rect_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("wmcterm empty rects"),
-            contents: bytemuck::bytes_of(&RectVertex {
-                position: [0.0; 2],
-                color: [0.0; 4],
-            }),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let overlay_rect_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("wmcterm empty overlay rects"),
-            contents: bytemuck::bytes_of(&RectVertex {
-                position: [0.0; 2],
-                color: [0.0; 4],
-            }),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        let rect_buffer = create_rect_buffer(&device, "wmcterm scene rects", 1);
+        let overlay_rect_buffer = create_rect_buffer(&device, "wmcterm overlay rects", 1);
         Ok(Self {
             instance,
             device,
@@ -345,11 +353,20 @@ impl GpuRenderer {
             font_family,
             blocks: Vec::new(),
             overlay_blocks: Vec::new(),
+            scene_blocks: None,
+            scene_rectangles: None,
+            scene_overlay_blocks: None,
+            scene_overlay_rectangles: None,
             rect_pipeline,
             rect_buffer,
             rect_vertex_count: 0,
             overlay_rect_buffer,
             overlay_rect_vertex_count: 0,
+            rect_buffer_capacity: 1,
+            overlay_rect_buffer_capacity: 1,
+            supported_alpha_modes,
+            transparent: transparent && alpha_mode != CompositeAlphaMode::Opaque,
+            scale_factor: normalize_scale_factor(scale_factor),
             window,
         })
     }
@@ -365,6 +382,35 @@ impl GpuRenderer {
         self.config.width = width;
         self.config.height = height;
         self.surface.configure(&self.device, &self.config);
+        self.scene_rectangles = None;
+        self.scene_overlay_rectangles = None;
+    }
+
+    pub fn set_transparent(&mut self, transparent: bool) {
+        self.window.set_transparent(transparent);
+        let alpha_mode = select_alpha_mode(transparent, &self.supported_alpha_modes);
+        self.transparent = transparent && alpha_mode != CompositeAlphaMode::Opaque;
+        if self.config.alpha_mode != alpha_mode {
+            self.config.alpha_mode = alpha_mode;
+            self.surface.configure(&self.device, &self.config);
+        }
+    }
+
+    pub fn transparency_active(&self) -> bool {
+        self.transparent
+    }
+
+    pub fn set_scale_factor(&mut self, scale_factor: f64) {
+        let scale_factor = normalize_scale_factor(scale_factor);
+        if self.scale_factor != scale_factor {
+            self.scale_factor = scale_factor;
+            // Keep the prepared content until the application submits its next scene, but
+            // invalidate equality caches so that identical logical content is re-scaled.
+            self.scene_blocks = None;
+            self.scene_rectangles = None;
+            self.scene_overlay_blocks = None;
+            self.scene_overlay_rectangles = None;
+        }
     }
 
     pub fn set_snapshot(&mut self, snapshot: &ScreenSnapshot) {
@@ -392,8 +438,8 @@ impl GpuRenderer {
                 .collect(),
             left: 12.0,
             top: 10.0,
-            width: self.config.width as f32 - 12.0,
-            height: self.config.height as f32 - 10.0,
+            width: self.config.width as f32 / self.scale_factor as f32 - 12.0,
+            height: self.config.height as f32 / self.scale_factor as f32 - 10.0,
             color: [220, 223, 228, 255],
             font_size: 16.0,
             line_height: 21.0,
@@ -407,82 +453,9 @@ impl GpuRenderer {
     pub fn set_scene_with_rects(&mut self, blocks: Vec<TextBlock>, rectangles: Vec<RectBlock>) {
         self.overlay_blocks.clear();
         self.overlay_rect_vertex_count = 0;
-        self.blocks = blocks
-            .into_iter()
-            .map(|block| {
-                let mut buffer = Buffer::new(
-                    &mut self.font_system,
-                    Metrics::new(block.font_size, block.line_height),
-                );
-                buffer.set_size(Some(block.width.max(1.0)), Some(block.height.max(1.0)));
-                buffer.set_monospace_width(Some(block.font_size * TERMINAL_CELL_WIDTH_FACTOR));
-                let family = if self.font_family.trim().is_empty() {
-                    MAPLE_MONO_FAMILY
-                } else {
-                    &self.font_family
-                };
-                let default_attrs = Attrs::new().family(Family::Name(family));
-                if block.spans.is_empty() {
-                    buffer.set_text(&block.text, &default_attrs, Shaping::Advanced, None);
-                } else {
-                    buffer.set_rich_text(
-                        block.spans.iter().map(|span| {
-                            let attrs = default_attrs
-                                .clone()
-                                .color(Color::rgba(
-                                    span.color[0],
-                                    span.color[1],
-                                    span.color[2],
-                                    span.color[3],
-                                ))
-                                .weight(if span.bold {
-                                    Weight::BOLD
-                                } else {
-                                    Weight::NORMAL
-                                })
-                                .style(if span.italic {
-                                    Style::Italic
-                                } else {
-                                    Style::Normal
-                                });
-                            (span.text.as_str(), attrs)
-                        }),
-                        &default_attrs,
-                        Shaping::Advanced,
-                        None,
-                    );
-                }
-                buffer.shape_until_scroll(&mut self.font_system, false);
-                PreparedBlock {
-                    buffer,
-                    left: block.left,
-                    top: block.top,
-                    bounds: TextBounds {
-                        left: block.left as i32,
-                        top: block.top as i32,
-                        right: (block.left + block.width) as i32,
-                        bottom: (block.top + block.height) as i32,
-                    },
-                    color: Color::rgba(
-                        block.color[0],
-                        block.color[1],
-                        block.color[2],
-                        block.color[3],
-                    ),
-                }
-            })
-            .collect();
-        let vertices = rect_vertices(rectangles, self.config.width, self.config.height);
-        self.rect_vertex_count = vertices.len() as u32;
-        if !vertices.is_empty() {
-            self.rect_buffer = self
-                .device
-                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("wmcterm scene rects"),
-                    contents: bytemuck::cast_slice(&vertices),
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-        }
+        self.scene_overlay_blocks = None;
+        self.scene_overlay_rectangles = None;
+        self.update_scene_blocks(blocks, rectangles);
     }
 
     pub fn set_scene_with_overlays(
@@ -492,19 +465,61 @@ impl GpuRenderer {
         overlay_blocks: Vec<TextBlock>,
         overlay_rectangles: Vec<RectBlock>,
     ) {
-        self.set_scene_with_rects(blocks, rectangles);
-        self.overlay_blocks =
-            prepare_text_blocks(&mut self.font_system, &self.font_family, overlay_blocks);
-        let vertices = rect_vertices(overlay_rectangles, self.config.width, self.config.height);
-        self.overlay_rect_vertex_count = vertices.len() as u32;
-        if !vertices.is_empty() {
-            self.overlay_rect_buffer =
-                self.device
-                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                        label: Some("wmcterm overlay rects"),
-                        contents: bytemuck::cast_slice(&vertices),
-                        usage: wgpu::BufferUsages::VERTEX,
-                    });
+        self.update_scene_blocks(blocks, rectangles);
+        update_prepared_text_blocks(
+            &mut self.font_system,
+            &self.font_family,
+            self.scale_factor,
+            &mut self.scene_overlay_blocks,
+            &mut self.overlay_blocks,
+            overlay_blocks,
+        );
+        if self.scene_overlay_rectangles.as_ref() != Some(&overlay_rectangles) {
+            let vertices = rect_vertices(
+                &overlay_rectangles,
+                self.config.width,
+                self.config.height,
+                self.scale_factor,
+            );
+            self.overlay_rect_vertex_count = vertices.len() as u32;
+            update_rect_buffer(
+                &self.device,
+                &self.queue,
+                &mut self.overlay_rect_buffer,
+                &mut self.overlay_rect_buffer_capacity,
+                "wmcterm overlay rects",
+                &vertices,
+            );
+            self.scene_overlay_rectangles = Some(overlay_rectangles);
+        }
+    }
+
+    fn update_scene_blocks(&mut self, blocks: Vec<TextBlock>, rectangles: Vec<RectBlock>) {
+        update_prepared_text_blocks(
+            &mut self.font_system,
+            &self.font_family,
+            self.scale_factor,
+            &mut self.scene_blocks,
+            &mut self.blocks,
+            blocks,
+        );
+        if self.scene_rectangles.as_ref() != Some(&rectangles) {
+            let vertices = rect_vertices(
+                &rectangles,
+                self.config.width,
+                self.config.height,
+                self.scale_factor,
+            );
+            self.rect_vertex_count = vertices.len() as u32;
+            update_rect_buffer(
+                &self.device,
+                &self.queue,
+                &mut self.rect_buffer,
+                &mut self.rect_buffer_capacity,
+                "wmcterm scene rects",
+                &vertices,
+            );
+            self.scene_rectangles = Some(rectangles);
         }
     }
 
@@ -556,7 +571,12 @@ impl GpuRenderer {
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
                 return Ok(());
             }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Suboptimal(_) => {
+            wgpu::CurrentSurfaceTexture::Outdated => {
+                self.surface.configure(&self.device, &self.config);
+                return Ok(());
+            }
+            wgpu::CurrentSurfaceTexture::Suboptimal(frame) => {
+                drop(frame);
                 self.surface.configure(&self.device, &self.config);
                 return Ok(());
             }
@@ -585,7 +605,7 @@ impl GpuRenderer {
                             r: srgb_byte_to_linear(28) as f64,
                             g: srgb_byte_to_linear(28) as f64,
                             b: srgb_byte_to_linear(28) as f64,
-                            a: 1.0,
+                            a: if self.transparent { 0.0 } else { 1.0 },
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -620,17 +640,22 @@ impl GpuRenderer {
 fn prepare_text_blocks(
     font_system: &mut FontSystem,
     font_family: &str,
-    blocks: Vec<TextBlock>,
+    blocks: &[TextBlock],
+    scale_factor: f64,
 ) -> Vec<PreparedBlock> {
+    let scale_factor = normalize_scale_factor(scale_factor) as f32;
     blocks
-        .into_iter()
+        .iter()
         .map(|block| {
-            let mut buffer = Buffer::new(
-                &mut *font_system,
-                Metrics::new(block.font_size, block.line_height),
-            );
-            buffer.set_size(Some(block.width.max(1.0)), Some(block.height.max(1.0)));
-            buffer.set_monospace_width(Some(block.font_size * TERMINAL_CELL_WIDTH_FACTOR));
+            let left = block.left * scale_factor;
+            let top = block.top * scale_factor;
+            let width = block.width * scale_factor;
+            let height = block.height * scale_factor;
+            let font_size = block.font_size * scale_factor;
+            let line_height = block.line_height * scale_factor;
+            let mut buffer = Buffer::new(&mut *font_system, Metrics::new(font_size, line_height));
+            buffer.set_size(Some(width.max(1.0)), Some(height.max(1.0)));
+            buffer.set_monospace_width(Some(font_size * TERMINAL_CELL_WIDTH_FACTOR));
             let family = if font_family.trim().is_empty() {
                 MAPLE_MONO_FAMILY
             } else {
@@ -670,13 +695,13 @@ fn prepare_text_blocks(
             buffer.shape_until_scroll(&mut *font_system, false);
             PreparedBlock {
                 buffer,
-                left: block.left,
-                top: block.top,
+                left,
+                top,
                 bounds: TextBounds {
-                    left: block.left as i32,
-                    top: block.top as i32,
-                    right: (block.left + block.width) as i32,
-                    bottom: (block.top + block.height) as i32,
+                    left: left as i32,
+                    top: top as i32,
+                    right: (left + width) as i32,
+                    bottom: (top + height) as i32,
                 },
                 color: Color::rgba(
                     block.color[0],
@@ -689,13 +714,53 @@ fn prepare_text_blocks(
         .collect()
 }
 
-fn rect_vertices(rectangles: Vec<RectBlock>, width: u32, height: u32) -> Vec<RectVertex> {
+fn update_prepared_text_blocks(
+    font_system: &mut FontSystem,
+    font_family: &str,
+    scale_factor: f64,
+    previous_blocks: &mut Option<Vec<TextBlock>>,
+    prepared_blocks: &mut Vec<PreparedBlock>,
+    next_blocks: Vec<TextBlock>,
+) {
+    if previous_blocks.as_ref() == Some(&next_blocks) {
+        return;
+    }
+
+    let mut previous_specs = previous_blocks.take().unwrap_or_default().into_iter();
+    let mut previous_prepared = std::mem::take(prepared_blocks).into_iter();
+    let mut next_prepared = Vec::with_capacity(next_blocks.len());
+    for next in &next_blocks {
+        match (previous_specs.next(), previous_prepared.next()) {
+            (Some(previous), Some(prepared)) if previous == *next => {
+                next_prepared.push(prepared);
+            }
+            _ => {
+                next_prepared.extend(prepare_text_blocks(
+                    font_system,
+                    font_family,
+                    std::slice::from_ref(next),
+                    scale_factor,
+                ));
+            }
+        }
+    }
+    *prepared_blocks = next_prepared;
+    *previous_blocks = Some(next_blocks);
+}
+
+fn rect_vertices(
+    rectangles: &[RectBlock],
+    width: u32,
+    height: u32,
+    scale_factor: f64,
+) -> Vec<RectVertex> {
+    let scale_factor = normalize_scale_factor(scale_factor) as f32;
     let mut vertices = Vec::with_capacity(rectangles.len() * 6);
     for rect in rectangles {
-        let left = rect.left / width as f32 * 2.0 - 1.0;
-        let right = (rect.left + rect.width) / width as f32 * 2.0 - 1.0;
-        let top = 1.0 - rect.top / height as f32 * 2.0;
-        let bottom = 1.0 - (rect.top + rect.height) / height as f32 * 2.0;
+        let left = rect.left * scale_factor / width as f32 * 2.0 - 1.0;
+        let right = (rect.left + rect.width) * scale_factor / width as f32 * 2.0 - 1.0;
+        let top = 1.0 - rect.top * scale_factor / height as f32 * 2.0;
+        let bottom = 1.0 - (rect.top + rect.height) * scale_factor / height as f32 * 2.0;
         let color = rgba_to_gpu(rect.color);
         vertices.extend(
             [
@@ -710,6 +775,68 @@ fn rect_vertices(rectangles: Vec<RectBlock>, width: u32, height: u32) -> Vec<Rec
         );
     }
     vertices
+}
+
+fn normalize_scale_factor(scale_factor: f64) -> f64 {
+    if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    }
+}
+
+fn select_alpha_mode(
+    transparent: bool,
+    supported_alpha_modes: &[CompositeAlphaMode],
+) -> CompositeAlphaMode {
+    if !transparent {
+        return CompositeAlphaMode::Opaque;
+    }
+    [
+        CompositeAlphaMode::PreMultiplied,
+        CompositeAlphaMode::PostMultiplied,
+        CompositeAlphaMode::Inherit,
+    ]
+    .into_iter()
+    .find(|mode| supported_alpha_modes.contains(mode))
+    .or_else(|| {
+        supported_alpha_modes
+            .contains(&CompositeAlphaMode::Opaque)
+            .then_some(CompositeAlphaMode::Opaque)
+    })
+    .or_else(|| supported_alpha_modes.first().copied())
+    .unwrap_or(CompositeAlphaMode::Opaque)
+}
+
+fn create_rect_buffer(
+    device: &wgpu::Device,
+    label: &'static str,
+    vertex_capacity: usize,
+) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some(label),
+        size: (vertex_capacity.max(1) * std::mem::size_of::<RectVertex>()) as u64,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+fn update_rect_buffer(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    buffer: &mut wgpu::Buffer,
+    capacity: &mut usize,
+    label: &'static str,
+    vertices: &[RectVertex],
+) {
+    if vertices.is_empty() {
+        return;
+    }
+    if vertices.len() > *capacity {
+        *capacity = vertices.len().next_power_of_two();
+        *buffer = create_rect_buffer(device, label, *capacity);
+    }
+    queue.write_buffer(buffer, 0, bytemuck::cast_slice(vertices));
 }
 
 fn srgb_byte_to_linear(value: u8) -> f32 {
@@ -780,5 +907,60 @@ mod tests {
     #[test]
     fn renderer_uses_the_same_terminal_cell_width_factor_as_layout() {
         assert!((16.0 * TERMINAL_CELL_WIDTH_FACTOR - 9.6).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn transparent_surfaces_prefer_premultiplied_alpha() {
+        let modes = [
+            CompositeAlphaMode::Opaque,
+            CompositeAlphaMode::PreMultiplied,
+            CompositeAlphaMode::PostMultiplied,
+            CompositeAlphaMode::Inherit,
+        ];
+        assert_eq!(
+            select_alpha_mode(true, &modes),
+            CompositeAlphaMode::PreMultiplied
+        );
+        assert_eq!(select_alpha_mode(false, &modes), CompositeAlphaMode::Opaque);
+    }
+
+    #[test]
+    fn transparent_surfaces_fall_back_only_to_supported_modes() {
+        assert_eq!(
+            select_alpha_mode(
+                true,
+                &[CompositeAlphaMode::Opaque, CompositeAlphaMode::Inherit]
+            ),
+            CompositeAlphaMode::Inherit
+        );
+        assert_eq!(
+            select_alpha_mode(true, &[CompositeAlphaMode::Opaque]),
+            CompositeAlphaMode::Opaque
+        );
+    }
+
+    #[test]
+    fn rectangle_vertices_scale_logical_coordinates_to_physical_pixels() {
+        let rect = RectBlock {
+            left: 10.0,
+            top: 20.0,
+            width: 30.0,
+            height: 40.0,
+            color: [255, 0, 0, 255],
+        };
+        let logical = rect_vertices(&[rect], 100, 100, 1.0);
+        let hidpi = rect_vertices(&[rect], 200, 200, 2.0);
+        assert_eq!(logical, hidpi);
+        assert_eq!(logical[0].position, [-0.8, 0.6]);
+        assert!((logical[2].position[0] + 0.2).abs() < f32::EPSILON * 2.0);
+        assert!((logical[2].position[1] + 0.2).abs() < f32::EPSILON * 2.0);
+    }
+
+    #[test]
+    fn invalid_scale_factors_fall_back_to_one() {
+        assert_eq!(normalize_scale_factor(0.0), 1.0);
+        assert_eq!(normalize_scale_factor(-2.0), 1.0);
+        assert_eq!(normalize_scale_factor(f64::NAN), 1.0);
+        assert_eq!(normalize_scale_factor(1.5), 1.5);
     }
 }

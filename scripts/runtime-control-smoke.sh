@@ -70,7 +70,7 @@ xvfb-run -a --server-args="-screen 0 1280x800x24" sh -eu -c '
         "$test_root/status.json")
     WMCTERM_WORKSPACE_ID="$workspace_id" \
         "$binary" pane split --right --no-focus \
-        --command "env >$test_root/child-env; sleep 2" >"$test_root/split.json"
+        --command "env >$test_root/child-env; exec sh" >"$test_root/split.json"
     attempt=0
     while [ ! -f "$test_root/child-env" ] && [ "$attempt" -lt 50 ]; do
         attempt=$((attempt + 1))
@@ -82,6 +82,23 @@ xvfb-run -a --server-args="-screen 0 1280x800x24" sh -eu -c '
     for field in workspace_id pane_id surface_id terminal_id; do
         rg -q "\"${field}\"" "$test_root/split.json"
     done
+
+    surface_id=$(python3 -c \
+        "import json, sys; print(json.load(open(sys.argv[1], encoding=\"utf-8\"))[\"surface_id\"])" \
+        "$test_root/split.json")
+    "$binary" screen read --surface "$surface_id" >"$test_root/screen-before.json"
+    revision=$(python3 -c \
+        "import json, sys; print(json.load(open(sys.argv[1], encoding=\"utf-8\"))[\"revision\"])" \
+        "$test_root/screen-before.json")
+    "$binary" send-line --surface "$surface_id" -- "printf SCREEN_CONTROL_OK"
+    "$binary" screen wait --surface "$surface_id" --until SCREEN_CONTROL_OK --timeout 5s \
+        >"$test_root/screen-wait.json"
+    "$binary" screen wait --surface "$surface_id" --revision "$revision" --timeout 5s \
+        >"$test_root/screen-revision.json"
+    "$binary" screen read --surface "$surface_id" --scrollback --lines 20 \
+        >"$test_root/screen-history.json"
+    rg -q SCREEN_CONTROL_OK "$test_root/screen-wait.json"
+    rg -q "\"includes_scrollback\": true" "$test_root/screen-history.json"
 
     echo "runtime input and control smoke tests passed"
     kill "$app_pid" 2>/dev/null || true

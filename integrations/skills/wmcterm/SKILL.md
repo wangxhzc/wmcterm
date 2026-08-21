@@ -77,8 +77,22 @@ command used to inspect an approval.
 
 - Paste prompt text atomically with
   `wmcterm send --surface "$WMCTERM_SURFACE_ID" -- TEXT`.
+- Submit a shell command as one actor operation with
+  `wmcterm send-line --surface "$WMCTERM_SURFACE_ID" -- COMMAND`. This preserves
+  bracketed-paste encoding and appends Enter without an observable half-sent
+  state. Prefer it over separate `send` and `send-key Enter` calls for ordinary
+  command lines.
 - Send Enter and other individual keys separately with
   `wmcterm send-key Enter --surface "$WMCTERM_SURFACE_ID"`.
+- Wait for a prompt or other stable output without blind sleeps with
+  `wmcterm screen wait --surface "$WMCTERM_SURFACE_ID" --until TEXT --timeout 10s`.
+  Use `--revision N` with the revision from an earlier screen read when any
+  subsequent screen update is sufficient. `--change` starts its baseline when
+  the wait command begins and can miss an update that already arrived.
+- Read bounded full history without moving the user's viewport with
+  `wmcterm screen read --surface "$WMCTERM_SURFACE_ID" --scrollback --lines 200`.
+  Ordinary reads now include a revision, cursor and viewport metadata;
+  `truncated_top: true` means the visible snapshot has older content above it.
 - Split from the caller with
   `wmcterm pane split --pane "$WMCTERM_PANE_ID" --right` or `--down`; add
   `--no-focus` for background work.

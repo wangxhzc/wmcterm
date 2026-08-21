@@ -12,3 +12,4 @@ serde_json.workspace = true
 wmcterm-agent = { path = "../wmcterm-agent" }
 wmcterm-core = { path = "../wmcterm-core" }
 thiserror.workspace = true
+uuid.workspace = true

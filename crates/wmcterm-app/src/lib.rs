@@ -4,6 +4,7 @@ mod ui;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
+use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, SyncSender};
@@ -14,8 +15,9 @@ use anyhow::{Context, Result};
 use i18n::Language;
 use serde_json::{Value, json};
 use text_edit::{TextEditor, TextViewport};
+use unicode_width::UnicodeWidthStr;
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
@@ -61,6 +63,86 @@ use wmcterm_terminal::{
 const TERMINAL_TERM: &str = "xterm-256color";
 const TERMINAL_COLORTERM: &str = "truecolor";
 const TERMINAL_PROGRAM: &str = "wmcterm";
+const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
+const MAX_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+const CURSOR_BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+
+fn terminal_text_cell_width(text: &str) -> usize {
+    UnicodeWidthStr::width(text).max(1)
+}
+
+fn needs_grid_positioned_glyph(text: &str) -> bool {
+    !text.is_empty() && !text.is_ascii()
+}
+
+fn wide_cell_lead(row: &[CellSnapshot], column: usize) -> usize {
+    if row.get(column).is_some_and(|cell| cell.text.is_empty())
+        && column > 0
+        && row
+            .get(column - 1)
+            .is_some_and(|cell| UnicodeWidthStr::width(cell.text.as_str()) > 1)
+    {
+        column - 1
+    } else {
+        column
+    }
+}
+
+fn wide_cell_end(row: &[CellSnapshot], column: usize) -> usize {
+    column
+        .saturating_add(
+            row.get(column)
+                .map(|cell| terminal_text_cell_width(cell.text.as_str()).saturating_sub(1))
+                .unwrap_or(0),
+        )
+        .min(row.len().saturating_sub(1))
+}
+
+fn wide_glyph_center_offset(text: &str, cell_width: f32, font_size: f32) -> f32 {
+    (terminal_text_cell_width(text) as f32 * cell_width - font_size).max(0.0) * 0.5
+}
+
+fn windows_paths_equal(left: &Path, right: &Path) -> bool {
+    let normalize = |path: &Path| {
+        path.to_string_lossy()
+            .replace('/', "\\")
+            .trim_end_matches('\\')
+            .to_lowercase()
+    };
+    normalize(left) == normalize(right)
+}
+
+#[cfg(any(windows, test))]
+fn safe_windows_startup_cwd(
+    process_cwd: PathBuf,
+    executable_dir: Option<&Path>,
+    user_profile: Option<&Path>,
+) -> PathBuf {
+    if executable_dir.is_some_and(|dir| windows_paths_equal(&process_cwd, dir))
+        && let Some(profile) = user_profile
+    {
+        return profile.to_path_buf();
+    }
+    process_cwd
+}
+
+fn safe_process_cwd(process_cwd: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let executable = env::current_exe().ok();
+        let executable_dir = executable.as_deref().and_then(Path::parent);
+        let user_profile = env::var_os("USERPROFILE").map(PathBuf::from);
+        return safe_windows_startup_cwd(
+            process_cwd,
+            executable_dir,
+            user_profile.as_deref().filter(|path| path.is_dir()),
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        process_cwd
+    }
+}
 
 fn terminal_context_ids(
     state: &AppState,
@@ -115,7 +197,9 @@ struct TaggedEvent {
 struct TerminalRuntime {
     session: TerminalSession,
     snapshot: ScreenSnapshot,
+    snapshot_revision: u64,
     size: TerminalSize,
+    cell_metrics_px: (u32, u32),
     lifecycle_id: String,
 }
 
@@ -245,6 +329,8 @@ struct NotificationContextMenu {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NavigationHover {
+    ConfirmationCancel,
+    ConfirmationConfirm,
     Workspace(usize),
     NewWorkspace,
     Tab(PaneId, usize),
@@ -489,8 +575,11 @@ struct WmctermApplication {
     sidebar_scroll: usize,
     workspace_search: TextEditor,
     workspace_search_focused: bool,
+    /// Logical UI size. The renderer converts the scene to physical pixels.
     window_size: PhysicalSize<u32>,
+    scale_factor: f64,
     _ipc: Option<UnixServer>,
+    control_socket_path: Option<std::path::PathBuf>,
     config: Config,
     cursor_position: (f32, f32),
     commands: HashMap<TerminalId, String>,
@@ -534,6 +623,13 @@ struct WmctermApplication {
     foreground_agents: HashMap<TerminalId, AgentKind>,
     automatic_agent_status: HashSet<TerminalId>,
     foreground_agent_input: HashMap<TerminalId, String>,
+    scene_dirty: bool,
+    last_scene_rebuild: Option<std::time::Instant>,
+    frame_work_estimate: std::time::Duration,
+    pending_scene_build_duration: std::time::Duration,
+    cursor_blink_visible: bool,
+    cursor_blink_last_toggle: std::time::Instant,
+    pixel_scroll_remainder: f64,
     window_focused: bool,
     window_focus_gained_at: std::time::Instant,
     last_bell_notifications: HashMap<TerminalId, std::time::Instant>,
@@ -554,14 +650,30 @@ impl WmctermApplication {
         restored_window: Option<WindowState>,
         restored_agent_sessions: HashMap<SurfaceId, AgentSession>,
     ) -> Result<Self> {
-        let process_cwd = env::current_dir()?;
-        let cwd = config.workspace.default_cwd.clone().unwrap_or(process_cwd);
+        let raw_process_cwd = env::current_dir()?;
+        let process_cwd = safe_process_cwd(raw_process_cwd.clone());
+        let cwd = config
+            .workspace
+            .default_cwd
+            .clone()
+            .unwrap_or_else(|| process_cwd.clone());
         let name = cwd
             .file_name()
             .and_then(|v| v.to_str())
             .unwrap_or("wmcterm")
             .to_owned();
         let mut state = restored.unwrap_or_else(|| AppState::new(name, cwd.clone()));
+        for workspace in &mut state.workspaces {
+            workspace.cwd =
+                wmcterm_config::normalize_windows_path(std::mem::take(&mut workspace.cwd));
+        }
+        if config.workspace.default_cwd.is_none() && process_cwd != raw_process_cwd {
+            for workspace in &mut state.workspaces {
+                if windows_paths_equal(&workspace.cwd, &raw_process_cwd) {
+                    workspace.cwd = process_cwd.clone();
+                }
+            }
+        }
         if commands.is_empty()
             && let Some(project) = wmcterm_config::load_project(&cwd)?
             && let Some(workspace) = state.workspaces.first_mut()
@@ -586,10 +698,12 @@ impl WmctermApplication {
         }
         let pending = Arc::new(Mutex::new(VecDeque::new()));
         let wake_pending = Arc::new(AtomicBool::new(false));
-        let ipc = default_socket_path()
+        let control_socket_path = application_socket_path();
+        let ipc = control_socket_path
+            .as_ref()
             .map(|path| {
                 let rpc_proxy = proxy.clone();
-                UnixServer::spawn(&path, move |request| {
+                UnixServer::spawn(path, move |request| {
                     let id = request.id.clone();
                     let (tx, rx) = mpsc::sync_channel(1);
                     if rpc_proxy.send_event(UserEvent::Rpc(request, tx)).is_err() {
@@ -635,7 +749,9 @@ impl WmctermApplication {
             window_size: restored_window
                 .map(|window| PhysicalSize::new(window.width.max(600), window.height.max(360)))
                 .unwrap_or_else(|| PhysicalSize::new(1000, 650)),
+            scale_factor: 1.0,
             _ipc: ipc,
+            control_socket_path,
             config,
             cursor_position: (0.0, 0.0),
             commands,
@@ -679,6 +795,13 @@ impl WmctermApplication {
             foreground_agents: HashMap::new(),
             automatic_agent_status: HashSet::new(),
             foreground_agent_input: HashMap::new(),
+            scene_dirty: true,
+            last_scene_rebuild: None,
+            frame_work_estimate: std::time::Duration::ZERO,
+            pending_scene_build_duration: std::time::Duration::ZERO,
+            cursor_blink_visible: true,
+            cursor_blink_last_toggle: std::time::Instant::now(),
+            pixel_scroll_remainder: 0.0,
             window_focused: true,
             window_focus_gained_at: std::time::Instant::now(),
             last_bell_notifications: HashMap::new(),
@@ -762,40 +885,36 @@ impl WmctermApplication {
         }
         let size = TerminalSize::new(80, 24)?;
         let lifecycle_id = uuid::Uuid::new_v4().to_string();
-        let shell = env::var_os("SHELL").unwrap_or_else(|| "sh".into());
-        let mut spec = match &options.command {
-            Some(command) => CommandSpec::new(shell).args(["-lc", command.as_str()]),
-            None => CommandSpec::new(shell),
-        }
-        .cwd(
-            options
-                .cwd
-                .clone()
-                .or_else(|| self.cwd_for_terminal(id))
-                .unwrap_or_else(|| env::current_dir().unwrap_or_default()),
-        )
-        .env("TERM", TERMINAL_TERM)
-        .env("COLORTERM", TERMINAL_COLORTERM)
-        .env("TERM_PROGRAM", TERMINAL_PROGRAM)
-        .env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"))
-        .env("WMCTERM", "1")
-        .env("WMCTERM_TERMINAL_LIFECYCLE_ID", &lifecycle_id)
-        .env("WMCTERM_LIFECYCLE_ID", &lifecycle_id)
-        .env(
-            "COLORFGBG",
-            if terminal_background_is_light(self.config.theme.background) {
-                "0;15"
-            } else {
-                "15;0"
-            },
-        );
+        let mut spec = terminal_command_spec(options.command.as_deref())
+            .cwd(
+                options
+                    .cwd
+                    .clone()
+                    .or_else(|| self.cwd_for_terminal(id))
+                    .unwrap_or_else(|| env::current_dir().unwrap_or_default()),
+            )
+            .env("TERM", TERMINAL_TERM)
+            .env("COLORTERM", TERMINAL_COLORTERM)
+            .env("TERM_PROGRAM", TERMINAL_PROGRAM)
+            .env("TERM_PROGRAM_VERSION", env!("CARGO_PKG_VERSION"))
+            .env("WMCTERM", "1")
+            .env("WMCTERM_TERMINAL_LIFECYCLE_ID", &lifecycle_id)
+            .env("WMCTERM_LIFECYCLE_ID", &lifecycle_id)
+            .env(
+                "COLORFGBG",
+                if terminal_background_is_light(self.config.theme.background) {
+                    "0;15"
+                } else {
+                    "15;0"
+                },
+            );
         if let Some((workspace, pane, surface)) = terminal_context_ids(&self.state, id) {
             spec = spec
                 .env("WMCTERM_WORKSPACE_ID", workspace.to_string())
                 .env("WMCTERM_PANE_ID", pane.to_string())
                 .env("WMCTERM_SURFACE_ID", surface.to_string());
         }
-        if let Some(path) = default_socket_path() {
+        if let Some(path) = &self.control_socket_path {
             spec = spec
                 .env("WMCTERM_CONTROL_SOCKET", path.as_os_str())
                 .env("WMCTERM_SOCKET", path.as_os_str());
@@ -839,7 +958,9 @@ impl WmctermApplication {
                     viewport_offset: 0,
                     screen_row_origin: 0,
                 },
+                snapshot_revision: 0,
                 size,
+                cell_metrics_px: (0, 0),
                 lifecycle_id,
             },
         );
@@ -945,6 +1066,9 @@ impl WmctermApplication {
                     self.language = Language::resolve(config.ui.language);
                     self.config = config;
                     self.keybindings = keybindings;
+                    if let Some(renderer) = &mut self.renderer {
+                        renderer.set_transparent(self.config.window.opacity < 1.0);
+                    }
                     let theme = terminal_theme(&self.config.theme);
                     for runtime in self.terminals.values() {
                         let _ = runtime
@@ -963,6 +1087,22 @@ impl WmctermApplication {
 
     fn drain_terminal_events(&mut self, _event_loop: &ActiveEventLoop) {
         self.wake_pending.store(false, Ordering::Release);
+        let active_terminal = self.active_terminal_id();
+        let visible_terminals: HashSet<_> = self
+            .pane_rects()
+            .into_iter()
+            .filter_map(|(pane, _)| {
+                self.state
+                    .panes
+                    .get(&pane)
+                    .and_then(|pane| pane.active_surface())
+                    .and_then(|surface| self.state.surfaces.get(&surface))
+                    .and_then(|surface| match surface.kind {
+                        SurfaceKind::Terminal(terminal) => Some(terminal),
+                        _ => None,
+                    })
+            })
+            .collect();
         let events: Vec<_> = self
             .pending
             .lock()
@@ -970,10 +1110,11 @@ impl WmctermApplication {
             .drain(..)
             .collect();
         let mut changed = false;
+        let mut saw_snapshot = false;
         for tagged in events {
             let terminal_id = tagged.terminal;
             match tagged.event {
-                SessionEvent::Snapshot(snapshot) => { if let Some(runtime) = self.terminals.get_mut(&terminal_id) { runtime.snapshot = snapshot; changed = true; } }
+                SessionEvent::Snapshot(snapshot) => { if let Some(runtime) = self.terminals.get_mut(&terminal_id) { runtime.snapshot = snapshot; runtime.snapshot_revision = runtime.snapshot_revision.wrapping_add(1); if visible_terminals.contains(&terminal_id) { changed = true; saw_snapshot |= active_terminal == Some(terminal_id); } } }
                 SessionEvent::Exited(status) => {
                     tracing::info!(terminal=%tagged.terminal, %status, "terminal exited");
                     self.close_agent_session_for_terminal(terminal_id, status.clone());
@@ -1028,9 +1169,16 @@ impl WmctermApplication {
                     changed = true;
                 }
                 SessionEvent::Notification(message) => { self.notify_terminal(terminal_id, &message); changed = true; }
-                SessionEvent::ClipboardText(text) => { if let Some(clipboard) = &mut self.clipboard { let _ = clipboard.set_text(text); } }
+                SessionEvent::ClipboardText(text) => {
+                    if let Err(error) = self.set_clipboard_text(text) {
+                        tracing::warn!(%error, "copying terminal text to the clipboard failed");
+                    }
+                }
                 SessionEvent::SearchResult(result) => { self.search_result = Some(result); changed = true; }
             }
+        }
+        if saw_snapshot {
+            self.reset_cursor_blink();
         }
         if changed {
             self.rebuild_scene();
@@ -1686,6 +1834,7 @@ impl WmctermApplication {
         if event.state != ElementState::Pressed {
             return;
         }
+        self.reset_cursor_blink();
         // Focus transitions are allowed to race keyboard delivery on several
         // desktop backends. Never route a late key press from an unfocused
         // window, and consume the physical Tab from Alt/Super+Tab before any
@@ -1716,6 +1865,8 @@ impl WmctermApplication {
                 Key::Named(NamedKey::Enter) => self.confirm_close(),
                 Key::Named(NamedKey::Escape) => {
                     self.close_confirmation = None;
+                    self.update_navigation_hover();
+                    self.update_cursor_icon();
                     self.rebuild_scene();
                 }
                 _ => {}
@@ -2187,6 +2338,17 @@ impl WmctermApplication {
             self.execute_action(&action);
             return;
         }
+        if self.modifiers.control_key()
+            && !self.modifiers.alt_key()
+            && !self.modifiers.super_key()
+            && event.physical_key == PhysicalKey::Code(KeyCode::KeyC)
+            && self
+                .selection
+                .is_some_and(|selection| selection.start != selection.end)
+        {
+            self.copy_selection_to_clipboard();
+            return;
+        }
         if self.config.ui.legacy_shortcuts {
             if matches!(event.logical_key, Key::Named(NamedKey::F2))
                 && !self.modifiers.control_key()
@@ -2197,16 +2359,16 @@ impl WmctermApplication {
                 return;
             }
             if self.modifiers.control_key() && self.modifiers.shift_key() {
-                match &event.logical_key {
-                    Key::Character(value) if value.eq_ignore_ascii_case("d") => {
+                match physical_ascii_character(event.physical_key) {
+                    Some('d') => {
                         self.split_active(SplitAxis::Vertical);
                         return;
                     }
-                    Key::Character(value) if value.eq_ignore_ascii_case("e") => {
+                    Some('e') => {
                         self.split_active(SplitAxis::Horizontal);
                         return;
                     }
-                    Key::Character(value) if value.eq_ignore_ascii_case("p") => {
+                    Some('p') => {
                         self.palette_visible = !self.palette_visible;
                         self.palette_query.clear();
                         self.palette_index = 0;
@@ -2215,29 +2377,29 @@ impl WmctermApplication {
                         self.rebuild_scene();
                         return;
                     }
-                    Key::Character(value) if value.eq_ignore_ascii_case("w") => {
+                    Some('w') => {
                         self.close_active_pane();
                         return;
                     }
-                    Key::Character(value) if value.eq_ignore_ascii_case("x") => {
+                    Some('x') => {
                         self.request_close_active_surface();
                         return;
                     }
-                    Key::Character(value) if value.eq_ignore_ascii_case("t") => {
+                    Some('t') => {
                         self.new_surface();
                         return;
                     }
-                    Key::Character(value) if value.eq_ignore_ascii_case("a") => {
+                    Some('a') => {
                         self.new_workspace();
                         return;
                     }
-                    Key::Character(value) if value.eq_ignore_ascii_case("b") => {
+                    Some('b') => {
                         self.sidebar_visible = !self.sidebar_visible;
                         self.resize_terminals();
                         self.rebuild_scene();
                         return;
                     }
-                    Key::Character(value) if value.eq_ignore_ascii_case("n") => {
+                    Some('n') => {
                         self.notifications_visible = !self.notifications_visible;
                         if self.notifications_visible {
                             self.notification_scroll = 0;
@@ -2246,35 +2408,35 @@ impl WmctermApplication {
                         self.rebuild_scene();
                         return;
                     }
-                    Key::Character(value) if value.eq_ignore_ascii_case("k") => {
+                    Some('k') => {
                         self.clear_scrollback();
                         return;
                     }
-                    Key::Character(value) if value.eq_ignore_ascii_case("z") => {
+                    Some('z') => {
                         self.toggle_pane_zoom();
                         return;
                     }
-                    Key::Character(value) if value.eq_ignore_ascii_case("r") => {
+                    Some('r') => {
                         self.open_workspace_prompt(PromptKind::RenameWorkspace);
                         return;
                     }
-                    Key::Character(value) if value.eq_ignore_ascii_case("u") => {
+                    Some('u') => {
                         self.jump_latest_unread();
                         return;
                     }
-                    Key::Character(value) if value.eq_ignore_ascii_case("l") => {
+                    Some('l') => {
                         self.open_log_filter_prompt();
                         return;
                     }
-                    Key::Named(NamedKey::PageUp) => {
+                    _ if matches!(event.logical_key, Key::Named(NamedKey::PageUp)) => {
                         self.move_workspace(-1);
                         return;
                     }
-                    Key::Named(NamedKey::PageDown) => {
+                    _ if matches!(event.logical_key, Key::Named(NamedKey::PageDown)) => {
                         self.move_workspace(1);
                         return;
                     }
-                    Key::Character(value) if value.eq_ignore_ascii_case("c") => {
+                    Some('c') => {
                         if !self.copy_selection_to_clipboard()
                             && let Some(runtime) = self
                                 .active_terminal_id()
@@ -2284,7 +2446,7 @@ impl WmctermApplication {
                         }
                         return;
                     }
-                    Key::Character(value) if value.eq_ignore_ascii_case("v") => {
+                    Some('v') => {
                         self.paste_clipboard();
                         return;
                     }
@@ -2442,7 +2604,10 @@ impl WmctermApplication {
         let Some((event, queued_at)) = self.pending_unmodified_tab.take() else {
             return;
         };
-        if self.window_focused && queued_at.elapsed() >= UNMODIFIED_TAB_FOCUS_GRACE {
+        if !self.window_focused {
+            return;
+        }
+        if queued_at.elapsed() >= UNMODIFIED_TAB_FOCUS_GRACE {
             self.send_key(&event);
         } else {
             self.pending_unmodified_tab = Some((event, queued_at));
@@ -2453,6 +2618,7 @@ impl WmctermApplication {
         if text.is_empty() || self.close_confirmation.is_some() {
             return;
         }
+        self.reset_cursor_blink();
         if self.workspace_search_focused {
             self.workspace_search.insert(&text);
             self.sidebar_scroll = 0;
@@ -3346,6 +3512,46 @@ impl WmctermApplication {
         self.terminal_font_size * 1.4
     }
 
+    fn active_cursor_blinks(&self) -> bool {
+        self.window_focused
+            && self
+                .active_terminal_id()
+                .and_then(|id| self.terminals.get(&id))
+                .and_then(|runtime| runtime.snapshot.cursor)
+                .is_some_and(|cursor| cursor.visible && cursor.blinking)
+    }
+
+    fn reset_cursor_blink(&mut self) {
+        let changed = !self.cursor_blink_visible;
+        self.cursor_blink_visible = true;
+        self.cursor_blink_last_toggle = std::time::Instant::now();
+        if changed {
+            self.rebuild_scene();
+        }
+    }
+
+    fn update_cursor_blink(&mut self, now: std::time::Instant) -> Option<std::time::Duration> {
+        if !self.active_cursor_blinks() {
+            if !self.cursor_blink_visible {
+                self.cursor_blink_visible = true;
+                self.rebuild_scene();
+            }
+            self.cursor_blink_last_toggle = now;
+            return None;
+        }
+        if advance_cursor_blink(
+            &mut self.cursor_blink_visible,
+            &mut self.cursor_blink_last_toggle,
+            now,
+        ) {
+            self.rebuild_scene();
+        }
+        Some(
+            CURSOR_BLINK_INTERVAL
+                .saturating_sub(now.saturating_duration_since(self.cursor_blink_last_toggle)),
+        )
+    }
+
     fn adjust_font_size(&mut self, delta: f32) {
         self.terminal_font_size = (self.terminal_font_size + delta).clamp(8.0, 40.0);
         self.resize_terminals();
@@ -3696,6 +3902,8 @@ impl WmctermApplication {
             }
             CloseTarget::Application => self.quit_requested = true,
         }
+        self.update_navigation_hover();
+        self.update_cursor_icon();
         self.rebuild_scene();
     }
 
@@ -3717,6 +3925,8 @@ impl WmctermApplication {
                     pending_request_count,
                 ),
             });
+            self.update_navigation_hover();
+            self.update_cursor_icon();
             self.rebuild_scene();
         } else {
             self.quit_requested = true;
@@ -3761,6 +3971,8 @@ impl WmctermApplication {
                     .language
                     .close_workspace_warning(terminal_ids.len(), process_count),
             });
+            self.update_navigation_hover();
+            self.update_cursor_icon();
             self.rebuild_scene();
             return Ok(false);
         }
@@ -4081,6 +4293,8 @@ impl WmctermApplication {
                 .language
                 .close_terminal_warning(terminals.len(), process_count),
         });
+        self.update_navigation_hover();
+        self.update_cursor_icon();
         self.rebuild_scene();
         false
     }
@@ -5376,6 +5590,8 @@ impl WmctermApplication {
                 self.confirm_close();
             } else if cancel.contains(x, y) {
                 self.close_confirmation = None;
+                self.update_navigation_hover();
+                self.update_cursor_icon();
                 self.rebuild_scene();
             }
             return true;
@@ -5564,6 +5780,16 @@ impl WmctermApplication {
                 return true;
             }
         }
+        if notification_toggle_press(
+            self.notifications_visible,
+            self.titlebar_buttons().into_iter().any(|button| {
+                matches!(button.action, TitlebarAction::ToggleNotifications)
+                    && button.bounds.contains(x, y)
+            }),
+        ) {
+            self.execute_action("notifications.toggle");
+            return true;
+        }
         match notification_overlay_press(
             self.notifications_visible,
             self.notification_panel(),
@@ -5634,6 +5860,10 @@ impl WmctermApplication {
 
     fn navigation_hover_at_cursor(&self) -> Option<NavigationHover> {
         let (x, y) = self.cursor_position;
+        if self.close_confirmation.is_some() {
+            let (cancel, confirm) = self.confirmation_buttons();
+            return confirmation_hover(cancel, confirm, x, y);
+        }
         if let Some(menu) = self.notification_context_menu {
             let panel = ui::popup_menu(
                 menu.anchor.0,
@@ -5819,7 +6049,10 @@ impl WmctermApplication {
 
     fn update_cursor_icon(&self) {
         let (x, y) = self.cursor_position;
-        let icon = if let Some(direction) = self.window_resize_direction(x, y) {
+        let icon = if self.close_confirmation.is_some() {
+            let (cancel, confirm) = self.confirmation_buttons();
+            confirmation_cursor_icon(cancel, confirm, x, y)
+        } else if let Some(direction) = self.window_resize_direction(x, y) {
             match direction {
                 ResizeDirection::East | ResizeDirection::West => CursorIcon::EwResize,
                 ResizeDirection::North | ResizeDirection::South => CursorIcon::NsResize,
@@ -6002,8 +6235,8 @@ impl WmctermApplication {
             )
         };
         renderer.window().set_ime_cursor_area(
-            PhysicalPosition::new(x.max(0.0) as i32, y.max(0.0) as i32),
-            PhysicalSize::new(2, height.max(1.0) as u32),
+            LogicalPosition::new(x.max(0.0), y.max(0.0)),
+            LogicalSize::new(2.0, height.max(1.0)),
         );
     }
 
@@ -6321,6 +6554,11 @@ impl WmctermApplication {
             })?;
         let snapshot = &self.terminals.get(&terminal)?.snapshot;
         let screen_row = snapshot.screen_row_origin.saturating_add(row);
+        let col = snapshot
+            .cells
+            .get(row)
+            .map(|cells| wide_cell_lead(cells, col))
+            .unwrap_or(col);
         (row < snapshot.cells.len() && col < snapshot.cols as usize).then_some((
             pane,
             terminal,
@@ -6349,6 +6587,27 @@ impl WmctermApplication {
                 end: point(selection.end),
             })
             .is_ok()
+    }
+
+    fn set_clipboard_text(&mut self, text: String) -> Result<(), String> {
+        #[cfg(windows)]
+        {
+            return set_windows_clipboard_text(&text).map_err(|error| error.to_string());
+        }
+        #[cfg(not(windows))]
+        {
+            if let Some(clipboard) = &mut self.clipboard
+                && clipboard.set_text(text.clone()).is_ok()
+            {
+                return Ok(());
+            }
+            let mut clipboard = arboard::Clipboard::new().map_err(|error| error.to_string())?;
+            clipboard
+                .set_text(text)
+                .map_err(|error| error.to_string())?;
+            self.clipboard = Some(clipboard);
+            Ok(())
+        }
     }
 
     fn send_terminal_mouse(
@@ -6533,6 +6792,7 @@ impl WmctermApplication {
         if let Some(runtime) = self.terminals.get(&terminal) {
             let _ = runtime.session.send(SessionCommand::Paste(text));
         }
+        self.reset_cursor_blink();
         if notifications_changed {
             self.rebuild_scene();
         }
@@ -6541,6 +6801,11 @@ impl WmctermApplication {
     fn resize_terminals(&mut self) {
         let cell_width = self.cell_width();
         let cell_height = self.cell_height();
+        let scale_factor = self.scale_factor;
+        let cell_metrics_px = (
+            (cell_width as f64 * scale_factor).round().max(1.0) as u32,
+            (cell_height as f64 * scale_factor).round().max(1.0) as u32,
+        );
         for (pane_id, rect) in self.pane_rects() {
             let terminal = self
                 .state
@@ -6558,22 +6823,78 @@ impl WmctermApplication {
             let cols = ((rect.width - 16.0).max(cell_width) / cell_width) as u16;
             let rows = ((rect.height - 25.0).max(cell_height) / cell_height) as u16;
             if let Ok(size) = TerminalSize::new(cols.max(1), rows.max(1))
-                && size != runtime.size
+                && (size != runtime.size || cell_metrics_px != runtime.cell_metrics_px)
             {
-                let _ = runtime.session.send(SessionCommand::Resize(size));
+                let _ = runtime.session.send(SessionCommand::Resize {
+                    size,
+                    cell_width_px: cell_metrics_px.0,
+                    cell_height_px: cell_metrics_px.1,
+                });
                 runtime.size = size;
+                runtime.cell_metrics_px = cell_metrics_px;
             }
         }
     }
 
     fn rebuild_scene(&mut self) {
-        if self.renderer.is_none() {
-            return;
+        self.scene_dirty = true;
+    }
+
+    fn rebuild_scene_if_due(&mut self, now: std::time::Instant) -> bool {
+        if !self.scene_dirty
+            || !frame_rebuild_due_with_interval(
+                self.last_scene_rebuild,
+                now,
+                adaptive_frame_interval(self.frame_work_estimate),
+            )
+        {
+            return false;
         }
-        let theme_crust = theme_rgba(self.config.theme.sidebar_background);
-        let theme_mantle = theme_rgba(self.config.theme.sidebar_background);
-        let theme_base = theme_rgba(self.config.theme.background);
-        let theme_surface = theme_rgba(self.config.theme.panel_background);
+        self.scene_dirty = false;
+        self.last_scene_rebuild = Some(now);
+        let started = std::time::Instant::now();
+        self.rebuild_scene_now();
+        self.pending_scene_build_duration = started.elapsed();
+        true
+    }
+
+    fn scene_rebuild_wait(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        if !self.scene_dirty {
+            return None;
+        }
+        Some(
+            self.last_scene_rebuild
+                .map_or(std::time::Duration::ZERO, |last| {
+                    adaptive_frame_interval(self.frame_work_estimate)
+                        .saturating_sub(now.saturating_duration_since(last))
+                }),
+        )
+    }
+
+    fn observe_render_duration(&mut self, render_duration: std::time::Duration) {
+        let observed = self
+            .pending_scene_build_duration
+            .saturating_add(render_duration);
+        self.pending_scene_build_duration = std::time::Duration::ZERO;
+        self.frame_work_estimate = smooth_frame_work(self.frame_work_estimate, observed);
+    }
+
+    fn rebuild_scene_now(&mut self) {
+        let Some(renderer) = &self.renderer else {
+            return;
+        };
+        let opacity = if renderer.transparency_active() {
+            self.config.window.opacity.clamp(0.0, 1.0)
+        } else {
+            1.0
+        };
+        let theme_crust =
+            background_opacity(theme_rgba(self.config.theme.sidebar_background), opacity);
+        let theme_mantle =
+            background_opacity(theme_rgba(self.config.theme.sidebar_background), opacity);
+        let theme_base = background_opacity(theme_rgba(self.config.theme.background), opacity);
+        let theme_surface =
+            background_opacity(theme_rgba(self.config.theme.panel_background), opacity);
         let theme_hover = theme_rgba(self.config.theme.hover_background);
         let theme_selection = theme_rgba(self.config.theme.selection_background);
         let theme_selection_text = theme_rgba(self.config.theme.selection_foreground);
@@ -6596,6 +6917,9 @@ impl WmctermApplication {
         let mut overlay_blocks = Vec::new();
         let mut overlay_rectangles = Vec::new();
         if self.sidebar_visible {
+            let sidebar_resize_hovered =
+                self.sidebar_resize_hit(self.cursor_position.0, self.cursor_position.1);
+            let sidebar_resize_active = self.sidebar_drag || sidebar_resize_hovered;
             rectangles.extend([
                 RectBlock {
                     left: 0.0,
@@ -6605,11 +6929,11 @@ impl WmctermApplication {
                     color: theme_mantle,
                 },
                 RectBlock {
-                    left: self.sidebar_width() - if self.sidebar_drag { 1.5 } else { 0.0 },
+                    left: self.sidebar_width() - if sidebar_resize_active { 1.5 } else { 0.0 },
                     top: 0.0,
-                    width: if self.sidebar_drag { 3.0 } else { 1.0 },
+                    width: if sidebar_resize_active { 3.0 } else { 1.0 },
                     height: self.window_size.height as f32,
-                    color: if self.sidebar_drag {
+                    color: if sidebar_resize_active {
                         theme_blue
                     } else {
                         theme_border
@@ -7198,6 +7522,7 @@ impl WmctermApplication {
                     }
                 }
             }
+            let mut terminal_wide_glyphs = Vec::new();
             let (text, spans) = match surface.kind {
                 SurfaceKind::Terminal(id) => self
                     .terminals
@@ -7207,18 +7532,56 @@ impl WmctermApplication {
                         let cell_height = self.cell_height();
                         for (row, cells) in runtime.snapshot.cells.iter().enumerate() {
                             for (col, cell) in cells.iter().enumerate() {
+                                if needs_grid_positioned_glyph(cell.text.as_str()) {
+                                    terminal_wide_glyphs.push(TextBlock {
+                                        text: String::new(),
+                                        spans: vec![TextSpan {
+                                            text: cell.text.clone(),
+                                            color: [
+                                                cell.foreground.r,
+                                                cell.foreground.g,
+                                                cell.foreground.b,
+                                                255,
+                                            ],
+                                            bold: cell.bold,
+                                            italic: cell.italic,
+                                        }],
+                                        // glyphon constrains a fallback glyph to
+                                        // one monospace advance. Center it in
+                                        // the VT cell range owned by the wide
+                                        // character instead of pinning it to
+                                        // the leading edge.
+                                        left: rect.x
+                                            + 8.0
+                                            + col as f32 * cell_width
+                                            + wide_glyph_center_offset(
+                                                cell.text.as_str(),
+                                                cell_width,
+                                                self.terminal_font_size,
+                                            ),
+                                        top: rect.y + 25.0 + row as f32 * cell_height,
+                                        width: cell_width * 2.0,
+                                        height: cell_height,
+                                        color: theme_text,
+                                        font_size: self.terminal_font_size,
+                                        line_height: cell_height,
+                                    });
+                                }
                                 if cell.background_explicit {
                                     rectangles.push(RectBlock {
                                         left: rect.x + 8.0 + col as f32 * cell_width,
                                         top: rect.y + 25.0 + row as f32 * cell_height,
                                         width: cell_width,
                                         height: cell_height,
-                                        color: [
-                                            cell.background.r,
-                                            cell.background.g,
-                                            cell.background.b,
-                                            255,
-                                        ],
+                                        color: background_opacity(
+                                            [
+                                                cell.background.r,
+                                                cell.background.g,
+                                                cell.background.b,
+                                                255,
+                                            ],
+                                            opacity,
+                                        ),
                                     });
                                 }
                                 if cell.underline || cell.strikethrough {
@@ -7282,6 +7645,12 @@ impl WmctermApplication {
                                 } else {
                                     runtime.snapshot.cols as usize - 1
                                 };
+                                let to = runtime
+                                    .snapshot
+                                    .cells
+                                    .get(row)
+                                    .map(|cells| wide_cell_end(cells, to))
+                                    .unwrap_or(to);
                                 rectangles.push(RectBlock {
                                     left: rect.x + 8.0 + from as f32 * cell_width,
                                     top: rect.y + 25.0 + row as f32 * cell_height,
@@ -7291,22 +7660,30 @@ impl WmctermApplication {
                                 });
                             }
                         }
-                        if let Some(cursor) =
-                            runtime.snapshot.cursor.filter(|cursor| cursor.visible)
-                        {
+                        if let Some(cursor) = runtime.snapshot.cursor.filter(|cursor| {
+                            cursor.visible
+                                && (!cursor.blinking || !active || self.cursor_blink_visible)
+                        }) {
+                            let cursor_width = runtime
+                                .snapshot
+                                .cells
+                                .get(cursor.y as usize)
+                                .and_then(|row| row.get(cursor.x as usize))
+                                .map(|cell| terminal_text_cell_width(cell.text.as_str()))
+                                .unwrap_or(1);
                             rectangles.push(RectBlock {
                                 left: rect.x + 8.0 + cursor.x as f32 * cell_width,
                                 top: rect.y + 25.0 + cursor.y as f32 * cell_height,
-                                width: cell_width,
+                                width: cursor_width as f32 * cell_width,
                                 height: cell_height,
                                 color: [
                                     theme_lavender[0],
                                     theme_lavender[1],
                                     theme_lavender[2],
-                                    if cursor.blinking {
-                                        145
-                                    } else {
+                                    if active && self.window_focused {
                                         theme_lavender[3]
+                                    } else {
+                                        145
                                     },
                                 ],
                             });
@@ -7322,41 +7699,54 @@ impl WmctermApplication {
                             runtime.snapshot.scrollback_rows,
                             runtime.snapshot.viewport_offset,
                         ) {
+                            let scrollbar_hovered = self
+                                .scrollbar_at_cursor()
+                                .is_some_and(|(_, terminal, _)| terminal == id)
+                                || self.scrollbar_drag.is_some_and(|drag| drag.terminal == id);
                             rectangles.push(RectBlock {
                                 left: scrollbar.track.x,
                                 top: scrollbar.track.y,
                                 width: scrollbar.track.width,
                                 height: scrollbar.track.height,
-                                color: [theme_subtext[0], theme_subtext[1], theme_subtext[2], 28],
+                                color: [
+                                    theme_subtext[0],
+                                    theme_subtext[1],
+                                    theme_subtext[2],
+                                    if scrollbar_hovered { 55 } else { 28 },
+                                ],
                             });
                             rectangles.push(RectBlock {
                                 left: scrollbar.thumb.x,
                                 top: scrollbar.thumb.y,
                                 width: scrollbar.thumb.width,
                                 height: scrollbar.thumb.height,
-                                color: [theme_subtext[0], theme_subtext[1], theme_subtext[2], 150],
+                                color: if scrollbar_hovered {
+                                    theme_blue
+                                } else {
+                                    [theme_subtext[0], theme_subtext[1], theme_subtext[2], 150]
+                                },
                             });
                         }
                         let mut spans = Vec::new();
                         for (row_index, row) in runtime.snapshot.cells.iter().enumerate() {
-                            spans.extend(row.iter().map(|cell| TextSpan {
-                                text: cell.text.clone(),
-                                color: [
-                                    cell.foreground.r,
-                                    cell.foreground.g,
-                                    cell.foreground.b,
-                                    255,
-                                ],
-                                bold: cell.bold,
-                                italic: cell.italic,
-                            }));
+                            for cell in row {
+                                let text = if cell.text.is_empty()
+                                    || needs_grid_positioned_glyph(cell.text.as_str())
+                                {
+                                    " "
+                                } else {
+                                    cell.text.as_str()
+                                };
+                                push_terminal_span(
+                                    &mut spans,
+                                    text,
+                                    [cell.foreground.r, cell.foreground.g, cell.foreground.b, 255],
+                                    cell.bold,
+                                    cell.italic,
+                                );
+                            }
                             if row_index + 1 < runtime.snapshot.cells.len() {
-                                spans.push(TextSpan {
-                                    text: "\n".into(),
-                                    color: theme_text,
-                                    bold: false,
-                                    italic: false,
-                                });
+                                push_terminal_span(&mut spans, "\n", theme_text, false, false);
                             }
                         }
                         (String::new(), spans)
@@ -7461,6 +7851,7 @@ impl WmctermApplication {
                 font_size: self.terminal_font_size,
                 line_height: self.cell_height(),
             });
+            blocks.append(&mut terminal_wide_glyphs);
             if let SurfaceKind::Terminal(terminal) = surface.kind
                 && let Some(notice) = self.terminal_notices.get(&terminal)
             {
@@ -7625,6 +8016,9 @@ impl WmctermApplication {
         if let Some(confirmation) = &self.close_confirmation {
             let panel = self.confirmation_panel();
             let (cancel, confirm) = self.confirmation_buttons();
+            let cancel_hovered = self.navigation_hover == Some(NavigationHover::ConfirmationCancel);
+            let confirm_hovered =
+                self.navigation_hover == Some(NavigationHover::ConfirmationConfirm);
             overlay_rectangles.push(RectBlock {
                 left: 0.0,
                 top: 40.0,
@@ -7633,7 +8027,24 @@ impl WmctermApplication {
                 color: [0, 0, 0, 150],
             });
             overlay_rectangles.extend(context_menu_frame(panel, theme_surface, theme_blue));
-            for (bounds, color) in [(cancel, theme_hover), (confirm, theme_red)] {
+            for (bounds, color) in [
+                (
+                    cancel,
+                    if cancel_hovered {
+                        theme_selection
+                    } else {
+                        theme_hover
+                    },
+                ),
+                (
+                    confirm,
+                    if confirm_hovered {
+                        brighten_rgba(theme_red, 28)
+                    } else {
+                        theme_red
+                    },
+                ),
+            ] {
                 overlay_rectangles.push(RectBlock {
                     left: bounds.x,
                     top: bounds.y,
@@ -8946,7 +9357,7 @@ impl WmctermApplication {
                 "unread_notifications": self.state.notifications.iter().filter(|item| !item.read).count(),
             })),
             "app.capabilities" => Ok(json!({
-                "protocol_version": 2,
+                "protocol_version": 3,
                 "product": "wmcterm",
                 "version": env!("CARGO_PKG_VERSION"),
                 "context": {
@@ -8964,6 +9375,9 @@ impl WmctermApplication {
                     "focus_preserving_documents": true,
                     "atomic_close_others": true,
                     "destructive_rpc_requires_target": true,
+                    "non_intrusive_scrollback_read": true,
+                    "screen_revisions": true,
+                    "screen_wait_cli": true,
                 },
                 "create_options": [
                     "workspace", "pane", "surface", "direction", "focus", "command", "cwd",
@@ -8983,7 +9397,7 @@ impl WmctermApplication {
                     "workspace.close", "pane.list", "pane.split", "pane.focus", "pane.zoom",
                     "pane.close", "pane.close-others", "surface.list", "surface.new", "surface.activate",
                     "surface.close", "surface.close-others", "surface.read", "surface.search", "surface.markdown",
-                    "surface.logs", "screen.read", "send", "terminal.search", "terminal.clear",
+                    "surface.logs", "screen.read", "send", "send.line", "terminal.search", "terminal.clear",
                     "terminal.scroll", "notification.list", "notification.mark", "notify",
                     "agent.update", "agent.request.list", "agent.request.reply", "agent.request.cancel",
                     "agent.approval.register", "agent.approval.poll"
@@ -9273,13 +9687,48 @@ impl WmctermApplication {
             "screen.read" => {
                 let terminal = self.terminal_for_params(&request.params)?;
                 let runtime = self.terminals.get(&terminal).ok_or_else(|| "target terminal is not running".to_owned())?;
-                Ok(json!({"text": runtime.snapshot.to_plain_text()}))
+                let include_scrollback = request
+                    .params
+                    .get("scrollback")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false);
+                let lines = optional_screen_lines(&request.params)?;
+                let mut text = if include_scrollback {
+                    runtime
+                        .session
+                        .export_history()
+                        .ok_or_else(|| "timed out reading terminal scrollback".to_owned())?
+                } else {
+                    runtime.snapshot.to_plain_text()
+                };
+                if let Some(lines) = lines {
+                    text = tail_lines(&text, lines);
+                }
+                let snapshot = &runtime.snapshot;
+                Ok(json!({
+                    "text": text,
+                    "revision": runtime.snapshot_revision,
+                    "cols": snapshot.cols,
+                    "rows": snapshot.rows,
+                    "cursor": snapshot.cursor.as_ref().map(|cursor| json!({
+                        "column": cursor.x,
+                        "row": cursor.y,
+                        "visible": cursor.visible,
+                    })),
+                    "scrollback_rows": snapshot.scrollback_rows,
+                    "viewport_offset": snapshot.viewport_offset,
+                    "at_bottom": snapshot.viewport_offset == 0,
+                    "truncated_top": !include_scrollback && snapshot.screen_row_origin > 0,
+                    "includes_scrollback": include_scrollback,
+                }))
             }
-            "send" => {
+            "send" | "send.line" => {
                 let text = request.params.get("text").and_then(Value::as_str).ok_or_else(|| "missing params.text".to_owned())?;
                 let terminal = self.terminal_for_params(&request.params)?;
                 let runtime = self.terminals.get(&terminal).ok_or_else(|| "target terminal is not running".to_owned())?;
-                let command = if request
+                let command = if request.method == "send.line" {
+                    SessionCommand::PasteLine(text.to_owned())
+                } else if request
                     .params
                     .get("paste")
                     .and_then(Value::as_bool)
@@ -9540,7 +9989,10 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
             return;
         }
         let mut attributes = default_window_attributes()
-            .with_inner_size(self.window_size)
+            .with_inner_size(LogicalSize::new(
+                self.window_size.width,
+                self.window_size.height,
+            ))
             .with_min_inner_size(LogicalSize::new(600.0, 360.0))
             .with_window_icon(application_icon())
             .with_decorations(false)
@@ -9553,23 +10005,33 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
         if let Some(monitor) = event_loop.primary_monitor() {
             let monitor_size = monitor.size();
             let monitor_position = monitor.position();
+            let desired_size: PhysicalSize<u32> =
+                LogicalSize::new(self.window_size.width, self.window_size.height)
+                    .to_physical(monitor.scale_factor());
             let x = monitor_position.x
-                + monitor_size.width.saturating_sub(self.window_size.width) as i32 / 2;
+                + monitor_size.width.saturating_sub(desired_size.width) as i32 / 2;
             let y = monitor_position.y
-                + monitor_size.height.saturating_sub(self.window_size.height) as i32 / 2;
+                + monitor_size.height.saturating_sub(desired_size.height) as i32 / 2;
             attributes = attributes.with_position(PhysicalPosition::new(x, y));
         }
         match event_loop
             .create_window(attributes)
             .context("creating wmcterm window")
             .and_then(|window| {
+                let window = Arc::new(window);
+                let scale_factor = window.scale_factor();
                 GpuRenderer::new(
-                    Arc::new(window),
+                    window,
                     event_loop,
                     self.config.terminal.font_family.clone(),
+                    self.config.window.opacity < 1.0,
+                    scale_factor,
                 )
             }) {
             Ok(renderer) => {
+                self.scale_factor = renderer.window().scale_factor();
+                self.window_size =
+                    logical_window_size(renderer.window().inner_size(), self.scale_factor);
                 renderer.window().set_ime_allowed(true);
                 self.renderer = Some(renderer);
                 self.resize_terminals();
@@ -9582,6 +10044,7 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        let now = std::time::Instant::now();
         self.flush_pending_unmodified_tab();
         self.reload_config_if_changed();
         if self.expire_agent_requests() {
@@ -9590,7 +10053,6 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
         if self.last_metadata_refresh.elapsed() >= std::time::Duration::from_secs(5) {
             self.refresh_workspace_metadata();
             self.last_metadata_refresh = std::time::Instant::now();
-            self.rebuild_scene();
         }
         let mut document_changed = false;
         for backend in self.surface_backends.values_mut() {
@@ -9603,7 +10065,9 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
             self.rebuild_scene();
         }
         let mut wait = std::time::Duration::from_secs(1);
-        if let Some((_, queued_at)) = &self.pending_unmodified_tab {
+        if self.window_focused
+            && let Some((_, queued_at)) = &self.pending_unmodified_tab
+        {
             wait = wait.min(UNMODIFIED_TAB_FOCUS_GRACE.saturating_sub(queued_at.elapsed()));
         }
         if self.update_selection_autoscroll() {
@@ -9626,7 +10090,14 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
             }
             wait = std::time::Duration::from_millis(100);
         }
-        event_loop.set_control_flow(ControlFlow::WaitUntil(std::time::Instant::now() + wait));
+        if let Some(blink_wait) = self.update_cursor_blink(now) {
+            wait = wait.min(blink_wait);
+        }
+        self.rebuild_scene_if_due(now);
+        if let Some(scene_wait) = self.scene_rebuild_wait(now) {
+            wait = wait.min(scene_wait);
+        }
+        event_loop.set_control_flow(ControlFlow::WaitUntil(now + wait));
     }
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
@@ -9636,6 +10107,7 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
             }
             UserEvent::WorkspaceMetadata(metadata) => {
                 self.metadata_refresh_in_flight = false;
+                let mut changed = false;
                 for update in metadata {
                     if let Some(workspace) = self
                         .state
@@ -9643,11 +10115,19 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                         .iter_mut()
                         .find(|workspace| workspace.id == update.id)
                     {
-                        workspace.git_branch = update.git_branch;
-                        workspace.listening_ports = update.listening_ports;
+                        if workspace.git_branch != update.git_branch {
+                            workspace.git_branch = update.git_branch;
+                            changed = true;
+                        }
+                        if workspace.listening_ports != update.listening_ports {
+                            workspace.listening_ports = update.listening_ports;
+                            changed = true;
+                        }
                     }
                 }
-                self.rebuild_scene();
+                if changed {
+                    self.rebuild_scene();
+                }
             }
         }
     }
@@ -9665,6 +10145,8 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
             WindowEvent::Ime(Ime::Disabled) => self.update_ime_preedit(""),
             WindowEvent::Focused(focused) => {
                 self.window_focused = focused;
+                self.reset_cursor_blink();
+                self.rebuild_scene();
                 if focused {
                     self.window_focus_gained_at = std::time::Instant::now();
                 } else {
@@ -9695,6 +10177,7 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                let position: LogicalPosition<f64> = position.to_logical(self.scale_factor);
                 self.cursor_position = (position.x as f32, position.y as f32);
                 self.update_palette_hover();
                 self.update_navigation_hover();
@@ -9774,15 +10257,23 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                let cell_height = self.cell_height() as f64;
                 let lines = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => -(y * 3.0) as isize,
-                    MouseScrollDelta::PixelDelta(position) => {
-                        -(position.y / self.cell_height() as f64) as isize
+                    MouseScrollDelta::LineDelta(_, y) => {
+                        self.pixel_scroll_remainder = 0.0;
+                        -(y * 3.0) as isize
                     }
+                    MouseScrollDelta::PixelDelta(position) => accumulate_pixel_scroll(
+                        &mut self.pixel_scroll_remainder,
+                        -position.y / self.scale_factor,
+                        cell_height,
+                    ),
                 };
                 if let Some((_, scroll)) = &mut self.agent_request_detail {
-                    *scroll = scroll.saturating_add_signed(lines.signum());
-                    self.rebuild_scene();
+                    if lines != 0 {
+                        *scroll = scroll.saturating_add_signed(lines.signum());
+                        self.rebuild_scene();
+                    }
                     return;
                 }
                 if self.notifications_visible
@@ -9835,7 +10326,12 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                     } else {
                         MouseButtonInput::WheelDown
                     };
+                    let has_local_scrollback = self
+                        .terminal_at_cursor()
+                        .and_then(|(_, terminal)| self.terminals.get(&terminal))
+                        .is_some_and(|runtime| runtime.snapshot.scrollback_rows > 0);
                     if self.modifiers.shift_key()
+                        || has_local_scrollback
                         || !self.send_terminal_mouse(MouseActionInput::Press, Some(button))
                     {
                         self.scroll_surface_at_cursor(lines);
@@ -9843,10 +10339,27 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                 }
             }
             WindowEvent::Resized(size) => {
-                self.window_size = size;
+                self.window_size = logical_window_size(size, self.scale_factor);
                 if let Some(renderer) = &mut self.renderer {
                     renderer.resize(size.width, size.height);
                 }
+                self.resize_terminals();
+                self.rebuild_scene();
+            }
+            WindowEvent::ScaleFactorChanged {
+                scale_factor,
+                mut inner_size_writer,
+            } => {
+                self.scale_factor = scale_factor.max(f64::EPSILON);
+                let size: PhysicalSize<u32> =
+                    LogicalSize::new(self.window_size.width, self.window_size.height)
+                        .to_physical(self.scale_factor);
+                let _ = inner_size_writer.request_inner_size(size);
+                if let Some(renderer) = &mut self.renderer {
+                    renderer.set_scale_factor(self.scale_factor);
+                    renderer.resize(size.width, size.height);
+                }
+                self.pixel_scroll_remainder = 0.0;
                 self.resize_terminals();
                 self.rebuild_scene();
             }
@@ -9892,11 +10405,15 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                 }
             }
             WindowEvent::RedrawRequested => {
-                if let Some(renderer) = &mut self.renderer
-                    && let Err(error) = renderer.render()
-                {
-                    tracing::error!(%error, "render failed");
-                    event_loop.exit();
+                if let Some(renderer) = &mut self.renderer {
+                    let started = std::time::Instant::now();
+                    let result = renderer.render();
+                    let render_duration = started.elapsed();
+                    self.observe_render_duration(render_duration);
+                    if let Err(error) = result {
+                        tracing::error!(%error, "render failed");
+                        event_loop.exit();
+                    }
                 }
             }
             _ => {}
@@ -9908,10 +10425,31 @@ fn shell_quote_path(path: &std::path::Path) -> String {
     shell_quote_command(&path.to_string_lossy())
 }
 
+fn logical_window_size(size: PhysicalSize<u32>, scale_factor: f64) -> PhysicalSize<u32> {
+    let logical: LogicalSize<f64> = size.to_logical(scale_factor.max(f64::EPSILON));
+    PhysicalSize::new(
+        logical.width.round().max(1.0) as u32,
+        logical.height.round().max(1.0) as u32,
+    )
+}
+
+fn application_socket_path() -> Option<std::path::PathBuf> {
+    let path = default_socket_path()?;
+    #[cfg(windows)]
+    {
+        let name = format!("wmcterm-{}.endpoint", std::process::id());
+        Some(path.with_file_name(name))
+    }
+    #[cfg(not(windows))]
+    {
+        Some(path)
+    }
+}
+
 fn shell_quote_command(value: &str) -> String {
     #[cfg(windows)]
     {
-        format!("\"{}\"", value.replace('"', "\\\""))
+        format!("'{}'", value.replace('\'', "''"))
     }
     #[cfg(not(windows))]
     {
@@ -9919,15 +10457,139 @@ fn shell_quote_command(value: &str) -> String {
     }
 }
 
+fn terminal_command_spec(command: Option<&str>) -> CommandSpec {
+    #[cfg(windows)]
+    {
+        let shell = env::var_os("SHELL").unwrap_or_else(|| "powershell.exe".into());
+        let name = std::path::Path::new(&shell)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        match (name.as_str(), command) {
+            ("powershell" | "pwsh", Some(command)) => {
+                CommandSpec::new(shell).args(["-NoLogo", "-Command", command])
+            }
+            ("powershell" | "pwsh", None) => CommandSpec::new(shell).args(["-NoLogo"]),
+            ("cmd", Some(command)) => CommandSpec::new(shell).args(["/D", "/S", "/C", command]),
+            ("cmd", None) => CommandSpec::new(shell).args(["/D"]),
+            (_, Some(command)) => CommandSpec::new(shell).args(["-lc", command]),
+            (_, None) => CommandSpec::new(shell),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let shell = env::var_os("SHELL").unwrap_or_else(|| "sh".into());
+        match command {
+            Some(command) => CommandSpec::new(shell).args(["-lc", command]),
+            None => CommandSpec::new(shell),
+        }
+    }
+}
+
 fn codex_teams_command() -> String {
     std::env::current_exe()
         .map(|path| {
+            #[cfg(windows)]
+            return powershell_executable_command(&path, "codex-teams");
+            #[cfg(not(windows))]
             format!(
                 "{} codex-teams",
                 shell_quote_command(&path.to_string_lossy())
             )
         })
         .unwrap_or_else(|_| "wmcterm codex-teams".into())
+}
+
+#[cfg(any(windows, test))]
+fn powershell_executable_command(path: &std::path::Path, argument: &str) -> String {
+    format!(
+        "& {} {argument}",
+        shell_quote_command(&path.to_string_lossy())
+    )
+}
+
+#[cfg(windows)]
+fn set_windows_clipboard_text(text: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use std::ptr;
+    use windows_sys::Win32::Foundation::GlobalFree;
+    use windows_sys::Win32::System::DataExchange::{
+        CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+    };
+    use windows_sys::Win32::System::Memory::{
+        GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock,
+    };
+    use windows_sys::Win32::System::Ole::CF_UNICODETEXT;
+
+    let mut opened = false;
+    for _ in 0..5 {
+        if unsafe { OpenClipboard(ptr::null_mut()) } != 0 {
+            opened = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if !opened {
+        return Err(std::io::Error::last_os_error().into());
+    }
+
+    let utf16 = text
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let byte_len = utf16.len() * std::mem::size_of::<u16>();
+    let handle = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_len) };
+    if handle.is_null() {
+        unsafe { CloseClipboard() };
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let memory = unsafe { GlobalLock(handle) }.cast::<u16>();
+    if memory.is_null() {
+        unsafe {
+            GlobalFree(handle);
+            CloseClipboard();
+        }
+        return Err(std::io::Error::last_os_error().into());
+    }
+    unsafe {
+        ptr::copy_nonoverlapping(utf16.as_ptr(), memory, utf16.len());
+        GlobalUnlock(handle);
+    }
+    let stored = unsafe {
+        EmptyClipboard();
+        SetClipboardData(CF_UNICODETEXT as u32, handle)
+    };
+    unsafe { CloseClipboard() };
+    if stored.is_null() {
+        unsafe { GlobalFree(handle) };
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+const MAX_SCREEN_READ_LINES: usize = 100_000;
+
+fn optional_screen_lines(params: &Value) -> Result<Option<usize>, String> {
+    match params.get("lines") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => {
+            let lines = value
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .ok_or_else(|| "params.lines must be a positive integer".to_owned())?;
+            if lines == 0 || lines > MAX_SCREEN_READ_LINES {
+                return Err(format!(
+                    "params.lines must be between 1 and {MAX_SCREEN_READ_LINES}"
+                ));
+            }
+            Ok(Some(lines))
+        }
+    }
+}
+
+fn tail_lines(text: &str, maximum: usize) -> String {
+    let lines = text.lines().collect::<Vec<_>>();
+    lines[lines.len().saturating_sub(maximum)..].join("\n")
 }
 
 fn optional_uuid_param(params: &Value, name: &str) -> Result<Option<uuid::Uuid>, String> {
@@ -10133,7 +10795,7 @@ fn resolve_existing_directory(
     if !resolved.is_dir() {
         return Err(format!("{} is not a directory", resolved.display()));
     }
-    Ok(resolved)
+    Ok(wmcterm_config::normalize_windows_path(resolved))
 }
 
 fn select_new_workspace_cwd(
@@ -10699,6 +11361,43 @@ const fn theme_rgba(color: ThemeColor) -> [u8; 4] {
     [color.r, color.g, color.b, color.a]
 }
 
+fn background_opacity(mut color: [u8; 4], opacity: f32) -> [u8; 4] {
+    color[3] = (color[3] as f32 * opacity.clamp(0.0, 1.0)).round() as u8;
+    color
+}
+
+fn push_terminal_span(
+    spans: &mut Vec<TextSpan>,
+    text: &str,
+    color: [u8; 4],
+    bold: bool,
+    italic: bool,
+) {
+    if let Some(last) = spans.last_mut()
+        && last.color == color
+        && last.bold == bold
+        && last.italic == italic
+    {
+        last.text.push_str(text);
+    } else {
+        spans.push(TextSpan {
+            text: text.to_owned(),
+            color,
+            bold,
+            italic,
+        });
+    }
+}
+
+const fn brighten_rgba([red, green, blue, alpha]: [u8; 4], amount: u8) -> [u8; 4] {
+    [
+        red.saturating_add(amount),
+        green.saturating_add(amount),
+        blue.saturating_add(amount),
+        alpha,
+    ]
+}
+
 fn terminal_theme(theme: &ThemeConfig) -> TerminalTheme {
     let rgb = |color: ThemeColor| Rgb {
         r: color.r,
@@ -10937,6 +11636,29 @@ fn application_requires_close_confirmation(
     pending_request_count: usize,
 ) -> bool {
     process_count > 0 || pending_request_count > 0
+}
+
+fn confirmation_cursor_icon(cancel: ui::Bounds, confirm: ui::Bounds, x: f32, y: f32) -> CursorIcon {
+    if confirmation_hover(cancel, confirm, x, y).is_some() {
+        CursorIcon::Pointer
+    } else {
+        CursorIcon::Default
+    }
+}
+
+fn confirmation_hover(
+    cancel: ui::Bounds,
+    confirm: ui::Bounds,
+    x: f32,
+    y: f32,
+) -> Option<NavigationHover> {
+    if cancel.contains(x, y) {
+        Some(NavigationHover::ConfirmationCancel)
+    } else if confirm.contains(x, y) {
+        Some(NavigationHover::ConfirmationConfirm)
+    } else {
+        None
+    }
 }
 
 fn agent_state_priority(state: wmcterm_core::AgentState) -> u8 {
@@ -11274,8 +11996,59 @@ fn selection_autoscroll_lines(
 }
 
 fn selection_redraw_due(previous: Option<std::time::Instant>, now: std::time::Instant) -> bool {
-    const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
-    previous.is_none_or(|previous| now.saturating_duration_since(previous) >= FRAME_INTERVAL)
+    frame_rebuild_due(previous, now)
+}
+
+fn frame_rebuild_due(previous: Option<std::time::Instant>, now: std::time::Instant) -> bool {
+    frame_rebuild_due_with_interval(previous, now, FRAME_INTERVAL)
+}
+
+fn frame_rebuild_due_with_interval(
+    previous: Option<std::time::Instant>,
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) -> bool {
+    previous.is_none_or(|previous| now.saturating_duration_since(previous) >= interval)
+}
+
+fn adaptive_frame_interval(work: std::time::Duration) -> std::time::Duration {
+    work.saturating_mul(2)
+        .clamp(FRAME_INTERVAL, MAX_FRAME_INTERVAL)
+}
+
+fn smooth_frame_work(
+    previous: std::time::Duration,
+    observed: std::time::Duration,
+) -> std::time::Duration {
+    if previous.is_zero() {
+        observed
+    } else {
+        previous.saturating_mul(3) / 4 + observed / 4
+    }
+}
+
+fn accumulate_pixel_scroll(remainder: &mut f64, delta: f64, cell_height: f64) -> isize {
+    *remainder += delta;
+    let lines = (*remainder / cell_height.max(1.0)).trunc() as isize;
+    *remainder -= lines as f64 * cell_height.max(1.0);
+    lines
+}
+
+fn advance_cursor_blink(
+    visible: &mut bool,
+    last_toggle: &mut std::time::Instant,
+    now: std::time::Instant,
+) -> bool {
+    let elapsed = now.saturating_duration_since(*last_toggle);
+    if elapsed < CURSOR_BLINK_INTERVAL {
+        return false;
+    }
+    let intervals = (elapsed.as_millis() / CURSOR_BLINK_INTERVAL.as_millis()).max(1);
+    if intervals % 2 == 1 {
+        *visible = !*visible;
+    }
+    *last_toggle += CURSOR_BLINK_INTERVAL * intervals as u32;
+    intervals % 2 == 1
 }
 
 fn notification_arrives_read(
@@ -11327,15 +12100,7 @@ fn spawn_event_bridge(
         .spawn(move || {
             while let Ok(event) = events.recv() {
                 let mut queue = pending.lock().expect("PTY event queue poisoned");
-                if matches!(&event, SessionEvent::Snapshot(_))
-                    && let Some(previous) = queue.back_mut()
-                    && previous.terminal == terminal
-                    && matches!(&previous.event, SessionEvent::Snapshot(_))
-                {
-                    previous.event = event;
-                } else {
-                    queue.push_back(TaggedEvent { terminal, event });
-                }
+                enqueue_terminal_event(&mut queue, terminal, event);
                 drop(queue);
                 if !wake_pending.swap(true, Ordering::AcqRel) {
                     let _ = proxy.send_event(UserEvent::TerminalWake);
@@ -11343,6 +12108,24 @@ fn spawn_event_bridge(
             }
         })
         .expect("failed to spawn terminal event bridge");
+}
+
+fn enqueue_terminal_event(
+    queue: &mut VecDeque<TaggedEvent>,
+    terminal: TerminalId,
+    event: SessionEvent,
+) {
+    if matches!(&event, SessionEvent::Snapshot(_))
+        && let Some(previous) = queue
+            .iter_mut()
+            .rev()
+            .find(|previous| previous.terminal == terminal)
+        && matches!(&previous.event, SessionEvent::Snapshot(_))
+    {
+        previous.event = event;
+    } else {
+        queue.push_back(TaggedEvent { terminal, event });
+    }
 }
 
 fn effective_agent_lifecycle(
@@ -11778,6 +12561,10 @@ fn notification_overlay_press(
     }
 }
 
+fn notification_toggle_press(visible: bool, toggle_button_hit: bool) -> bool {
+    visible && toggle_button_hit
+}
+
 fn titlebar_double_click(
     previous: std::time::Instant,
     previous_position: (f32, f32),
@@ -11864,11 +12651,63 @@ fn word_cell_bounds(row: &[CellSnapshot], clicked: usize) -> Option<(usize, usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn screen_read_line_limit_returns_the_tail_without_changing_terminal_state() {
+        assert_eq!(tail_lines("one\ntwo\nthree", 2), "two\nthree");
+        assert_eq!(tail_lines("中文\n🙂", 10), "中文\n🙂");
+        assert_eq!(optional_screen_lines(&json!({"lines": 2})), Ok(Some(2)));
+        assert!(optional_screen_lines(&json!({"lines": 0})).is_err());
+    }
     use wmcterm_core::AgentState;
 
     #[test]
     fn bundled_application_icon_decodes_for_winit() {
         assert!(application_icon().is_some());
+    }
+
+    #[test]
+    fn windows_install_directory_is_replaced_by_user_profile() {
+        let install = Path::new(r"C:\Program Files\wmcterm");
+        let profile = Path::new(r"C:\Users\wangxh");
+        assert_eq!(
+            safe_windows_startup_cwd(
+                PathBuf::from(r"c:/program files/wmcterm/"),
+                Some(install),
+                Some(profile),
+            ),
+            profile
+        );
+        assert_eq!(
+            safe_windows_startup_cwd(
+                PathBuf::from(r"D:\code\wmcterm"),
+                Some(install),
+                Some(profile),
+            ),
+            PathBuf::from(r"D:\code\wmcterm")
+        );
+    }
+
+    #[test]
+    fn wide_terminal_glyphs_are_centered_and_use_a_wide_cursor() {
+        assert_eq!(terminal_text_cell_width("a"), 1);
+        assert_eq!(terminal_text_cell_width("汉"), 2);
+        assert_eq!(wide_glyph_center_offset("a", 9.6, 16.0), 0.0);
+        assert!((wide_glyph_center_offset("汉", 9.6, 16.0) - 1.6).abs() < 0.001);
+
+        let row = vec![
+            selection_cell("汉"),
+            selection_cell(""),
+            selection_cell("a"),
+        ];
+        assert_eq!(wide_cell_lead(&row, 0), 0);
+        assert_eq!(wide_cell_lead(&row, 1), 0);
+        assert_eq!(wide_cell_end(&row, 0), 1);
+        assert_eq!(wide_cell_end(&row, 2), 2);
+        assert!(needs_grid_positioned_glyph("❯"));
+        assert!(needs_grid_positioned_glyph("汉"));
+        assert!(!needs_grid_positioned_glyph(">"));
+        assert!(!needs_grid_positioned_glyph("a"));
     }
 
     #[test]
@@ -11978,6 +12817,9 @@ mod tests {
             notification_overlay_press(false, panel, 100.0, 100.0),
             NotificationOverlayPress::Inactive
         );
+        assert!(notification_toggle_press(true, true));
+        assert!(!notification_toggle_press(true, false));
+        assert!(!notification_toggle_press(false, true));
     }
 
     #[test]
@@ -12392,6 +13234,13 @@ mod tests {
     #[test]
     fn integrated_codex_launcher_uses_the_subagent_pane_bridge() {
         assert!(codex_teams_command().ends_with(" codex-teams"));
+        assert_eq!(
+            powershell_executable_command(
+                std::path::Path::new(r"C:\Program Files\wmcterm\wmcterm.exe"),
+                "codex-teams",
+            ),
+            r"& 'C:\Program Files\wmcterm\wmcterm.exe' codex-teams"
+        );
     }
 
     #[test]
@@ -12475,12 +13324,113 @@ mod tests {
         assert!(selection_redraw_due(None, start));
         assert!(!selection_redraw_due(
             Some(start),
-            start + std::time::Duration::from_millis(15)
+            start + std::time::Duration::from_millis(16)
         ));
         assert!(selection_redraw_due(
             Some(start),
-            start + std::time::Duration::from_millis(16)
+            start + std::time::Duration::from_millis(17)
         ));
+    }
+
+    #[test]
+    fn expensive_frames_are_throttled_but_remain_responsive() {
+        assert_eq!(
+            adaptive_frame_interval(std::time::Duration::ZERO),
+            FRAME_INTERVAL
+        );
+        assert_eq!(
+            adaptive_frame_interval(std::time::Duration::from_millis(20)),
+            std::time::Duration::from_millis(40)
+        );
+        assert_eq!(
+            adaptive_frame_interval(std::time::Duration::from_millis(40)),
+            MAX_FRAME_INTERVAL
+        );
+    }
+
+    #[test]
+    fn frame_work_estimate_smooths_transient_spikes() {
+        assert_eq!(
+            smooth_frame_work(
+                std::time::Duration::from_millis(8),
+                std::time::Duration::from_millis(24)
+            ),
+            std::time::Duration::from_millis(12)
+        );
+        assert_eq!(
+            smooth_frame_work(
+                std::time::Duration::ZERO,
+                std::time::Duration::from_millis(7)
+            ),
+            std::time::Duration::from_millis(7)
+        );
+    }
+
+    #[test]
+    fn pixel_scroll_accumulates_sub_cell_touchpad_motion() {
+        let mut remainder = 0.0;
+        assert_eq!(accumulate_pixel_scroll(&mut remainder, 4.0, 20.0), 0);
+        assert_eq!(accumulate_pixel_scroll(&mut remainder, 9.0, 20.0), 0);
+        assert_eq!(accumulate_pixel_scroll(&mut remainder, 8.0, 20.0), 1);
+        assert_eq!(remainder, 1.0);
+        assert_eq!(accumulate_pixel_scroll(&mut remainder, -22.0, 20.0), -1);
+        assert_eq!(remainder, -1.0);
+    }
+
+    #[test]
+    fn cursor_blink_uses_elapsed_half_periods() {
+        let start = std::time::Instant::now();
+        let mut last = start;
+        let mut visible = true;
+        assert!(!advance_cursor_blink(
+            &mut visible,
+            &mut last,
+            start + std::time::Duration::from_millis(499)
+        ));
+        assert!(advance_cursor_blink(
+            &mut visible,
+            &mut last,
+            start + std::time::Duration::from_millis(500)
+        ));
+        assert!(!visible);
+        assert!(!advance_cursor_blink(
+            &mut visible,
+            &mut last,
+            start + std::time::Duration::from_millis(1_500)
+        ));
+        assert!(!visible);
+        assert_eq!(last, start + std::time::Duration::from_millis(1_500));
+    }
+
+    #[test]
+    fn logical_window_dimensions_follow_scale_factor() {
+        assert_eq!(
+            logical_window_size(PhysicalSize::new(1500, 975), 1.5),
+            PhysicalSize::new(1000, 650)
+        );
+    }
+
+    #[test]
+    fn background_opacity_scales_alpha_without_dimming_rgb() {
+        assert_eq!(
+            background_opacity([10, 20, 30, 200], 0.5),
+            [10, 20, 30, 100]
+        );
+        assert_eq!(
+            background_opacity([10, 20, 30, 200], 2.0),
+            [10, 20, 30, 200]
+        );
+    }
+
+    #[test]
+    fn adjacent_terminal_cells_with_the_same_style_share_a_span() {
+        let mut spans = Vec::new();
+        push_terminal_span(&mut spans, "a", [1, 2, 3, 255], false, false);
+        push_terminal_span(&mut spans, "b", [1, 2, 3, 255], false, false);
+        push_terminal_span(&mut spans, "c", [1, 2, 3, 255], true, false);
+        assert_eq!(spans.len(), 2);
+        assert_eq!(spans[0].text, "ab");
+        assert_eq!(spans[1].text, "c");
     }
 
     #[test]
@@ -12778,6 +13728,48 @@ mod tests {
         assert!(!application_requires_close_confirmation(0, 0));
         assert!(application_requires_close_confirmation(1, 0));
         assert!(application_requires_close_confirmation(0, 1));
+    }
+
+    #[test]
+    fn close_confirmation_cursor_only_points_at_its_buttons() {
+        let cancel = ui::Bounds {
+            x: 10.0,
+            y: 20.0,
+            width: 100.0,
+            height: 30.0,
+        };
+        let confirm = ui::Bounds {
+            x: 120.0,
+            y: 20.0,
+            width: 100.0,
+            height: 30.0,
+        };
+
+        assert_eq!(
+            confirmation_cursor_icon(cancel, confirm, 15.0, 25.0),
+            CursorIcon::Pointer
+        );
+        assert_eq!(
+            confirmation_cursor_icon(cancel, confirm, 125.0, 25.0),
+            CursorIcon::Pointer
+        );
+        assert_eq!(
+            confirmation_cursor_icon(cancel, confirm, 115.0, 25.0),
+            CursorIcon::Default
+        );
+        assert_eq!(
+            confirmation_hover(cancel, confirm, 15.0, 25.0),
+            Some(NavigationHover::ConfirmationCancel)
+        );
+        assert_eq!(
+            confirmation_hover(cancel, confirm, 125.0, 25.0),
+            Some(NavigationHover::ConfirmationConfirm)
+        );
+        assert_eq!(confirmation_hover(cancel, confirm, 115.0, 25.0), None);
+        assert_eq!(
+            brighten_rgba([240, 250, 255, 128], 28),
+            [255, 255, 255, 128]
+        );
     }
 
     #[test]

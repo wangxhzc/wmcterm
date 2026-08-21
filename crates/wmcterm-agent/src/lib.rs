@@ -1189,7 +1189,7 @@ pub fn hook_install_plan(agent: AgentKind, wmcterm_binary: impl Into<String>) ->
         "--agent".into(),
         agent.to_string(),
     ];
-    let command = shell_command(&receiver_command);
+    let command = agent_shell_command(agent, &receiver_command);
     let (relative_path, format, content) = match agent {
         AgentKind::Claude => (
             Some("settings.json".into()),
@@ -1288,7 +1288,7 @@ fn json_hook_fragment(
     permission_allow: &[&str],
 ) -> String {
     let hooks = events.iter().map(|event| {
-        let event_command = format!("{command} --event {}", shell_command(&[(*event).into()]));
+        let event_command = format!("{command} --event {event}");
         let command_hook = serde_json::json!({ "type": "command", "command": event_command });
         let entries = if nested_hooks {
             serde_json::json!([{ "hooks": [command_hook] }])
@@ -1306,7 +1306,34 @@ fn json_hook_fragment(
         .expect("hook fragment only contains serializable JSON values")
 }
 
-fn shell_command(arguments: &[String]) -> String {
+fn agent_shell_command(agent: AgentKind, arguments: &[String]) -> String {
+    #[cfg(windows)]
+    {
+        return windows_agent_hook_command(agent, arguments);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = agent;
+        arguments
+            .iter()
+            .map(|argument| shell_argument(argument))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_agent_hook_command(agent: AgentKind, arguments: &[String]) -> String {
+    let command = windows_hook_command(arguments);
+    if matches!(agent, AgentKind::Codex) {
+        format!("& {command}")
+    } else {
+        command
+    }
+}
+
+#[cfg(any(windows, test))]
+fn windows_hook_command(arguments: &[String]) -> String {
     arguments
         .iter()
         .map(|argument| {
@@ -1316,11 +1343,46 @@ fn shell_command(arguments: &[String]) -> String {
             {
                 argument.clone()
             } else {
-                format!("'{}'", argument.replace('\'', "'\\''"))
+                windows_shell_argument(argument)
             }
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(not(windows))]
+fn shell_argument(argument: &str) -> String {
+    if argument
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || "-_./".contains(character))
+    {
+        return argument.to_owned();
+    }
+    format!("'{}'", argument.replace('\'', "'\\''"))
+}
+
+#[cfg(any(windows, test))]
+fn windows_shell_argument(argument: &str) -> String {
+    let mut quoted = String::from("\"");
+    let mut backslashes = 0;
+    for character in argument.chars() {
+        match character {
+            '\\' => backslashes += 1,
+            '"' => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes * 2 + 1));
+                quoted.push('"');
+                backslashes = 0;
+            }
+            _ => {
+                quoted.extend(std::iter::repeat_n('\\', backslashes));
+                backslashes = 0;
+                quoted.push(character);
+            }
+        }
+    }
+    quoted.extend(std::iter::repeat_n('\\', backslashes * 2));
+    quoted.push('"');
+    quoted
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2133,5 +2195,40 @@ mod tests {
         let codex_json: Value = serde_json::from_str(&codex.snippets[0].content).unwrap();
         assert!(codex_json["hooks"]["PermissionRequest"].is_array());
         assert!(codex_json["hooks"]["Stop"].is_array());
+    }
+
+    #[test]
+    fn windows_hook_command_quotes_installed_paths_for_create_process() {
+        assert_eq!(
+            windows_shell_argument(r#"C:\Program Files\wmcterm\wmcterm.exe"#),
+            r#""C:\Program Files\wmcterm\wmcterm.exe""#
+        );
+        assert_eq!(
+            windows_shell_argument(r#"C:\tools\wmc"term\"#),
+            r#""C:\tools\wmc\"term\\""#
+        );
+    }
+
+    #[test]
+    fn windows_hook_command_is_bash_compatible_and_does_not_quote_event_as_a_command() {
+        let arguments = [
+            r"C:\Program Files\wmcterm\wmcterm.exe".to_owned(),
+            "hook".to_owned(),
+            "receive".to_owned(),
+            "--event".to_owned(),
+            "SessionStart".to_owned(),
+        ];
+        assert_eq!(
+            windows_hook_command(&arguments),
+            r#""C:\Program Files\wmcterm\wmcterm.exe" hook receive --event SessionStart"#
+        );
+        assert_eq!(
+            windows_agent_hook_command(AgentKind::Codex, &arguments),
+            r#"& "C:\Program Files\wmcterm\wmcterm.exe" hook receive --event SessionStart"#
+        );
+        assert_eq!(
+            windows_agent_hook_command(AgentKind::Claude, &arguments),
+            r#""C:\Program Files\wmcterm\wmcterm.exe" hook receive --event SessionStart"#
+        );
     }
 }

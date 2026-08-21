@@ -569,30 +569,49 @@ pub use unix::{UnixServer, call, notify};
 
 #[cfg(windows)]
 mod windows {
+    use std::fs;
     use std::io::{BufRead, BufReader, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::Path;
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::thread::{self, JoinHandle};
 
     use super::{IpcError, Request, Response};
-    const ADDRESS: &str = "127.0.0.1:49497";
 
     pub struct Server {
         stop: Arc<AtomicBool>,
         worker: Option<JoinHandle<()>>,
+        endpoint_path: PathBuf,
+        discovery_path: Option<PathBuf>,
+        address: String,
+        token: String,
     }
     impl Server {
-        pub fn spawn<F>(_path: &Path, handler: F) -> Result<Self, IpcError>
+        pub fn spawn<F>(path: &Path, handler: F) -> Result<Self, IpcError>
         where
             F: Fn(Request) -> Response + Send + Sync + 'static,
         {
-            let listener = TcpListener::bind(ADDRESS)?;
+            let listener = TcpListener::bind("127.0.0.1:0")?;
+            let address = listener.local_addr()?.to_string();
+            let token = uuid::Uuid::new_v4().to_string();
             listener.set_nonblocking(true)?;
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::write(path, format!("{address} {token}\n"))?;
+            let discovery_path = super::default_socket_path().filter(|value| value != path);
+            if let Some(discovery) = &discovery_path {
+                if let Some(parent) = discovery.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(discovery, format!("{address} {token}\n"))?;
+            }
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = Arc::clone(&stop);
             let handler = Arc::new(handler);
+            let expected_token = token.clone();
             let worker = thread::Builder::new()
                 .name("wmcterm-ipc".into())
                 .spawn(move || {
@@ -600,7 +619,14 @@ mod windows {
                         match listener.accept() {
                             Ok((mut stream, _)) => {
                                 let mut line = String::new();
-                                if BufReader::new(&stream).read_line(&mut line).is_ok() {
+                                let mut reader = BufReader::new(&stream);
+                                if reader.read_line(&mut line).is_err()
+                                    || line.trim() != expected_token
+                                {
+                                    continue;
+                                }
+                                line.clear();
+                                if reader.read_line(&mut line).is_ok() {
                                     let response = serde_json::from_str::<Request>(&line)
                                         .map(|request| handler(request))
                                         .unwrap_or_else(|error| {
@@ -625,6 +651,10 @@ mod windows {
             Ok(Self {
                 stop,
                 worker: Some(worker),
+                endpoint_path: path.to_path_buf(),
+                discovery_path,
+                address,
+                token,
             })
         }
     }
@@ -634,10 +664,31 @@ mod windows {
             if let Some(worker) = self.worker.take() {
                 let _ = worker.join();
             }
+            if fs::read_to_string(&self.endpoint_path)
+                .ok()
+                .is_some_and(|value| value.trim() == format!("{} {}", self.address, self.token))
+            {
+                let _ = fs::remove_file(&self.endpoint_path);
+            }
+            if let Some(path) = &self.discovery_path
+                && fs::read_to_string(path)
+                    .ok()
+                    .is_some_and(|value| value.trim() == format!("{} {}", self.address, self.token))
+            {
+                let _ = fs::remove_file(path);
+            }
         }
     }
-    pub fn call(_path: &Path, request: &Request) -> Result<Response, IpcError> {
-        let mut stream = TcpStream::connect(ADDRESS)?;
+    fn connect(path: &Path) -> Result<(TcpStream, String), IpcError> {
+        let endpoint = fs::read_to_string(path)?;
+        let (address, token) = endpoint.trim().split_once(' ').ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid wmcterm endpoint")
+        })?;
+        Ok((TcpStream::connect(address)?, token.to_owned()))
+    }
+    pub fn call(path: &Path, request: &Request) -> Result<Response, IpcError> {
+        let (mut stream, token) = connect(path)?;
+        writeln!(stream, "{token}")?;
         serde_json::to_writer(&mut stream, request)?;
         stream.write_all(b"\n")?;
         let mut line = String::new();
@@ -645,8 +696,9 @@ mod windows {
         Ok(serde_json::from_str(&line)?)
     }
 
-    pub fn notify(_path: &Path, request: &Request) -> Result<(), IpcError> {
-        let mut stream = TcpStream::connect(ADDRESS)?;
+    pub fn notify(path: &Path, request: &Request) -> Result<(), IpcError> {
+        let (mut stream, token) = connect(path)?;
+        writeln!(stream, "{token}")?;
         serde_json::to_writer(&mut stream, request)?;
         stream.write_all(b"\n")?;
         stream.flush()?;

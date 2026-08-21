@@ -3438,6 +3438,7 @@ dependencies = [
  "tracing",
  "unicode-width",
  "uuid",
+ "windows-sys 0.61.2",
  "winit",
  "wmcterm-agent",
  "wmcterm-config",
@@ -3499,6 +3500,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "uuid",
  "wmcterm-agent",
  "wmcterm-core",
 ]
@@ -3511,6 +3513,7 @@ dependencies = [
  "flume",
  "portable-pty",
  "thiserror 2.0.20",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

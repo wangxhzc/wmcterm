@@ -1924,6 +1924,10 @@ Plugin Marketplace
   消费不可变快照并合并唤醒，避免 UI 线程直接读写 VT 状态。
 - Linux/macOS/Windows 进程抽象由 `portable-pty` 提供，终端解析和输入编码由
   `libghostty-vt` 提供；渲染由 `wgpu` 矩形和 `glyphon` 字形管线完成。
+- Windows 最低运行环境是 Windows 10 1809（build 17763），同时支持 Windows 11；
+  安装器和程序入口均拒绝更旧系统。Windows 默认启动系统内置的 Windows
+  PowerShell 5.1（`powershell.exe`），只有用户显式配置时才使用 PowerShell 7
+ （`pwsh.exe`）或其他 shell。
 - Terminal 支持主/备用屏、scrollback、ANSI/SGR 颜色、鼠标协议、选择、搜索、
   Unicode 宽度、CJK/emoji/组合字符以及主题颜色查询；拖选越过内容区上下边界时
   会连续滚动，越界距离决定滚动速度，回到内容区或松开鼠标后立即停止。
@@ -1958,7 +1962,7 @@ Plugin Marketplace
 ## 33.3 CLI、IPC 与 Agent 控制面
 
 - 本地控制面使用 JSON-RPC，协议能力由 `wmcterm capabilities` 自描述；当前
-  协议版本为 2。
+  协议版本为 3。
 - CLI/RPC 覆盖 workspace、pane、surface、screen、terminal、notification、
   Agent request/approval、配置、Hook、Skill 和远程命令入口。
 - wmcterm 创建的终端导出 `WMCTERM_WORKSPACE_ID`、`WMCTERM_PANE_ID`、
@@ -1966,6 +1970,11 @@ Plugin Marketplace
   显式目标优先于 UI 焦点；`--no-focus` 创建不会偷取调用者焦点。
 - `wmcterm send` 使用 bracketed-paste 协议传送普通或长文本；Enter 等独立按键
   由 `wmcterm send-key` 编码，避免粘贴文本和控制键语义混淆。
+- `wmcterm send-line` 在 terminal actor 内把 bracketed paste 与 Enter 合并成单个
+  有序命令，避免 Agent 在两次 RPC 之间留下半输入状态。`screen.read` 返回单调
+  revision、光标和 viewport 元数据，并可通过 `--scrollback --lines N` 从 actor
+  导出有界历史而不改变用户当前滚动位置。`screen wait` 在 CLI 侧轮询 revision
+  或目标文本，不阻塞 winit UI 线程和 PTY/VT actor。
 - 普通通知与可操作授权请求是两条数据通道。“全部已读”只改变普通通知的未读
   状态，不删除通知，也不解决或隐藏 Agent 请求。
 - Agent 授权采用有界、可过期、幂等且 fail-closed 的请求/回复通道。请求绑定
@@ -2005,6 +2014,11 @@ Plugin Marketplace
   Agent resume ID；不会序列化 PTY 进程内存，恢复时重新启动对应命令。
 - 仓库包含 Linux x86_64 Debian 与 Windows x86_64 NSIS 打包脚本、桌面入口、
   应用图标，以及作为默认字体随包分发的 Maple Mono Normal NF（含 OFL 许可）。
+  Windows 安装器检查 build 17763 门槛、注册 App Paths，并维护系统 `PATH`；
+  Windows 本地控制传输为写入端点文件的动态 loopback 地址，不占用固定端口。
+  安装包同时提供 GUI subsystem 的 `wmcterm-gui.exe` 轻量启动器；桌面/开始菜单
+  快捷方式经该启动器以无控制台模式启动 `wmcterm.exe gui`，而主 EXE 保留 CUI
+  subsystem，保证 CLI 与 Agent Hook 的标准输入输出可用。
 - Agent Skill 的唯一源码位于 `integrations/skills/wmcterm/SKILL.md`，Hook
   协议、事件清单与配置片段生成器位于 `crates/wmcterm-agent`。`.agents`、
   `.codex` 和 `.claude` 下的 wmcterm 文件只是安装/发现目标，不作为源码维护；
@@ -2189,3 +2203,32 @@ Enter、收到 ToolUse/Activity 或明确的运行状态观测后才进入 `Runn
 
 生命周期 `Running` 仅表示 Codex/Claude 进程仍存活，不能直接聚合为工作区“运行中”。
 新打开 Agent 并停在输入框时工作区显示空闲，避免把等待首次输入误报为正在执行任务。
+
+## 33.11 性能与显示修复：cmux 参考边界
+
+修复状态（2026-08-21）：高频终端快照只标记 scene dirty，UI 合并唤醒并在
+60 Hz 上限内消费最新状态。每个终端的待处理队列只保留最新快照；隐藏工作区、
+非活动标签页的快照继续更新 RPC revision，但不再使可见 scene 失效。渲染器按
+文字块复用 glyphon 排版结果，并根据最近的 scene 构建与提交耗时在 60–20 FPS
+之间自适应留出事件处理余量。闪烁光标每 0.5 秒切换显隐；触控板精确滚动保留
+不足一行的余量，不再丢失小幅输入。布局、输入命中和终端行列使用
+winit 逻辑坐标，wgpu surface 与字形渲染使用当前 DPI 换算的物理像素。
+`window.opacity` 同时作用于背景 alpha 和透明窗口合成；工作区 Git 分支、
+端口等元数据只在可见值变化时使 scene 失效。
+
+`example-cmux` 中的实现适合校验产品语义，但不适合直接移植：
+
+- `TerminalCursorBlinkState` 将 0.5 秒半周期、单调时间与“只在可见性
+  变化时失效”分离，wmcterm 采用这一可测试状态机原则。
+- `GhosttyTerminalScrollBoost` 区分精确、手势与惯性滚动，但其 AppKit 特有的
+  2 倍 boost 不是跨平台契约；wmcterm 保留 winit delta 语义并累计小数行余量。
+- `GhosttyTerminalView` 的 backing scale 处理证明了“逻辑布局、物理渲染”的
+  边界；其最新值覆盖、单次异步 flush 也适合作为渲染失效原则。
+- `RenderedFrameDeliveryCoordinator` 与 `RenderPumpGate` 的 demand gate、
+  `bufferingNewest(1)` 和 clean→dirty 边沿唤醒适合映射为 wmcterm 的可见性门控、
+  每终端最新快照与空闲零轮询；Swift actor/Metal 提交代码本身不直接移植。
+
+cmux 依赖 Swift/AppKit 事件、`NSView`/`CAMetalLayer` 生命周期和
+GhosttyKit 的 surface/renderer；wmcterm 需要在 Linux、macOS 和 Windows 上共用
+Rust actor、winit 事件循环、wgpu surface 和 glyphon 缓存。因此只借鉴上述时序、
+坐标和失效原则，不引入 AppKit/CAMetalLayer/GhosttyKit 适配层。

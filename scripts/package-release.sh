@@ -54,7 +54,8 @@ echo "Building Windows x86_64 release binary"
 # MinGW link directive searches for libghostty-vt.a. `cargo check` builds the
 # archive without reaching the final link; expose the same archive under the
 # GNU name until the upstream crate fixes its Windows-GNU link metadata.
-cargo check --release --target x86_64-pc-windows-gnu --bin wmcterm
+cargo check --release --target x86_64-pc-windows-gnu \
+    --bin wmcterm --bin wmcterm-gui
 ghostty_archive="$(find target/x86_64-pc-windows-gnu/release/build \
     -path '*/ghostty-install/lib/ghostty-vt-static.lib' -print -quit)"
 if [ -z "$ghostty_archive" ]; then
@@ -63,12 +64,15 @@ if [ -z "$ghostty_archive" ]; then
 fi
 install -m 0644 "$ghostty_archive" "$windows_lib_dir/libghostty-vt.a"
 RUSTFLAGS="-L native=$windows_lib_dir ${RUSTFLAGS:-}" \
-    cargo build --release --target x86_64-pc-windows-gnu --bin wmcterm
+    cargo build --release --target x86_64-pc-windows-gnu \
+        --bin wmcterm --bin wmcterm-gui
 x86_64-w64-mingw32-strip target/x86_64-pc-windows-gnu/release/wmcterm.exe
+x86_64-w64-mingw32-strip target/x86_64-pc-windows-gnu/release/wmcterm-gui.exe
 
 makensis \
     -DVERSION="$version" \
     -DSOURCE_EXE="$project_root/target/x86_64-pc-windows-gnu/release/wmcterm.exe" \
+    -DSOURCE_GUI_EXE="$project_root/target/x86_64-pc-windows-gnu/release/wmcterm-gui.exe" \
     -DPRODUCT_ICON="$project_root/assets/icons/icon.ico" \
     -DOUTPUT_FILE="$dist_dir/wmcterm-${version}-windows-x86_64-setup.exe" \
     packaging/windows/wmcterm.nsi

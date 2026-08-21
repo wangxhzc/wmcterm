@@ -19,6 +19,7 @@ use wmcterm_terminal::{TerminalEngine, TerminalSize};
 const WMCTERM_SKILL: &str = include_str!("../integrations/skills/wmcterm/SKILL.md");
 
 fn main() -> Result<()> {
+    ensure_supported_windows()?;
     let mode = env::args().nth(1);
     if matches!(mode.as_deref(), Some("-h" | "--help" | "help")) {
         print_help();
@@ -50,6 +51,7 @@ fn main() -> Result<()> {
                 | "surface"
                 | "screen"
                 | "send"
+                | "send-line"
                 | "send-key"
                 | "notify"
                 | "agent-event"
@@ -85,6 +87,48 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn ensure_supported_windows() -> Result<()> {
+    #[repr(C)]
+    struct OsVersionInfo {
+        size: u32,
+        major: u32,
+        minor: u32,
+        build: u32,
+        platform: u32,
+        service_pack: [u16; 128],
+    }
+    #[link(name = "ntdll")]
+    unsafe extern "system" {
+        fn RtlGetVersion(version: *mut OsVersionInfo) -> i32;
+    }
+    let mut version = OsVersionInfo {
+        size: std::mem::size_of::<OsVersionInfo>() as u32,
+        major: 0,
+        minor: 0,
+        build: 0,
+        platform: 0,
+        service_pack: [0; 128],
+    };
+    // SAFETY: RtlGetVersion writes the initialized, correctly sized structure
+    // synchronously and retains no pointer.
+    let status = unsafe { RtlGetVersion(&mut version) };
+    if status != 0 || !windows_version_supported(version.major, version.build) {
+        bail!("wmcterm requires Windows 10 version 1809 (build 17763) or later");
+    }
+    Ok(())
+}
+
+#[cfg(any(windows, test))]
+fn windows_version_supported(major: u32, build: u32) -> bool {
+    major > 10 || (major == 10 && build >= 17_763)
+}
+
+#[cfg(not(windows))]
+fn ensure_supported_windows() -> Result<()> {
+    Ok(())
+}
+
 fn print_help() {
     println!(
         "wmcterm - GPU terminal workspace\n\
@@ -98,8 +142,10 @@ fn print_help() {
          \x20 wmcterm surface markdown|logs PATH [--workspace ID|--pane ID|--surface ID] [--no-focus]\n\
          \x20 wmcterm surface close [ID] | close-others [--anchor ID]\n\
          \x20 wmcterm send [--surface ID] TEXT...\n\
+         \x20 wmcterm send-line [--surface ID] TEXT...\n\
          \x20 wmcterm send-key KEY [--surface ID]\n\
-         \x20 wmcterm screen read [--surface ID]\n\
+         \x20 wmcterm screen read [--surface ID] [--scrollback] [--lines N]\n\
+         \x20 wmcterm screen wait [--surface ID] (--until TEXT|--change|--revision N) [--timeout DURATION]\n\
          \x20 wmcterm terminal search|clear|scroll ...\n\
          \x20 wmcterm notification list|mark ID [--unread]\n\
          \x20 wmcterm notify [--title TITLE] [--body BODY] [--surface ID]\n\
@@ -134,7 +180,19 @@ fn run_codex_teams() -> Result<()> {
         env::var_os("WMCTERM_CODEX_PATH"),
         wmcterm_codex::allocate_loopback_endpoint()?,
     )?;
-    let status = wmcterm_codex::launch_codex_teams(config, &args)?;
+    let codex_program = config.codex_program.clone();
+    let status = match wmcterm_codex::launch_codex_teams(config, &args) {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!(
+                "wmcterm: Codex app-server integration is unavailable ({error}); starting Codex without the teams bridge"
+            );
+            std::process::Command::new(&codex_program)
+                .args(&args)
+                .status()
+                .with_context(|| format!("could not start Codex `{}`", codex_program.display()))?
+        }
+    };
     if !status.success() {
         bail!("Codex exited with status {status}");
     }
@@ -240,12 +298,63 @@ fn codex_teams_config(
             .context("wmcterm codex-teams must run inside a wmcterm terminal")?,
         codex_program: codex_program
             .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("codex")),
+            .unwrap_or_else(resolve_codex_program),
         max_auto_depth: max_auto_depth
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(2)
             .min(wmcterm_codex::ABSOLUTE_MAX_AUTO_DEPTH),
     })
+}
+
+#[cfg(windows)]
+fn resolve_codex_program() -> PathBuf {
+    for name in ["codex.exe", "codex.cmd"] {
+        let Ok(output) = std::process::Command::new("where.exe").arg(name).output() else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        for path in String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+        {
+            if path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+            {
+                return path;
+            }
+            for candidate in codex_native_candidates(&path) {
+                if candidate.is_file() {
+                    return candidate;
+                }
+            }
+        }
+    }
+    PathBuf::from("codex")
+}
+
+#[cfg(not(windows))]
+fn resolve_codex_program() -> PathBuf {
+    PathBuf::from("codex")
+}
+
+#[cfg(any(windows, test))]
+fn codex_native_candidates(shim: &Path) -> Vec<PathBuf> {
+    let Some(prefix) = shim.parent() else {
+        return Vec::new();
+    };
+    let triple = "x86_64-pc-windows-msvc";
+    [
+        prefix.join("node_modules/@openai/codex/node_modules/@openai/codex-win32-x64/vendor"),
+        prefix.join("node_modules/@openai/codex-win32-x64/vendor"),
+        prefix.join("node_modules/@openai/codex/vendor"),
+    ]
+    .map(|vendor| vendor.join(triple).join("bin/codex.exe"))
+    .into()
 }
 
 fn run_rpc() -> Result<()> {
@@ -456,10 +565,21 @@ fn run_cli(scope: String) -> Result<()> {
             }
             _ => bail!("usage: wmcterm pane list|split|focus|zoom|close|close-others"),
         },
-        "screen" if args.next().as_deref() == Some("read") => {
-            let surface = parse_optional_target(&mut args, "--surface")?;
-            rpc("screen.read", serde_json::json!({"surface": surface}))?
-        }
+        "screen" => match args.next().as_deref() {
+            Some("read") => {
+                let options = parse_screen_options(args)?;
+                rpc(
+                    "screen.read",
+                    serde_json::json!({
+                        "surface": options.surface,
+                        "scrollback": options.scrollback,
+                        "lines": options.lines,
+                    }),
+                )?
+            }
+            Some("wait") => return run_screen_wait(args),
+            _ => bail!("usage: wmcterm screen read|wait ..."),
+        },
         "send" => {
             let mut surface = originating_surface();
             let mut text = Vec::new();
@@ -479,6 +599,16 @@ fn run_cli(scope: String) -> Result<()> {
                     "text": text.join(" "),
                     "surface": surface,
                     "paste": true,
+                }),
+            )?
+        }
+        "send-line" => {
+            let (surface, text) = parse_send_text(args)?;
+            rpc(
+                "send.line",
+                serde_json::json!({
+                    "text": text,
+                    "surface": surface,
                 }),
             )?
         }
@@ -836,6 +966,190 @@ fn plan_agent_process(program: &str, supplied: &[String]) -> Result<(PathBuf, Ve
         (PathBuf::from(program), supplied.to_vec())
     };
     Ok((executable, child_args))
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ScreenOptions {
+    surface: Option<String>,
+    scrollback: bool,
+    lines: Option<usize>,
+}
+
+fn parse_screen_options(args: impl Iterator<Item = String>) -> Result<ScreenOptions> {
+    let mut options = ScreenOptions {
+        surface: originating_surface(),
+        ..ScreenOptions::default()
+    };
+    let mut args = args.peekable();
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--surface" => options.surface = Some(args.next().context("--surface requires an ID")?),
+            "--scrollback" => options.scrollback = true,
+            "--lines" => {
+                let lines = args
+                    .next()
+                    .context("--lines requires a value")?
+                    .parse::<usize>()
+                    .context("--lines must be a positive integer")?;
+                if lines == 0 {
+                    bail!("--lines must be greater than zero");
+                }
+                options.lines = Some(lines);
+            }
+            value => bail!("unknown screen option: {value}"),
+        }
+    }
+    Ok(options)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ScreenWaitCondition {
+    Until(String),
+    Change,
+    Revision(u64),
+}
+
+fn run_screen_wait(args: impl Iterator<Item = String>) -> Result<()> {
+    let mut surface = originating_surface();
+    let mut scrollback = false;
+    let mut lines = None;
+    let mut condition = None;
+    let mut timeout = Duration::from_secs(10);
+    let mut args = args.peekable();
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--surface" => surface = Some(args.next().context("--surface requires an ID")?),
+            "--scrollback" => scrollback = true,
+            "--lines" => {
+                let value = args.next().context("--lines requires a value")?;
+                let parsed = value
+                    .parse::<usize>()
+                    .context("--lines must be a positive integer")?;
+                if parsed == 0 {
+                    bail!("--lines must be greater than zero");
+                }
+                lines = Some(parsed);
+            }
+            "--until" => set_wait_condition(
+                &mut condition,
+                ScreenWaitCondition::Until(args.next().context("--until requires text")?),
+            )?,
+            "--change" => set_wait_condition(&mut condition, ScreenWaitCondition::Change)?,
+            "--revision" => set_wait_condition(
+                &mut condition,
+                ScreenWaitCondition::Revision(
+                    args.next()
+                        .context("--revision requires a value")?
+                        .parse::<u64>()
+                        .context("--revision must be an integer")?,
+                ),
+            )?,
+            "--timeout" => {
+                timeout = parse_cli_duration(&args.next().context("--timeout requires a value")?)?
+            }
+            value => bail!("unknown screen wait option: {value}"),
+        }
+    }
+    let condition = condition.context("screen wait requires --until, --change, or --revision")?;
+    let params = serde_json::json!({
+        "surface": surface,
+        "scrollback": scrollback,
+        "lines": lines,
+    });
+    let started = std::time::Instant::now();
+    let mut baseline = None;
+    loop {
+        let response = rpc("screen.read", params.clone())?;
+        let result = response_result(&response)?;
+        let text = result
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let revision = result
+            .get("revision")
+            .and_then(Value::as_u64)
+            .context("screen.read response is missing revision")?;
+        let matched = match &condition {
+            ScreenWaitCondition::Until(needle) => text.contains(needle),
+            ScreenWaitCondition::Change => match baseline {
+                Some(initial) => revision != initial,
+                None => {
+                    baseline = Some(revision);
+                    false
+                }
+            },
+            ScreenWaitCondition::Revision(previous) => revision != *previous,
+        };
+        if matched {
+            return print_response(response);
+        }
+        if started.elapsed() >= timeout {
+            bail!(
+                "timed out after {} ms waiting for terminal screen",
+                timeout.as_millis()
+            );
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn set_wait_condition(
+    target: &mut Option<ScreenWaitCondition>,
+    condition: ScreenWaitCondition,
+) -> Result<()> {
+    if target.replace(condition).is_some() {
+        bail!("screen wait accepts exactly one of --until, --change, or --revision");
+    }
+    Ok(())
+}
+
+fn parse_cli_duration(value: &str) -> Result<Duration> {
+    let (number, multiplier) = if let Some(value) = value.strip_suffix("ms") {
+        (value, 1_u64)
+    } else if let Some(value) = value.strip_suffix('s') {
+        (value, 1_000)
+    } else {
+        (value, 1_000)
+    };
+    let milliseconds = number
+        .parse::<u64>()
+        .with_context(|| format!("invalid duration: {value}"))?
+        .checked_mul(multiplier)
+        .context("duration is too large")?;
+    if milliseconds == 0 || milliseconds > 300_000 {
+        bail!("duration must be between 1 ms and 300 s");
+    }
+    Ok(Duration::from_millis(milliseconds))
+}
+
+fn response_result(response: &wmcterm_ipc::Response) -> Result<&Value> {
+    if let Some(error) = &response.error {
+        bail!("RPC {}: {}", error.code, error.message);
+    }
+    response
+        .result
+        .as_ref()
+        .context("RPC response has no result")
+}
+
+fn parse_send_text(args: impl Iterator<Item = String>) -> Result<(Option<String>, String)> {
+    let mut surface = originating_surface();
+    let mut text = Vec::new();
+    let mut args = args.peekable();
+    while let Some(value) = args.next() {
+        if value == "--" {
+            text.extend(args);
+            break;
+        } else if value == "--surface" {
+            surface = Some(args.next().context("--surface requires an ID")?);
+        } else {
+            text.push(value);
+        }
+    }
+    if text.is_empty() {
+        bail!("send-line requires text");
+    }
+    Ok((surface, text.join(" ")))
 }
 
 fn parse_optional_target(
@@ -1594,7 +1908,7 @@ fn run_config(mut args: impl Iterator<Item = String>) -> Result<()> {
 fn shell_arg(value: &str) -> String {
     #[cfg(windows)]
     {
-        format!("\"{}\"", value.replace('"', "\\\""))
+        format!("'{}'", value.replace('\'', "''"))
     }
     #[cfg(not(windows))]
     {
@@ -1639,7 +1953,7 @@ fn parse_args() -> Result<(TerminalSize, CommandSpec)> {
 
     let command: Vec<_> = args.collect();
     let command = if command.is_empty() {
-        CommandSpec::new("sh").args(["-lc", "printf 'wmcterm phase 0\\n'"])
+        default_dump_command()
     } else {
         CommandSpec::new(&command[0]).args(command.iter().skip(1))
     };
@@ -1647,10 +1961,68 @@ fn parse_args() -> Result<(TerminalSize, CommandSpec)> {
     Ok((TerminalSize::new(cols, rows)?, command))
 }
 
+fn default_dump_command() -> CommandSpec {
+    #[cfg(windows)]
+    {
+        CommandSpec::new("powershell.exe").args([
+            "-NoLogo",
+            "-NoProfile",
+            "-Command",
+            "Write-Output 'wmcterm phase 0'",
+        ])
+    }
+    #[cfg(not(windows))]
+    {
+        CommandSpec::new("sh").args(["-lc", "printf 'wmcterm phase 0\\n'"])
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use wmcterm_agent::AgentKind;
+
+    #[test]
+    fn terminal_wait_durations_are_bounded_and_human_readable() {
+        assert_eq!(
+            parse_cli_duration("250ms").unwrap(),
+            Duration::from_millis(250)
+        );
+        assert_eq!(parse_cli_duration("2s").unwrap(), Duration::from_secs(2));
+        assert_eq!(parse_cli_duration("3").unwrap(), Duration::from_secs(3));
+        assert!(parse_cli_duration("0ms").is_err());
+        assert!(parse_cli_duration("301s").is_err());
+    }
+
+    #[test]
+    fn screen_wait_rejects_multiple_conditions() {
+        let mut condition = None;
+        set_wait_condition(&mut condition, ScreenWaitCondition::Change).unwrap();
+        assert!(
+            set_wait_condition(&mut condition, ScreenWaitCondition::Until("prompt".into()))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn windows_version_floor_includes_windows_11() {
+        assert!(!windows_version_supported(10, 17_762));
+        assert!(windows_version_supported(10, 17_763));
+        assert!(windows_version_supported(10, 22_000));
+        assert!(windows_version_supported(11, 0));
+    }
+
+    #[test]
+    fn windows_codex_shim_resolves_native_optional_dependency_layouts() {
+        let candidates = codex_native_candidates(Path::new("C:/Users/user/npm/codex.cmd"));
+        assert_eq!(candidates.len(), 3);
+        assert!(candidates.iter().all(|path| path.ends_with("codex.exe")));
+        assert!(
+            candidates[0]
+                .to_string_lossy()
+                .contains("@openai/codex-win32-x64")
+        );
+    }
 
     #[test]
     fn agent_control_keys_encode_terminal_bytes() {

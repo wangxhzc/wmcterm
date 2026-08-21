@@ -2,7 +2,7 @@ use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 use std::time::Instant;
 
 use portable_pty::{CommandBuilder, PtySize as NativePtySize, native_pty_system};
@@ -172,7 +172,7 @@ fn run_actor(
     commands: flume::Receiver<PtyCommand>,
     events: flume::Sender<PtyEvent>,
 ) {
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let root_process_id = child.process_id();
     let (output_tx, output_rx) = flume::unbounded();
     thread::spawn(move || {
@@ -193,11 +193,11 @@ fn run_actor(
         }
     });
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let mut next_process_check = Instant::now();
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     let mut last_foreground = Vec::new();
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", windows))]
     let mut last_children = Vec::new();
 
     loop {
@@ -207,12 +207,17 @@ fn run_actor(
                 return;
             }
         }
-        #[cfg(unix)]
+        #[cfg(any(unix, windows))]
         if Instant::now() >= next_process_check {
             next_process_check = Instant::now() + Duration::from_millis(500);
+            #[cfg(unix)]
             let foreground = master
                 .process_group_leader()
                 .and_then(|pid| foreground_process_chain(pid, root_process_id))
+                .unwrap_or_default();
+            #[cfg(windows)]
+            let foreground = root_process_id
+                .map(descendant_processes)
                 .unwrap_or_default();
             if foreground != last_foreground {
                 last_foreground.clone_from(&foreground);
@@ -224,7 +229,7 @@ fn run_actor(
                     return;
                 }
             }
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", windows))]
             {
                 let children = root_process_id
                     .map(descendant_processes)
@@ -355,6 +360,65 @@ fn descendant_processes(root: u32) -> Vec<String> {
         }
     }
     commands.sort();
+    commands
+}
+
+#[cfg(windows)]
+fn descendant_processes(root: u32) -> Vec<String> {
+    use std::collections::HashSet;
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
+        TH32CS_SNAPPROCESS,
+    };
+
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) };
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Vec::new();
+    }
+
+    let mut processes = Vec::new();
+    let mut entry = PROCESSENTRY32W {
+        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        ..Default::default()
+    };
+    let mut available = unsafe { Process32FirstW(snapshot, &mut entry) } != 0;
+    while available {
+        let name_end = entry
+            .szExeFile
+            .iter()
+            .position(|value| *value == 0)
+            .unwrap_or(entry.szExeFile.len());
+        processes.push((
+            entry.th32ProcessID,
+            entry.th32ParentProcessID,
+            String::from_utf16_lossy(&entry.szExeFile[..name_end]),
+        ));
+        available = unsafe { Process32NextW(snapshot, &mut entry) } != 0;
+    }
+    unsafe {
+        let _ = CloseHandle(snapshot);
+    }
+
+    let mut descendants = HashSet::from([root]);
+    loop {
+        let previous_len = descendants.len();
+        for (process_id, parent_id, _) in &processes {
+            if descendants.contains(parent_id) {
+                descendants.insert(*process_id);
+            }
+        }
+        if descendants.len() == previous_len {
+            break;
+        }
+    }
+    let mut commands = processes
+        .into_iter()
+        .filter(|(process_id, _, _)| *process_id != root && descendants.contains(process_id))
+        .map(|(_, _, name)| name)
+        .collect::<Vec<_>>();
+    commands.sort();
+    commands.dedup();
     commands
 }
 

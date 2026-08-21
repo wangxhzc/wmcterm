@@ -10,7 +10,7 @@ use libghostty_vt::render::{CellIterator, RowIterator};
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::selection::{FormatOptions, Selection};
 use libghostty_vt::style::{Palette, PaletteIndex, RgbColor, Underline};
-use libghostty_vt::terminal::{ColorScheme, Point, PointCoordinate, ScrollViewport};
+use libghostty_vt::terminal::{ColorScheme, Mode, Point, PointCoordinate, ScrollViewport};
 use libghostty_vt::{RenderState, Terminal, TerminalOptions};
 use thiserror::Error;
 use wmcterm_agent::{AgentEvent, OscEvent, OscScanner};
@@ -285,6 +285,12 @@ impl TerminalEngine {
             .resize(size.cols, size.rows, cell_width_px, cell_height_px)?;
         self.size = size;
         Ok(())
+    }
+
+    /// Whether the application is inside a DEC 2026 synchronized-output
+    /// transaction. A host should not present the partially updated grid.
+    pub fn synchronized_output(&self) -> bool {
+        self.terminal.mode(Mode::SYNC_OUTPUT).unwrap_or(false)
     }
 
     pub fn snapshot(&mut self) -> Result<ScreenSnapshot, TerminalError> {
@@ -755,13 +761,18 @@ pub enum SessionCommand {
     Input(Vec<u8>),
     Key(KeyInput),
     Paste(String),
+    PasteLine(String),
     CopyAll,
     CopySelection {
         start: SelectionPoint,
         end: SelectionPoint,
     },
     Mouse(MouseInput),
-    Resize(TerminalSize),
+    Resize {
+        size: TerminalSize,
+        cell_width_px: u32,
+        cell_height_px: u32,
+    },
     Scroll(isize),
     Search {
         query: String,
@@ -904,13 +915,65 @@ impl Drop for TerminalSession {
     }
 }
 
-const MAX_PTY_OUTPUT_CHUNKS_PER_BATCH: usize = 64;
+const PTY_OUTPUT_SNAPSHOT_INTERVAL: std::time::Duration =
+    std::time::Duration::from_nanos(16_666_667);
 const MAX_PROTOCOL_REPLY_BYTES_PER_BURST: usize = 1024;
 const PROTOCOL_REPLY_BURST_QUIET: std::time::Duration = std::time::Duration::from_millis(250);
 
 struct ProtocolReplyLimiter {
     remaining: usize,
     last_output: Option<std::time::Instant>,
+}
+
+#[derive(Debug, Default)]
+struct OutputSnapshotSchedule {
+    deadline: Option<std::time::Instant>,
+}
+
+impl OutputSnapshotSchedule {
+    fn mark_dirty(&mut self, now: std::time::Instant) {
+        // Keep the deadline anchored to the first unpresented output. Moving it
+        // on every chunk would allow a busy PTY to postpone rendering forever.
+        self.deadline
+            .get_or_insert(now + PTY_OUTPUT_SNAPSHOT_INTERVAL);
+    }
+
+    fn deadline(&self) -> Option<std::time::Instant> {
+        self.deadline
+    }
+
+    fn is_due(&self, now: std::time::Instant) -> bool {
+        self.deadline.is_some_and(|deadline| now >= deadline)
+    }
+
+    fn is_dirty(&self) -> bool {
+        self.deadline.is_some()
+    }
+
+    fn mark_presented(&mut self) {
+        self.deadline = None;
+    }
+}
+
+fn publish_snapshot(
+    engine: &mut TerminalEngine,
+    events: &flume::Sender<SessionEvent>,
+    schedule: &mut OutputSnapshotSchedule,
+    force: bool,
+) {
+    if engine.synchronized_output() && !force {
+        schedule.mark_dirty(std::time::Instant::now());
+        return;
+    }
+    match engine.snapshot() {
+        Ok(snapshot) => {
+            let _ = events.send(SessionEvent::Snapshot(snapshot));
+        }
+        Err(error) => {
+            let _ = events.send(SessionEvent::Error(error.to_string()));
+        }
+    }
+    schedule.mark_presented();
 }
 
 impl ProtocolReplyLimiter {
@@ -1071,22 +1134,38 @@ fn run_terminal_actor(
     let mut osc = OscScanner::default();
     let mut reply_limiter = ProtocolReplyLimiter::new();
     let mut reply_limit_warned = false;
+    let mut snapshot_schedule = OutputSnapshotSchedule::default();
     enum Incoming {
         Command(SessionCommand),
         Pty(PtyEvent),
+        SnapshotDeadline,
     }
-    let mut pending_pty = None;
     loop {
-        let incoming = if let Some(event) = pending_pty.take() {
-            Some(Incoming::Pty(event))
+        let now = std::time::Instant::now();
+        if snapshot_schedule.is_due(now) && !engine.synchronized_output() {
+            publish_snapshot(&mut engine, &events, &mut snapshot_schedule, false);
+        }
+        let incoming = if let Ok(command) = commands.try_recv() {
+            // Commands are latency-sensitive and must not be starved by a PTY
+            // whose output receiver remains continuously ready.
+            Some(Incoming::Command(command))
         } else {
-            flume::Selector::new()
+            let selector = flume::Selector::new()
                 .recv(&commands, |value| value.ok().map(Incoming::Command))
-                .recv(pty.events(), |value| value.ok().map(Incoming::Pty))
-                .wait()
+                .recv(pty.events(), |value| value.ok().map(Incoming::Pty));
+            if engine.synchronized_output() {
+                selector.wait()
+            } else if let Some(deadline) = snapshot_schedule.deadline() {
+                selector
+                    .wait_deadline(deadline)
+                    .unwrap_or(Some(Incoming::SnapshotDeadline))
+            } else {
+                selector.wait()
+            }
         };
         let Some(incoming) = incoming else { return };
         match incoming {
+            Incoming::SnapshotDeadline => continue,
             Incoming::Command(SessionCommand::Input(bytes)) => {
                 let _ = pty.send(PtyCommand::Input(bytes));
             }
@@ -1097,6 +1176,12 @@ fn run_terminal_actor(
             }
             Incoming::Command(SessionCommand::Paste(text)) => {
                 if let Ok(bytes) = engine.encode_paste(&text) {
+                    let _ = pty.send(PtyCommand::Input(bytes));
+                }
+            }
+            Incoming::Command(SessionCommand::PasteLine(text)) => {
+                if let Ok(mut bytes) = engine.encode_paste(&text) {
+                    bytes.push(b'\r');
                     let _ = pty.send(PtyCommand::Input(bytes));
                 }
             }
@@ -1124,25 +1209,25 @@ fn run_terminal_actor(
                     let _ = events.send(SessionEvent::Error(error.to_string()));
                 }
             },
-            Incoming::Command(SessionCommand::Resize(size)) => {
-                if let Err(error) = engine.resize(size, 10, 21) {
+            Incoming::Command(SessionCommand::Resize {
+                size,
+                cell_width_px,
+                cell_height_px,
+            }) => {
+                if let Err(error) = engine.resize(size, cell_width_px, cell_height_px) {
                     let _ = events.send(SessionEvent::Error(error.to_string()));
                 }
                 let _ = pty.send(PtyCommand::Resize(PtySize::new(size.cols, size.rows)));
             }
             Incoming::Command(SessionCommand::Scroll(lines)) => {
                 engine.scroll(lines);
-                if let Ok(snapshot) = engine.snapshot() {
-                    let _ = events.send(SessionEvent::Snapshot(snapshot));
-                }
+                publish_snapshot(&mut engine, &events, &mut snapshot_schedule, false);
             }
             Incoming::Command(SessionCommand::Search { query, direction }) => {
                 match engine.search(&query, direction) {
                     Ok(result) => {
                         let _ = events.send(SessionEvent::SearchResult(result));
-                        if let Ok(snapshot) = engine.snapshot() {
-                            let _ = events.send(SessionEvent::Snapshot(snapshot));
-                        }
+                        publish_snapshot(&mut engine, &events, &mut snapshot_schedule, false);
                     }
                     Err(error) => {
                         let _ = events.send(SessionEvent::Error(error.to_string()));
@@ -1151,9 +1236,7 @@ fn run_terminal_actor(
             }
             Incoming::Command(SessionCommand::ClearScrollback) => {
                 engine.clear_scrollback();
-                if let Ok(snapshot) = engine.snapshot() {
-                    let _ = events.send(SessionEvent::Snapshot(snapshot));
-                }
+                publish_snapshot(&mut engine, &events, &mut snapshot_schedule, false);
             }
             Incoming::Command(SessionCommand::ExportHistory(sender)) => {
                 let _ = sender.send(engine.select_all_text().unwrap_or_default());
@@ -1161,18 +1244,13 @@ fn run_terminal_actor(
             Incoming::Command(SessionCommand::RestoreHistory(text)) => {
                 engine.feed(&normalize_restored_history(&text));
                 let _ = engine.take_effects();
-                if let Ok(snapshot) = engine.snapshot() {
-                    let _ = events.send(SessionEvent::Snapshot(snapshot));
-                }
+                publish_snapshot(&mut engine, &events, &mut snapshot_schedule, false);
             }
             Incoming::Command(SessionCommand::SetTheme(theme)) => {
-                match engine.apply_theme(&theme).and_then(|_| engine.snapshot()) {
-                    Ok(snapshot) => {
-                        let _ = events.send(SessionEvent::Snapshot(snapshot));
-                    }
-                    Err(error) => {
-                        let _ = events.send(SessionEvent::Error(error.to_string()));
-                    }
+                if let Err(error) = engine.apply_theme(&theme) {
+                    let _ = events.send(SessionEvent::Error(error.to_string()));
+                } else {
+                    publish_snapshot(&mut engine, &events, &mut snapshot_schedule, false);
                 }
             }
             Incoming::Command(SessionCommand::Shutdown) => return,
@@ -1186,38 +1264,15 @@ fn run_terminal_actor(
                     &mut reply_limiter,
                     &mut reply_limit_warned,
                 );
-                for _ in 0..MAX_PTY_OUTPUT_CHUNKS_PER_BATCH {
-                    let Ok(event) = pty.events().try_recv() else {
-                        break;
-                    };
-                    match event {
-                        PtyEvent::Output(bytes) => {
-                            process_pty_output_chunk(
-                                &bytes,
-                                &mut engine,
-                                &mut osc,
-                                &pty,
-                                &events,
-                                &mut reply_limiter,
-                                &mut reply_limit_warned,
-                            );
-                        }
-                        other => {
-                            pending_pty = Some(other);
-                            break;
-                        }
-                    }
-                }
-                match engine.snapshot() {
-                    Ok(snapshot) => {
-                        let _ = events.send(SessionEvent::Snapshot(snapshot));
-                    }
-                    Err(error) => {
-                        let _ = events.send(SessionEvent::Error(error.to_string()));
-                    }
-                }
+                snapshot_schedule.mark_dirty(std::time::Instant::now());
             }
             Incoming::Pty(PtyEvent::Exited(status)) => {
+                if snapshot_schedule.is_dirty() {
+                    // Output and process-exit are separate PTY events. Publish
+                    // the final grid first even when the process exits inside
+                    // an unterminated synchronized-output transaction.
+                    publish_snapshot(&mut engine, &events, &mut snapshot_schedule, true);
+                }
                 let _ = events.send(SessionEvent::Exited(status.to_string()));
                 return;
             }
@@ -1266,6 +1321,31 @@ mod tests {
         assert_eq!(snapshot.lines[0], "Xello");
         assert_eq!(snapshot.lines[1], "world");
         assert_eq!(snapshot.to_plain_text(), "Xello\nworld");
+    }
+
+    #[test]
+    fn synchronized_output_mode_brackets_atomic_screen_updates() {
+        let mut terminal = TerminalEngine::new(TerminalSize::new(12, 3).unwrap()).unwrap();
+        assert!(!terminal.synchronized_output());
+        terminal.feed(b"\x1b[?2026hWorking");
+        assert!(terminal.synchronized_output());
+        terminal.feed(b"\x1b[?2026l");
+        assert!(!terminal.synchronized_output());
+        assert_eq!(terminal.snapshot().unwrap().lines[0], "Working");
+    }
+
+    #[test]
+    fn output_snapshot_deadline_is_bounded_by_the_first_chunk() {
+        let start = std::time::Instant::now();
+        let mut schedule = OutputSnapshotSchedule::default();
+        schedule.mark_dirty(start);
+        let deadline = schedule.deadline().unwrap();
+        schedule.mark_dirty(start + std::time::Duration::from_millis(15));
+        assert_eq!(schedule.deadline(), Some(deadline));
+        assert!(!schedule.is_due(deadline - std::time::Duration::from_nanos(1)));
+        assert!(schedule.is_due(deadline));
+        schedule.mark_presented();
+        assert!(!schedule.is_dirty());
     }
 
     #[test]
@@ -1481,10 +1561,15 @@ mod tests {
     fn preserves_cjk_emoji_and_combining_graphemes() {
         let mut terminal = TerminalEngine::new(TerminalSize::new(30, 2).unwrap()).unwrap();
         terminal.feed("中文 🙂 e\u{301}".as_bytes());
-        let text = terminal.snapshot().unwrap().to_plain_text();
+        let snapshot = terminal.snapshot().unwrap();
+        let text = snapshot.to_plain_text();
         assert!(text.contains("中文"));
         assert!(text.contains('🙂'));
         assert!(text.contains("e\u{301}"));
+        assert_eq!(snapshot.cells[0][0].text, "中");
+        assert_eq!(snapshot.cells[0][1].text, "");
+        assert_eq!(snapshot.cells[0][2].text, "文");
+        assert_eq!(snapshot.cells[0][3].text, "");
     }
 
     #[test]
@@ -1593,6 +1678,86 @@ mod tests {
             match event {
                 SessionEvent::Snapshot(snapshot) => {
                     found |= snapshot.to_plain_text().contains("actor-ok")
+                }
+                SessionEvent::Exited(_) => break,
+                SessionEvent::Error(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        assert!(found);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminal_actor_publishes_final_synchronized_output_before_exit() {
+        let session = TerminalSession::spawn(
+            CommandSpec::new("sh").args(["-lc", r"printf '\033[?2026hFINAL-SYNC'"]),
+            TerminalSize::new(40, 4).unwrap(),
+        )
+        .unwrap();
+        let mut screens = Vec::new();
+        while let Ok(event) = session
+            .events()
+            .recv_timeout(std::time::Duration::from_secs(2))
+        {
+            match event {
+                SessionEvent::Snapshot(snapshot) => {
+                    screens.push(snapshot.to_plain_text());
+                }
+                SessionEvent::Exited(_) => break,
+                SessionEvent::Error(error) => panic!("{error}"),
+                _ => {}
+            }
+        }
+        let final_screen = screens.last().expect("final snapshot before exit");
+        assert!(final_screen.contains("FINAL-SYNC"));
+        assert!(
+            screens[..screens.len() - 1]
+                .iter()
+                .all(|screen| !screen.contains("FINAL-SYNC")),
+            "synchronized output was presented partially"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn terminal_actor_services_commands_while_output_snapshot_is_deferred() {
+        let session = TerminalSession::spawn(
+            CommandSpec::new("sh").args([
+                "-lc",
+                r"printf '\033[?2026hbusy'; sleep 1; printf '\033[?2026l'",
+            ]),
+            TerminalSize::new(40, 4).unwrap(),
+        )
+        .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        assert!(session.export_history().is_some());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "actor command was starved by PTY output"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn paste_line_submits_text_and_enter_as_one_actor_command() {
+        let session = TerminalSession::spawn(
+            CommandSpec::new("sh").args(["-lc", "read value; printf 'line=%s\\n' \"$value\""]),
+            TerminalSize::new(40, 4).unwrap(),
+        )
+        .unwrap();
+        session
+            .send(SessionCommand::PasteLine("atomic input".into()))
+            .unwrap();
+        let mut found = false;
+        while let Ok(event) = session
+            .events()
+            .recv_timeout(std::time::Duration::from_secs(2))
+        {
+            match event {
+                SessionEvent::Snapshot(snapshot) => {
+                    found |= snapshot.to_plain_text().contains("line=atomic input")
                 }
                 SessionEvent::Exited(_) => break,
                 SessionEvent::Error(error) => panic!("{error}"),

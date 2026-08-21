@@ -880,8 +880,31 @@ fn validate_workspace_directory(config: &mut Config, source: &Path) -> Result<()
             directory: resolved,
         });
     }
-    config.workspace.default_cwd = Some(resolved);
+    config.workspace.default_cwd = Some(normalize_windows_path(resolved));
     Ok(())
+}
+
+/// Converts Windows verbatim paths returned by `canonicalize` back to the
+/// conventional form used in configuration, session state, and the UI.
+pub fn normalize_windows_path(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        use std::ffi::OsString;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+
+        let wide = path.as_os_str().encode_wide().collect::<Vec<_>>();
+        let verbatim_unc = r"\\?\UNC\".encode_utf16().collect::<Vec<_>>();
+        let verbatim = r"\\?\".encode_utf16().collect::<Vec<_>>();
+        if let Some(rest) = wide.strip_prefix(verbatim_unc.as_slice()) {
+            let mut conventional = r"\\".encode_utf16().collect::<Vec<_>>();
+            conventional.extend_from_slice(rest);
+            return PathBuf::from(OsString::from_wide(&conventional));
+        }
+        if let Some(rest) = wide.strip_prefix(verbatim.as_slice()) {
+            return PathBuf::from(OsString::from_wide(rest));
+        }
+    }
+    path
 }
 
 /// Expands a leading `~` path component using the platform home directory.
