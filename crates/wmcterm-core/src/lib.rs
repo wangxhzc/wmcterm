@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -240,6 +241,43 @@ pub enum AgentState {
     Completed,
     Error,
 }
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentRunMode {
+    #[default]
+    Interactive,
+    Unattended,
+    FullAccess,
+}
+
+impl std::fmt::Display for AgentRunMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let value = match self {
+            Self::Interactive => "interactive",
+            Self::Unattended => "unattended",
+            Self::FullAccess => "full-access",
+        };
+        f.write_str(value)
+    }
+}
+
+impl FromStr for AgentRunMode {
+    type Err = AgentRunModeParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "interactive" | "default" => Ok(Self::Interactive),
+            "unattended" => Ok(Self::Unattended),
+            "full-access" | "full_access" => Ok(Self::FullAccess),
+            unknown => Err(AgentRunModeParseError(unknown.into())),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("invalid agent run mode `{0}`, expected interactive|unattended|full-access")]
+pub struct AgentRunModeParseError(String);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentMetadata {
@@ -1177,6 +1215,46 @@ impl Default for ActionRegistry {
                     },
                 },
                 BuiltinAction {
+                    id: "agent.claude.unattended",
+                    title: "New Claude Code (Unattended)",
+                    command: || {
+                        AppCommand::Surface(SurfaceCommand::NewTerminal {
+                            pane: Uuid::nil(),
+                            command: Some("wmcterm agent --mode unattended claude".into()),
+                        })
+                    },
+                },
+                BuiltinAction {
+                    id: "agent.codex.unattended",
+                    title: "New Codex (Unattended)",
+                    command: || {
+                        AppCommand::Surface(SurfaceCommand::NewTerminal {
+                            pane: Uuid::nil(),
+                            command: Some("wmcterm agent --mode unattended codex".into()),
+                        })
+                    },
+                },
+                BuiltinAction {
+                    id: "agent.claude.full_access",
+                    title: "New Claude Code (Full Access…)",
+                    command: || {
+                        AppCommand::Surface(SurfaceCommand::NewTerminal {
+                            pane: Uuid::nil(),
+                            command: None,
+                        })
+                    },
+                },
+                BuiltinAction {
+                    id: "agent.codex.full_access",
+                    title: "New Codex (Full Access…)",
+                    command: || {
+                        AppCommand::Surface(SurfaceCommand::NewTerminal {
+                            pane: Uuid::nil(),
+                            command: None,
+                        })
+                    },
+                },
+                BuiltinAction {
                     id: "agent.gemini",
                     title: "New Gemini CLI",
                     command: || {
@@ -1904,5 +1982,27 @@ mod tests {
             session.apply_event(&retired_start),
             Err(AgentSessionError::RetiredLifecycle("life-a".into()))
         );
+    }
+
+    #[test]
+    fn parse_and_display_agent_run_mode() {
+        use std::str::FromStr;
+
+        assert_eq!(
+            AgentRunMode::from_str("interactive").unwrap(),
+            AgentRunMode::Interactive
+        );
+        assert_eq!(
+            AgentRunMode::from_str("unattended").unwrap(),
+            AgentRunMode::Unattended
+        );
+        assert_eq!(
+            AgentRunMode::from_str("full_access").unwrap(),
+            AgentRunMode::FullAccess
+        );
+        assert_eq!(AgentRunMode::Interactive.to_string(), "interactive");
+        assert_eq!(AgentRunMode::Unattended.to_string(), "unattended");
+        assert_eq!(AgentRunMode::FullAccess.to_string(), "full-access");
+        assert!(AgentRunMode::from_str("dangerous").is_err());
     }
 }

@@ -566,13 +566,19 @@ impl TerminalEngine {
         start: SelectionPoint,
         end: SelectionPoint,
     ) -> Result<String, TerminalError> {
+        let total_rows = self.terminal.total_rows()?;
+        if total_rows == 0 {
+            return Ok(String::new());
+        }
+        let max_column = self.size.cols.saturating_sub(1);
+        let max_row = total_rows.saturating_sub(1).min(u32::MAX as usize) as u32;
         let start = self.terminal.grid_ref(Point::Screen(PointCoordinate {
-            x: start.column,
-            y: start.screen_row,
+            x: start.column.min(max_column),
+            y: start.screen_row.min(max_row),
         }))?;
         let end = self.terminal.grid_ref(Point::Screen(PointCoordinate {
-            x: end.column,
-            y: end.screen_row,
+            x: end.column.min(max_column),
+            y: end.screen_row.min(max_row),
         }))?;
         let selection = Selection::new(start, end, false);
         let options = FormatOptions::new()
@@ -798,6 +804,7 @@ pub enum SessionEvent {
     ClipboardText(String),
     SearchResult(SearchResult),
     Exited(String),
+    Warning(String),
     Error(String),
 }
 
@@ -970,7 +977,7 @@ fn publish_snapshot(
             let _ = events.send(SessionEvent::Snapshot(snapshot));
         }
         Err(error) => {
-            let _ = events.send(SessionEvent::Error(error.to_string()));
+            let _ = events.send(SessionEvent::Warning(format!("snapshot: {error}")));
         }
     }
     schedule.mark_presented();
@@ -1119,7 +1126,9 @@ fn run_terminal_actor(
     if let Some(theme) = theme
         && let Err(error) = engine.apply_theme(&theme)
     {
-        let _ = events.send(SessionEvent::Error(error.to_string()));
+        let _ = events.send(SessionEvent::Error(format!(
+            "terminal theme initialization: {error}"
+        )));
         return;
     }
     if let Some(history) = history.filter(|history| !history.is_empty()) {
@@ -1127,8 +1136,15 @@ fn run_terminal_actor(
         // Persisted output is render-only replay. Never send terminal replies,
         // bells, or title changes back into a newly spawned PTY.
         let _ = engine.take_effects();
-        if let Ok(snapshot) = engine.snapshot() {
-            let _ = events.send(SessionEvent::Snapshot(snapshot));
+        match engine.snapshot() {
+            Ok(snapshot) => {
+                let _ = events.send(SessionEvent::Snapshot(snapshot));
+            }
+            Err(error) => {
+                let _ = events.send(SessionEvent::Warning(format!(
+                    "restored history snapshot: {error}"
+                )));
+            }
         }
     }
     let mut osc = OscScanner::default();
@@ -1185,18 +1201,22 @@ fn run_terminal_actor(
                     let _ = pty.send(PtyCommand::Input(bytes));
                 }
             }
-            Incoming::Command(SessionCommand::CopyAll) => {
-                if let Ok(text) = engine.select_all_text() {
+            Incoming::Command(SessionCommand::CopyAll) => match engine.select_all_text() {
+                Ok(text) => {
                     let _ = events.send(SessionEvent::ClipboardText(text));
                 }
-            }
+                Err(error) => {
+                    let _ = events.send(SessionEvent::Warning(format!("copy all: {error}")));
+                }
+            },
             Incoming::Command(SessionCommand::CopySelection { start, end }) => {
                 match engine.selection_text(start, end) {
                     Ok(text) => {
                         let _ = events.send(SessionEvent::ClipboardText(text));
                     }
                     Err(error) => {
-                        let _ = events.send(SessionEvent::Error(error.to_string()));
+                        let _ =
+                            events.send(SessionEvent::Warning(format!("copy selection: {error}")));
                     }
                 }
             }
@@ -1206,7 +1226,7 @@ fn run_terminal_actor(
                 }
                 Ok(_) => {}
                 Err(error) => {
-                    let _ = events.send(SessionEvent::Error(error.to_string()));
+                    let _ = events.send(SessionEvent::Warning(format!("mouse input: {error}")));
                 }
             },
             Incoming::Command(SessionCommand::Resize {
@@ -1215,7 +1235,7 @@ fn run_terminal_actor(
                 cell_height_px,
             }) => {
                 if let Err(error) = engine.resize(size, cell_width_px, cell_height_px) {
-                    let _ = events.send(SessionEvent::Error(error.to_string()));
+                    let _ = events.send(SessionEvent::Warning(format!("resize: {error}")));
                 }
                 let _ = pty.send(PtyCommand::Resize(PtySize::new(size.cols, size.rows)));
             }
@@ -1230,7 +1250,7 @@ fn run_terminal_actor(
                         publish_snapshot(&mut engine, &events, &mut snapshot_schedule, false);
                     }
                     Err(error) => {
-                        let _ = events.send(SessionEvent::Error(error.to_string()));
+                        let _ = events.send(SessionEvent::Warning(format!("search: {error}")));
                     }
                 }
             }
@@ -1248,7 +1268,7 @@ fn run_terminal_actor(
             }
             Incoming::Command(SessionCommand::SetTheme(theme)) => {
                 if let Err(error) = engine.apply_theme(&theme) {
-                    let _ = events.send(SessionEvent::Error(error.to_string()));
+                    let _ = events.send(SessionEvent::Warning(format!("apply theme: {error}")));
                 } else {
                     publish_snapshot(&mut engine, &events, &mut snapshot_schedule, false);
                 }
@@ -1570,6 +1590,49 @@ mod tests {
         assert_eq!(snapshot.cells[0][1].text, "");
         assert_eq!(snapshot.cells[0][2].text, "文");
         assert_eq!(snapshot.cells[0][3].text, "");
+
+        let cjk = terminal
+            .selection_text(
+                SelectionPoint {
+                    column: 0,
+                    screen_row: 0,
+                },
+                SelectionPoint {
+                    column: 3,
+                    screen_row: 0,
+                },
+            )
+            .unwrap();
+        assert_eq!(cjk, "中文");
+
+        let continuation_cell = terminal.selection_text(
+            SelectionPoint {
+                column: 1,
+                screen_row: 0,
+            },
+            SelectionPoint {
+                column: 1,
+                screen_row: 0,
+            },
+        );
+        assert!(
+            continuation_cell.is_ok(),
+            "selecting a wide-glyph continuation cell must not fail: {continuation_cell:?}"
+        );
+
+        let clamped = terminal
+            .selection_text(
+                SelectionPoint {
+                    column: 0,
+                    screen_row: 0,
+                },
+                SelectionPoint {
+                    column: u16::MAX,
+                    screen_row: u32::MAX,
+                },
+            )
+            .unwrap();
+        assert!(clamped.contains("中文"));
     }
 
     #[test]

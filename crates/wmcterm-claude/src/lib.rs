@@ -33,7 +33,6 @@ pub enum ApprovalDecision {
     Deny,
     Once,
     Always,
-    All,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -137,9 +136,7 @@ impl PermissionRequest {
             ApprovalDecision::Always => {
                 deny_response("wmcterm rejected an unavailable or ambiguous decision")
             }
-            ApprovalDecision::Deny | ApprovalDecision::All => {
-                deny_response("Permission denied in wmcterm")
-            }
+            ApprovalDecision::Deny => deny_response("Permission denied in wmcterm"),
         }
     }
 }
@@ -757,14 +754,14 @@ mod tests {
     }
 
     #[test]
-    fn no_suggestion_never_offers_always_or_all() {
+    fn no_suggestion_never_offers_always() {
         let parsed = PermissionRequest::parse(&request(json!([]))).unwrap();
         assert_eq!(
             parsed.supported_decisions(),
             vec![ApprovalDecision::Deny, ApprovalDecision::Once]
         );
         assert_eq!(
-            parsed.response(ApprovalDecision::All)["hookSpecificOutput"]["decision"]["behavior"],
+            parsed.response(ApprovalDecision::Always)["hookSpecificOutput"]["decision"]["behavior"],
             "deny"
         );
     }
@@ -940,6 +937,9 @@ mod tests {
         assert!(parse_control_status(&json!({"status":"pending"})).is_err());
         assert!(
             parse_control_status(&json!({"status":"resolved","decision":{"mode":"yes"}})).is_err()
+        );
+        assert!(
+            parse_control_status(&json!({"status":"resolved","decision":{"mode":"all"}})).is_err()
         );
     }
 

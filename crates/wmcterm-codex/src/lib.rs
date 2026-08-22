@@ -42,7 +42,6 @@ pub enum ApprovalDecision {
     Deny,
     Once,
     Always,
-    All,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -939,18 +938,7 @@ fn available(params: &Value, name: &str) -> bool {
     decision_names(params).is_none_or(|decisions| decisions.contains(name))
 }
 
-fn reject_decision(params: &Value) -> Value {
-    let decisions = decision_names(params).unwrap_or_default();
-    if decisions.is_empty() || decisions.contains("decline") {
-        json!("decline")
-    } else if decisions.contains("cancel") {
-        json!("cancel")
-    } else {
-        json!("decline")
-    }
-}
-
-fn command_amendment(params: &Value) -> Option<Value> {
+fn command_exact_rule(params: &Value) -> Option<Value> {
     let exec = params
         .get("proposedExecpolicyAmendment")
         .or_else(|| params.get("proposed_execpolicy_amendment"));
@@ -969,12 +957,24 @@ fn command_amendment(params: &Value) -> Option<Value> {
         .and_then(|items| items.first());
     if available(params, "applyNetworkPolicyAmendment")
         && let Some(amendment) = network
+        && !amendment.is_null()
     {
         return Some(json!({
             "applyNetworkPolicyAmendment": {"network_policy_amendment": amendment}
         }));
     }
     None
+}
+
+fn reject_decision(params: &Value) -> Value {
+    let decisions = decision_names(params).unwrap_or_default();
+    if decisions.is_empty() || decisions.contains("decline") {
+        json!("decline")
+    } else if decisions.contains("cancel") {
+        json!("cancel")
+    } else {
+        json!("decline")
+    }
 }
 
 fn command_decision(params: &Value, mode: ApprovalDecision) -> Value {
@@ -988,23 +988,14 @@ fn command_decision(params: &Value, mode: ApprovalDecision) -> Value {
             }
         }
         ApprovalDecision::Always => {
-            if available(params, "acceptForSession") {
-                json!("acceptForSession")
-            } else if let Some(amendment) = command_amendment(params) {
+            if let Some(amendment) = command_exact_rule(params) {
                 amendment
-            } else if available(params, "accept") {
-                json!("accept")
+            } else if available(params, "acceptForSession") {
+                json!("acceptForSession")
             } else {
                 reject_decision(params)
             }
         }
-        ApprovalDecision::All => command_amendment(params).unwrap_or_else(|| {
-            if available(params, "accept") {
-                json!("accept")
-            } else {
-                reject_decision(params)
-            }
-        }),
     }
 }
 
@@ -1012,21 +1003,21 @@ fn supported_modes(request: &ApprovalRequest) -> Vec<ApprovalDecision> {
     let mut modes = vec![ApprovalDecision::Deny];
     match request.kind {
         ApprovalKind::Permissions => {
-            modes.extend([
-                ApprovalDecision::Once,
-                ApprovalDecision::Always,
-                ApprovalDecision::All,
-            ]);
-        }
-        ApprovalKind::CommandExecution => {
             if available(&request.params, "accept") {
                 modes.push(ApprovalDecision::Once);
             }
             if available(&request.params, "acceptForSession") {
                 modes.push(ApprovalDecision::Always);
             }
-            if command_amendment(&request.params).is_some() {
-                modes.push(ApprovalDecision::All);
+        }
+        ApprovalKind::CommandExecution => {
+            if available(&request.params, "accept") {
+                modes.push(ApprovalDecision::Once);
+            }
+            if available(&request.params, "acceptForSession")
+                || command_exact_rule(&request.params).is_some()
+            {
+                modes.push(ApprovalDecision::Always);
             }
         }
         ApprovalKind::FileChange => {
@@ -1051,11 +1042,9 @@ fn file_decision(params: &Value, mode: ApprovalDecision) -> Value {
                 reject_decision(params)
             }
         }
-        ApprovalDecision::Always | ApprovalDecision::All => {
+        ApprovalDecision::Always => {
             if available(params, "acceptForSession") {
                 json!("acceptForSession")
-            } else if available(params, "accept") {
-                json!("accept")
             } else {
                 reject_decision(params)
             }
@@ -1064,7 +1053,7 @@ fn file_decision(params: &Value, mode: ApprovalDecision) -> Value {
 }
 
 fn permission_decision(params: &Value, mode: ApprovalDecision) -> Value {
-    let persistent = matches!(mode, ApprovalDecision::Always | ApprovalDecision::All);
+    let persistent = matches!(mode, ApprovalDecision::Always);
     let permissions = if mode == ApprovalDecision::Deny {
         json!({})
     } else {
@@ -2297,11 +2286,29 @@ mod tests {
             command_decision(&command, ApprovalDecision::Deny),
             "decline"
         );
+        let amendable_command = json!({
+            "availableDecisions": ["accept", "acceptWithExecpolicyAmendment", "decline"],
+            "proposedExecpolicyAmendment": {"path":"/tmp/a"}
+        });
+        assert_eq!(
+            command_decision(&amendable_command, ApprovalDecision::Always),
+            json!({"acceptWithExecpolicyAmendment":{"execpolicy_amendment":{"path":"/tmp/a"}}})
+        );
+        let network_rule_command = json!({
+            "availableDecisions": ["accept", "applyNetworkPolicyAmendment", "decline"],
+            "proposedNetworkPolicyAmendments": [
+                {"destination":"8.8.8.8","protocol":"tcp"}
+            ]
+        });
+        assert_eq!(
+            command_decision(&network_rule_command, ApprovalDecision::Always),
+            json!({"applyNetworkPolicyAmendment":{"network_policy_amendment":{"destination":"8.8.8.8","protocol":"tcp"}}})
+        );
         assert!(serde_json::from_value::<ApprovalDecision>(json!("bypass")).is_err());
 
         let file = json!({"availableDecisions": ["accept", "acceptForSession", "decline"]});
         assert_eq!(
-            file_decision(&file, ApprovalDecision::All),
+            file_decision(&file, ApprovalDecision::Always),
             "acceptForSession"
         );
 
@@ -2322,8 +2329,64 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            file_request.controlled_response(ApprovalDecision::All),
+            file_request.controlled_response(ApprovalDecision::Always),
             json!({"id": 7, "result": {"decision": "decline"}})
+        );
+    }
+
+    #[test]
+    fn command_mode_always_exposes_only_exact_session_decision() {
+        let request = ApprovalRequest::parse(&json!({
+            "id": 8,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "threadId": "thread-a",
+                "itemId": "item-a",
+                "availableDecisions": ["accept", "decline"]
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            supported_modes(&request),
+            vec![ApprovalDecision::Deny, ApprovalDecision::Once]
+        );
+
+        assert!(
+            parse_approval_control_status(&json!({"status":"resolved","decision":{"mode":"all"}}))
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn command_mode_always_prefers_exact_rule_when_present() {
+        let request = ApprovalRequest::parse(&json!({
+            "id": 9,
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "threadId": "thread-a",
+                "itemId": "item-a",
+                "availableDecisions": [
+                    "accept",
+                    "acceptForSession",
+                    "acceptWithExecpolicyAmendment",
+                    "decline"
+                ],
+                "proposedExecpolicyAmendment": {"path":"/tmp/allowlist-rule"},
+                "acceptForSession": true
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            command_decision(&request.params, ApprovalDecision::Always),
+            json!({"acceptWithExecpolicyAmendment":{"execpolicy_amendment":{"path":"/tmp/allowlist-rule"}}})
+        );
+        assert_eq!(
+            supported_modes(&request),
+            vec![
+                ApprovalDecision::Deny,
+                ApprovalDecision::Once,
+                ApprovalDecision::Always
+            ]
         );
     }
 }

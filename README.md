@@ -174,20 +174,30 @@ transcript 加载到监视器。它识别所有携带线程 ID 的 `thread/*` �
 线程列表，因此遗漏的 resume 通知不会永久绕过审批桥。
 托管 Codex 默认以 `--ask-for-approval on-request --sandbox workspace-write` 启动：
 普通工作区操作无需提示即可进行，沙箱外请求则路由至 wmcterm 的集中式审批 UI。
+需要长时间无人干预时，可从命令面板选择“新建 Codex/Claude Code（无人值守）”，
+或运行 `wmcterm agent --mode unattended codex|claude`。该模式使用 provider 原生的
+自动审查能力：Codex 使用 `--approve-for-me`（该参数自身启用 `workspace-write`
+沙箱），Claude 使用 `--permission-mode auto`；它不是“自动同意所有请求”，也不会
+关闭沙箱。
 对于这些托管 app-server 会话，通用 Codex `PermissionRequest` Hook 被视为重复遥测，
 不会创建第二个可操作请求；非托管 Codex 的 Hook 通知保持正常行为。
 如果根 Codex TUI 先回答同一个 app-server 请求，wmcterm 会消费 Codex 的
 `serverRequest/resolved` 确认或精确匹配的 item lifecycle 事件，并且只关闭对应的
 通知卡片；终端按键和无关 item 活动绝不会清除审批。
-显式指定的审批或沙箱选项仍然优先。
-始终拒绝 `--yolo` 和 `--dangerously-bypass-approvals-and-sandbox`；如果外部隔离环境
-需要不同的信任模型，请在托管启动器之外运行 Codex。
+显式指定的审批或沙箱选项仍然优先。托管启动器拒绝 Codex/Claude 的 bypass 参数、
+`danger-full-access` 沙箱和 CLI `--mode full-access`。命令面板另有明确标为“完全访问…”
+的人工入口；选择后还必须输入 `FULL ACCESS`，且只影响新启动的 Agent 会话，不写入
+配置。该会话关闭审批和沙箱，应仅在已有外部隔离边界时使用。
 
 可操作的 Agent 请求使用有界请求/回复通道，而不是普通通知。使用
 `wmcterm agent-request list` 查看请求，然后使用
 `agent-request reply ID --approve|--deny|--choice ID|--text TEXT` 或
 `agent-request cancel ID [REASON]` 处理。请求携带所属 Surface 和终端 lifecycle
-标识，会安全过期，并拒绝陈旧或重复的响应。
+标识，会安全过期，并拒绝陈旧或重复的响应。通知中心的审批卡片优先显示命令、
+工具、工作目录、原因或权限等可读摘要；详情保留格式化 JSON，并提供滚轮、方向键、
+Page Up/Down、Home/End、行数进度和可拖动滚动条。
+卡片只呈现“拒绝”“允许一次”和 provider 明确提供时的“信任规则”；“无人值守”和
+“完全访问”是 Agent 会话启动模式，不是某一条审批请求的升级按钮。
 
 交互式关闭操作会在终止活动进程前发出警告。明确指定工作区、窗格或表面 UUID 的
 Agent 和 CLI 控制调用会直接执行，不弹出 UI 确认；显式目标和调用 Agent 的审批边界
@@ -293,8 +303,8 @@ bell-debounce-ms = 1000
 内置默认字体为 `Maple Mono Normal NF`，复制自 `MapleMonoNormal-NF-unhinted`
 发行版；字体资产中包含其 OFL 许可证。
 
-应用程序/窗口图标位于 `assets/icons`，从同级 wmcssh 项目原样复制。PNG 在运行时由
-winit 加载，多分辨率 ICO 则嵌入 Windows 构建。
+应用程序/窗口图标位于 `assets/icons`，基于同级 wmcssh 项目的图标调整了圆角边框和
+透明外区。PNG 在运行时由 winit 加载，多分辨率 ICO 则嵌入 Windows 构建。
 
 支持 OSC 9/99 通知和 wmcterm OSC 777 Agent 协议。OSC 777 载荷使用
 `wmcterm;STATE;MESSAGE`，其中 state 为 `running`、`input`、`permission`、

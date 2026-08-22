@@ -38,10 +38,18 @@ from the currently focused UI item: the user may be viewing another workspace.
   sandbox option only when the user requests one.
 - Never pass `--yolo` or `--dangerously-bypass-approvals-and-sandbox`; wmcterm
   rejects both shortcuts instead of weakening the workspace sandbox.
+- Only when the user explicitly requests long-running unattended execution, use
+  `wmcterm agent --mode unattended codex`. This keeps `workspace-write` and uses
+  Codex's native automatic reviewer; it is not blanket approval. Full Access is
+  human-only in the wmcterm UI and must never be selected or reconstructed by an
+  Agent.
 
 ## Launch Claude safely
 
 - Launch a managed Claude Code process with `wmcterm agent claude`.
+- Only when the user explicitly requests unattended execution, use
+  `wmcterm agent --mode unattended claude`; this selects Claude's native `auto`
+  permission mode. Never pass `bypassPermissions` or dangerous-skip flags.
 - `wmcterm agent PROGRAM` runs in the terminal that invokes it. When it is the
   `--command` of a new pane, it must not create another tab or depend on UI
   focus.

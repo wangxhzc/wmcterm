@@ -50,6 +50,21 @@ pub(crate) fn centered_text_left(bounds: Bounds, text: &str, font_size: f32) -> 
     bounds.x + ((bounds.width - text_width) / 2.0).max(0.0)
 }
 
+pub(crate) fn centered_truncated_text_left(
+    bounds: Bounds,
+    text: &str,
+    font_size: f32,
+) -> (String, f32) {
+    if font_size <= 0.0 {
+        return (text.to_owned(), centered_text_left(bounds, text, 1.0));
+    }
+    let inner_width = (bounds.width - 8.0).max(font_size * 0.6);
+    let max_columns = (inner_width / (font_size * 0.6)).floor().max(1.0) as usize;
+    let visible = truncate_display_width(text, max_columns);
+    let left = centered_text_left(bounds, &visible, font_size);
+    (visible, left)
+}
+
 pub(crate) fn scroll_selection(index: usize, len: usize, delta: isize) -> usize {
     if len == 0 {
         return 0;
@@ -801,6 +816,20 @@ mod tests {
         );
         assert!(buttons.windows(2).all(|pair| pair[0].x + 40.0 == pair[1].x));
         assert!((centered_text_left(buttons[0], "×", 16.0) - 815.2).abs() < 0.01);
+    }
+
+    #[test]
+    fn centered_truncated_text_left_honors_bounds_and_keeps_ellipsis() {
+        let bounds = Bounds {
+            x: 100.0,
+            y: 12.0,
+            width: 44.0,
+            height: 20.0,
+        };
+        let (truncated, left) = centered_truncated_text_left(bounds, "Trust Rule", 12.0);
+        assert!(truncated.ends_with('…'));
+        assert!(display_width(&truncated) <= 6);
+        assert!((left - bounds.x).abs() < 20.0);
     }
 
     #[test]

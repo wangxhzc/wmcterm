@@ -255,6 +255,14 @@ impl Language {
         }
     }
 
+    pub(crate) const fn details(self) -> &'static str {
+        if self.is_chinese() {
+            "详情"
+        } else {
+            "Details"
+        }
+    }
+
     pub(crate) const fn deny(self) -> &'static str {
         if self.is_chinese() { "拒绝" } else { "Deny" }
     }
@@ -269,17 +277,25 @@ impl Language {
 
     pub(crate) const fn always_allow(self) -> &'static str {
         if self.is_chinese() {
-            "始终允许"
+            "信任规则"
         } else {
-            "Always Allow"
+            "Trust Rule"
         }
     }
 
-    pub(crate) const fn allow_all_tools(self) -> &'static str {
+    pub(crate) fn full_access_confirmation(self, agent: &str) -> String {
         if self.is_chinese() {
-            "全部工具"
+            format!("{agent} 完全访问（危险）：输入 FULL ACCESS")
         } else {
-            "All Tools"
+            format!("{agent} Full Access (unsafe): type FULL ACCESS")
+        }
+    }
+
+    pub(crate) const fn full_access_confirmation_error(self) -> &'static str {
+        if self.is_chinese() {
+            "确认短语不匹配；未启动 Agent"
+        } else {
+            "Confirmation phrase did not match; Agent was not started"
         }
     }
 
@@ -353,6 +369,14 @@ impl Language {
         }
     }
 
+    pub(crate) fn terminal_warning(self, warning: &str) -> String {
+        if self.is_chinese() {
+            format!("终端操作失败（可继续使用）：{warning}")
+        } else {
+            format!("Terminal operation failed (safe to continue): {warning}")
+        }
+    }
+
     pub(crate) fn terminal_spawn_failed(self, error: &str) -> String {
         if self.is_chinese() {
             format!("无法启动终端：{error}")
@@ -423,6 +447,10 @@ impl Language {
             "surface.filter_logs" => "筛选当前日志",
             "agent.claude" => "新建 Claude Code",
             "agent.codex" => "新建 Codex",
+            "agent.claude.unattended" => "新建 Claude Code（无人值守）",
+            "agent.codex.unattended" => "新建 Codex（无人值守）",
+            "agent.claude.full_access" => "新建 Claude Code（完全访问…）",
+            "agent.codex.full_access" => "新建 Codex（完全访问…）",
             "agent.gemini" => "新建 Gemini CLI",
             "agent.opencode" => "新建 OpenCode",
             "pane.close" => "关闭分区",
@@ -485,6 +513,10 @@ mod tests {
         assert_eq!(
             Language::SimplifiedChinese.terminal_error("broken pipe"),
             "终端错误：broken pipe"
+        );
+        assert_eq!(
+            Language::SimplifiedChinese.terminal_warning("copy selection: invalid value"),
+            "终端操作失败（可继续使用）：copy selection: invalid value"
         );
         assert!(
             Language::SimplifiedChinese

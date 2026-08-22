@@ -28,6 +28,7 @@ for language in en zh-CN; do
     terminal_menu_screenshot="$ui_tmp/wmcterm-$language-terminal-menu.png"
     sidebar_resize_screenshot="$ui_tmp/wmcterm-$language-sidebar-resize.png"
     prompt_screenshot="$ui_tmp/wmcterm-$language-prompt.png"
+    full_access_prompt_screenshot="$ui_tmp/wmcterm-$language-full-access-prompt.png"
     xvfb-run -a --server-args="-screen 0 1280x800x24" sh -eu -c '
         export WMCTERM_UI_LANGUAGE="$1"
         export WGPU_BACKEND=gl
@@ -141,10 +142,18 @@ for language in en zh-CN; do
         sleep 0.3
         import -window "$window_id" "$5"
         identify "$5" >/dev/null
+        xdotool key Escape
+        xdotool key ctrl+shift+p
+        xdotool type --delay 10 "agent.codex.full_access"
+        xdotool key Return
+        sleep 0.3
+        import -window "$window_id" "${17}"
+        identify "${17}" >/dev/null
+        xdotool key Escape
         kill "$app_pid" 2>/dev/null || true
         wait "$app_pid" 2>/dev/null || true
         trap - EXIT
-    ' sh "$language" "$ui_tmp" "$PWD/target/debug/wmcterm" "$screenshot" "$palette_screenshot" "$sidebar_hover_screenshot" "$workspace_menu_screenshot" "$split_screenshot" "$tab_menu_screenshot" "$sidebar_hidden_screenshot" "$notifications_screenshot" "$empty_workspace_screenshot" "$empty_pane_screenshot" "$terminal_menu_screenshot" "$sidebar_resize_screenshot" "$prompt_screenshot"
+    ' sh "$language" "$ui_tmp" "$PWD/target/debug/wmcterm" "$screenshot" "$palette_screenshot" "$sidebar_hover_screenshot" "$workspace_menu_screenshot" "$split_screenshot" "$tab_menu_screenshot" "$sidebar_hidden_screenshot" "$notifications_screenshot" "$empty_workspace_screenshot" "$empty_pane_screenshot" "$terminal_menu_screenshot" "$sidebar_resize_screenshot" "$prompt_screenshot" "$full_access_prompt_screenshot"
 
     dimensions="$(identify -format '%wx%h' "$screenshot")"
     [ "$dimensions" = "1000x650" ] || {
@@ -199,6 +208,13 @@ for language in en zh-CN; do
         exit 1
     }
     cp "$prompt_screenshot" "target/ui-smoke-$language-prompt.png"
+    full_access_prompt_difference="$(compare -metric AE "$screenshot" \
+        "$full_access_prompt_screenshot" null: 2>&1 || true)"
+    awk -v pixels="$full_access_prompt_difference" 'BEGIN { exit !(pixels > 10000) }' || {
+        echo "$language full access confirmation prompt did not visibly open" >&2
+        exit 1
+    }
+    cp "$full_access_prompt_screenshot" "target/ui-smoke-$language-full-access-prompt.png"
     empty_workspace_difference="$(compare -metric AE "$screenshot" \
         "$empty_workspace_screenshot" null: 2>&1 || true)"
     awk -v pixels="$empty_workspace_difference" 'BEGIN { exit !(pixels > 10000) }' || {

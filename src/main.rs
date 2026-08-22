@@ -2,6 +2,7 @@ use std::{
     env, fs,
     io::{Read, Write},
     path::{Path, PathBuf},
+    str::FromStr,
     sync::{
         atomic::{AtomicU64, Ordering},
         mpsc,
@@ -12,6 +13,7 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use serde_json::Value;
+use wmcterm_core::AgentRunMode;
 use wmcterm_ipc::{Request, call, default_socket_path, notify as notify_ipc};
 use wmcterm_pty::{CommandSpec, PtySize, run_to_end};
 use wmcterm_terminal::{TerminalEngine, TerminalSize};
@@ -153,10 +155,12 @@ fn print_help() {
          \x20 wmcterm agent-request list|reply|cancel ...\n\
          \x20 wmcterm hook receive|plan|install --agent KIND [--event NAME]\n\
          \x20 wmcterm skill print|install [--scope project|user] [--force]\n\
-         \x20 wmcterm agent claude|codex|gemini|opencode [ARG...]\n\
+         \x20 wmcterm agent [--mode interactive|unattended|full-access] claude|codex|gemini|opencode [ARG...]\n\
          \x20 wmcterm codex-teams [CODEX_ARG...]\n\
          \x20   Codex defaults: --ask-for-approval on-request --sandbox workspace-write\n\
-         \x20   --yolo and --dangerously-bypass-approvals-and-sandbox are rejected\n\
+         \x20   Unattended: Codex --approve-for-me/workspace-write; Claude --permission-mode auto\n\
+         \x20   --mode full-access is blocked in CLI and requires UI-authorized flow\n\
+         \x20   Managed Codex/Claude bypass options are rejected\n\
          \x20 wmcterm ssh TARGET [SSH_ARG...]\n\
          \x20 wmcterm docker CONTAINER [COMMAND...]\n\
          \x20 wmcterm kube POD [COMMAND...]\n\
@@ -171,7 +175,10 @@ fn print_help() {
 fn run_codex_teams() -> Result<()> {
     // Reject unsafe permission shortcuts before allocating bridge resources or
     // requiring terminal context.
-    let args = plan_codex_launch_args(&env::args().skip(2).collect::<Vec<_>>())?;
+    let args = plan_codex_launch_args(
+        AgentRunMode::Interactive,
+        &env::args().skip(2).collect::<Vec<_>>(),
+    )?;
     let config = codex_teams_config(
         env::var("WMCTERM_WORKSPACE_ID").ok(),
         env::var("WMCTERM_SURFACE_ID").ok(),
@@ -199,10 +206,13 @@ fn run_codex_teams() -> Result<()> {
     Ok(())
 }
 
-/// Apply wmcterm's safe unattended defaults without overriding an explicit
-/// Codex approval or sandbox choice. Fully unsandboxed shortcuts are never
-/// accepted through the managed multi-agent launcher.
-fn plan_codex_launch_args(args: &[String]) -> Result<Vec<String>> {
+/// Apply wmcterm's safe Codex launch policy without overriding explicit user
+/// approval or sandbox configuration. Fully unsafe shortcuts are never accepted
+/// through the managed multi-agent launcher.
+fn plan_codex_launch_args(mode: AgentRunMode, args: &[String]) -> Result<Vec<String>> {
+    if mode == AgentRunMode::FullAccess {
+        bail!("`--mode full-access` is not supported for CLI launch");
+    }
     let mut approval_is_explicit = false;
     let mut sandbox_is_explicit = false;
     let mut index = 0;
@@ -223,7 +233,17 @@ fn plan_codex_launch_args(args: &[String]) -> Result<Vec<String>> {
         }
         match argument.as_str() {
             "-a" | "--ask-for-approval" => approval_is_explicit = true,
-            "-s" | "--sandbox" => sandbox_is_explicit = true,
+            "-s" | "--sandbox" => {
+                if args
+                    .get(index + 1)
+                    .is_some_and(|value| value == "danger-full-access")
+                {
+                    bail!(
+                        "Codex sandbox `danger-full-access` is not allowed by wmcterm's managed agent launcher"
+                    );
+                }
+                sandbox_is_explicit = true;
+            }
             // These Codex shortcuts make both permission dimensions explicit.
             "--full-auto" | "--approve-for-me" => {
                 approval_is_explicit = true;
@@ -231,6 +251,7 @@ fn plan_codex_launch_args(args: &[String]) -> Result<Vec<String>> {
             }
             "-c" | "--config" => {
                 if let Some(value) = args.get(index + 1) {
+                    reject_unsafe_codex_permission_config(value)?;
                     mark_codex_permission_config(
                         value,
                         &mut approval_is_explicit,
@@ -242,12 +263,18 @@ fn plan_codex_launch_args(args: &[String]) -> Result<Vec<String>> {
             _ => {
                 if argument.starts_with("--ask-for-approval=") {
                     approval_is_explicit = true;
-                } else if argument.starts_with("--sandbox=") {
+                } else if let Some(value) = argument.strip_prefix("--sandbox=") {
+                    if value == "danger-full-access" {
+                        bail!(
+                            "Codex sandbox `danger-full-access` is not allowed by wmcterm's managed agent launcher"
+                        );
+                    }
                     sandbox_is_explicit = true;
                 } else if let Some(value) = argument
                     .strip_prefix("-c=")
                     .or_else(|| argument.strip_prefix("--config="))
                 {
+                    reject_unsafe_codex_permission_config(value)?;
                     mark_codex_permission_config(
                         value,
                         &mut approval_is_explicit,
@@ -260,11 +287,26 @@ fn plan_codex_launch_args(args: &[String]) -> Result<Vec<String>> {
     }
 
     let mut planned = Vec::with_capacity(args.len() + 4);
-    if !approval_is_explicit {
-        planned.extend(["--ask-for-approval".into(), "on-request".into()]);
-    }
-    if !sandbox_is_explicit {
-        planned.extend(["--sandbox".into(), "workspace-write".into()]);
+    match mode {
+        AgentRunMode::Interactive => {
+            if !approval_is_explicit {
+                planned.extend(["--ask-for-approval".into(), "on-request".into()]);
+            }
+            if !sandbox_is_explicit {
+                planned.extend(["--sandbox".into(), "workspace-write".into()]);
+            }
+        }
+        AgentRunMode::Unattended => {
+            if sandbox_is_explicit && !approval_is_explicit {
+                bail!(
+                    "an explicit Codex sandbox cannot be combined with wmcterm unattended mode; `--approve-for-me` selects the workspace-write sandbox itself"
+                );
+            }
+            if !approval_is_explicit {
+                planned.extend(["--approve-for-me".into()]);
+            }
+        }
+        AgentRunMode::FullAccess => unreachable!("full access is rejected above"),
     }
     planned.extend_from_slice(args);
     Ok(planned)
@@ -277,6 +319,20 @@ fn mark_codex_permission_config(value: &str, approval: &mut bool, sandbox: &mut 
         "sandbox_mode" => *sandbox = true,
         _ => {}
     }
+}
+
+fn reject_unsafe_codex_permission_config(value: &str) -> Result<()> {
+    let Some((key, value)) = value.split_once('=') else {
+        return Ok(());
+    };
+    if key.trim() == "sandbox_mode"
+        && value.trim().trim_matches(['\'', '"']) == "danger-full-access"
+    {
+        bail!(
+            "Codex sandbox `danger-full-access` is not allowed by wmcterm's managed agent launcher"
+        );
+    }
+    Ok(())
 }
 
 fn codex_teams_config(
@@ -942,11 +998,8 @@ fn run_cli(scope: String) -> Result<()> {
 /// and route the Agent to the workspace's active pane when the split was made
 /// with `--no-focus`.
 fn run_agent(mut args: impl Iterator<Item = String>) -> Result<()> {
-    let program = args
-        .next()
-        .context("usage: wmcterm agent PROGRAM [ARG...]")?;
-    let supplied = args.collect::<Vec<_>>();
-    let (executable, child_args) = plan_agent_process(&program, &supplied)?;
+    let (mode, program, supplied) = parse_agent_launch_args(&mut args)?;
+    let (executable, child_args) = plan_agent_process(mode, &program, &supplied)?;
     let status = std::process::Command::new(&executable)
         .args(&child_args)
         .status()
@@ -957,15 +1010,109 @@ fn run_agent(mut args: impl Iterator<Item = String>) -> Result<()> {
     Ok(())
 }
 
-fn plan_agent_process(program: &str, supplied: &[String]) -> Result<(PathBuf, Vec<String>)> {
+fn parse_agent_launch_args(
+    args: &mut impl Iterator<Item = String>,
+) -> Result<(AgentRunMode, String, Vec<String>)> {
+    let mut args = args.collect::<Vec<_>>();
+    if args.is_empty() {
+        bail!("usage: wmcterm agent [--mode interactive|unattended|full-access] PROGRAM [ARG...]");
+    }
+
+    let mut mode = AgentRunMode::Interactive;
+    if args[0] == "--mode" {
+        let value = args
+            .get(1)
+            .context("`--mode` requires a mode value: interactive|unattended|full-access")?;
+        mode = parse_agent_run_mode(value)?;
+        args.drain(0..2);
+    } else if let Some(raw) = args[0].strip_prefix("--mode=") {
+        mode = parse_agent_run_mode(raw)?;
+        args.remove(0);
+    }
+
+    let program = args.first().cloned().context(
+        "usage: wmcterm agent [--mode interactive|unattended|full-access] PROGRAM [ARG...]",
+    )?;
+    let supplied = args[1..].to_vec();
+    Ok((mode, program, supplied))
+}
+
+fn parse_agent_run_mode(raw: &str) -> Result<AgentRunMode> {
+    AgentRunMode::from_str(raw).with_context(|| {
+        format!("invalid agent run mode `{raw}`; expected interactive|unattended|full-access")
+    })
+}
+
+fn plan_agent_process(
+    mode: AgentRunMode,
+    program: &str,
+    supplied: &[String],
+) -> Result<(PathBuf, Vec<String>)> {
+    if mode == AgentRunMode::FullAccess {
+        bail!("`--mode full-access` is only available from wmcterm's confirmed UI action");
+    }
     let (executable, child_args) = if program == "codex" {
         let mut child_args = vec!["codex-teams".to_owned()];
-        child_args.extend(plan_codex_launch_args(supplied)?);
+        child_args.extend(plan_codex_launch_args(mode, supplied)?);
         (env::current_exe()?, child_args)
-    } else {
+    } else if program == "claude" {
+        (
+            PathBuf::from(program),
+            plan_claude_launch_args(mode, supplied)?,
+        )
+    } else if mode == AgentRunMode::Interactive {
         (PathBuf::from(program), supplied.to_vec())
+    } else {
+        bail!("Agent `{program}` does not define a safe `{mode}` launch profile")
     };
     Ok((executable, child_args))
+}
+
+fn plan_claude_launch_args(mode: AgentRunMode, args: &[String]) -> Result<Vec<String>> {
+    let mut permission_mode_is_explicit = false;
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--" {
+            break;
+        }
+        if argument == "--dangerously-skip-permissions"
+            || argument == "--allow-dangerously-skip-permissions"
+            || argument.starts_with("--dangerously-skip-permissions=")
+            || argument.starts_with("--allow-dangerously-skip-permissions=")
+        {
+            bail!(
+                "unsafe Claude option {argument} is not allowed by wmcterm's managed agent launcher"
+            );
+        }
+        if argument == "--permission-mode" {
+            let value = args
+                .get(index + 1)
+                .context("`--permission-mode` requires a value")?;
+            if value == "bypassPermissions" {
+                bail!(
+                    "Claude permission mode `bypassPermissions` is not allowed by wmcterm's managed agent launcher"
+                );
+            }
+            permission_mode_is_explicit = true;
+            index += 1;
+        } else if let Some(value) = argument.strip_prefix("--permission-mode=") {
+            if value == "bypassPermissions" {
+                bail!(
+                    "Claude permission mode `bypassPermissions` is not allowed by wmcterm's managed agent launcher"
+                );
+            }
+            permission_mode_is_explicit = true;
+        }
+        index += 1;
+    }
+
+    let mut planned = Vec::with_capacity(args.len() + 2);
+    if mode == AgentRunMode::Unattended && !permission_mode_is_explicit {
+        planned.extend(["--permission-mode".into(), "auto".into()]);
+    }
+    planned.extend_from_slice(args);
+    Ok(planned)
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -2097,12 +2244,24 @@ mod tests {
 
     #[test]
     fn managed_agent_runs_in_the_calling_terminal_without_surface_rpc() {
-        let (program, args) =
-            plan_agent_process("claude", &["--model".into(), "sonnet".into()]).unwrap();
+        let (mode, program, supplied) = parse_agent_launch_args(
+            &mut ["--mode".into(), "unattended".into(), "codex".into()].into_iter(),
+        )
+        .unwrap();
+        assert_eq!(mode, AgentRunMode::Unattended);
+        assert_eq!(program, "codex");
+        assert_eq!(supplied, Vec::<String>::new());
+
+        let (program, args) = plan_agent_process(
+            AgentRunMode::Interactive,
+            "claude",
+            &["--model".into(), "sonnet".into()],
+        )
+        .unwrap();
         assert_eq!(program, PathBuf::from("claude"));
         assert_eq!(args, ["--model", "sonnet"]);
 
-        let (program, args) = plan_agent_process("codex", &[]).unwrap();
+        let (program, args) = plan_agent_process(AgentRunMode::Interactive, "codex", &[]).unwrap();
         assert_eq!(program, env::current_exe().unwrap());
         assert_eq!(args[0], "codex-teams");
         assert!(
@@ -2398,7 +2557,11 @@ mod tests {
     #[test]
     fn codex_launch_defaults_to_on_request_approvals_and_workspace_sandbox() {
         assert_eq!(
-            plan_codex_launch_args(&["--model".into(), "gpt-test".into()]).unwrap(),
+            plan_codex_launch_args(
+                AgentRunMode::Interactive,
+                &["--model".into(), "gpt-test".into()]
+            )
+            .unwrap(),
             [
                 "--ask-for-approval",
                 "on-request",
@@ -2413,28 +2576,42 @@ mod tests {
     #[test]
     fn codex_launch_preserves_explicit_permission_dimensions() {
         assert_eq!(
-            plan_codex_launch_args(&["-a".into(), "on-request".into()]).unwrap(),
+            plan_codex_launch_args(
+                AgentRunMode::Interactive,
+                &["-a".into(), "on-request".into()]
+            )
+            .unwrap(),
             ["--sandbox", "workspace-write", "-a", "on-request"]
         );
         assert_eq!(
-            plan_codex_launch_args(&["-s".into(), "read-only".into()]).unwrap(),
+            plan_codex_launch_args(
+                AgentRunMode::Interactive,
+                &["-s".into(), "read-only".into()]
+            )
+            .unwrap(),
             ["--ask-for-approval", "on-request", "-s", "read-only"]
         );
         assert_eq!(
-            plan_codex_launch_args(&[
-                "--ask-for-approval=on-request".into(),
-                "-s".into(),
-                "read-only".into(),
-            ])
+            plan_codex_launch_args(
+                AgentRunMode::Interactive,
+                &[
+                    "--ask-for-approval=on-request".into(),
+                    "-s".into(),
+                    "read-only".into(),
+                ],
+            )
             .unwrap(),
             ["--ask-for-approval=on-request", "-s", "read-only"]
         );
         assert_eq!(
-            plan_codex_launch_args(&[
-                "-c".into(),
-                "approval_policy=untrusted".into(),
-                "--config=sandbox_mode=read-only".into(),
-            ])
+            plan_codex_launch_args(
+                AgentRunMode::Interactive,
+                &[
+                    "-c".into(),
+                    "approval_policy=untrusted".into(),
+                    "--config=sandbox_mode=read-only".into(),
+                ],
+            )
             .unwrap(),
             [
                 "-c",
@@ -2451,8 +2628,121 @@ mod tests {
             "--dangerously-bypass-approvals-and-sandbox",
             "--dangerously-bypass-approvals-and-sandbox=true",
         ] {
-            assert!(plan_codex_launch_args(&[option.into()]).is_err());
+            assert!(plan_codex_launch_args(AgentRunMode::Interactive, &[option.into()]).is_err());
         }
-        assert!(plan_codex_launch_args(&["--".into(), "--yolo".into()]).is_ok());
+        assert!(
+            plan_codex_launch_args(AgentRunMode::Interactive, &["--".into(), "--yolo".into()])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn codex_launch_unattended_injects_approve_for_me_profile() {
+        assert_eq!(
+            plan_codex_launch_args(
+                AgentRunMode::Unattended,
+                &["--model".into(), "gpt-test".into()]
+            )
+            .unwrap(),
+            ["--approve-for-me", "--model", "gpt-test"]
+        );
+    }
+
+    #[test]
+    fn codex_unattended_rejects_an_explicit_sandbox_without_an_approval_policy() {
+        assert!(
+            plan_codex_launch_args(
+                AgentRunMode::Unattended,
+                &["--sandbox".into(), "workspace-write".into()]
+            )
+            .is_err()
+        );
+        assert_eq!(
+            plan_codex_launch_args(AgentRunMode::Unattended, &["--approve-for-me".into()]).unwrap(),
+            ["--approve-for-me"]
+        );
+    }
+
+    #[test]
+    fn codex_launch_rejects_cli_full_access_mode_without_ui_authorization() {
+        assert!(plan_codex_launch_args(AgentRunMode::FullAccess, &["--model".into()]).is_err());
+    }
+
+    #[test]
+    fn claude_unattended_uses_native_auto_mode_and_rejects_bypass() {
+        assert_eq!(
+            plan_claude_launch_args(
+                AgentRunMode::Unattended,
+                &["--model".into(), "sonnet".into()]
+            )
+            .unwrap(),
+            ["--permission-mode", "auto", "--model", "sonnet"]
+        );
+        assert_eq!(
+            plan_claude_launch_args(
+                AgentRunMode::Unattended,
+                &["--permission-mode=manual".into()]
+            )
+            .unwrap(),
+            ["--permission-mode=manual"]
+        );
+        for option in [
+            "--dangerously-skip-permissions",
+            "--allow-dangerously-skip-permissions",
+            "--permission-mode=bypassPermissions",
+        ] {
+            assert!(plan_claude_launch_args(AgentRunMode::Interactive, &[option.into()]).is_err());
+        }
+    }
+
+    #[test]
+    fn managed_codex_launcher_rejects_unsandboxed_variants() {
+        for args in [
+            vec!["--sandbox=danger-full-access".into()],
+            vec!["-s".into(), "danger-full-access".into()],
+            vec!["-c".into(), "sandbox_mode=danger-full-access".into()],
+            vec!["--config=sandbox_mode='danger-full-access'".into()],
+        ] {
+            assert!(plan_codex_launch_args(AgentRunMode::Interactive, &args).is_err());
+        }
+    }
+
+    #[test]
+    fn noninteractive_modes_are_limited_to_supported_managed_agents() {
+        assert!(plan_agent_process(AgentRunMode::Unattended, "gemini", &[]).is_err());
+        assert!(plan_agent_process(AgentRunMode::FullAccess, "codex", &[]).is_err());
+        assert!(plan_agent_process(AgentRunMode::FullAccess, "claude", &[]).is_err());
+    }
+
+    #[test]
+    fn parse_agent_launch_mode_preserves_legacy_and_rejects_invalid_mode() {
+        let (mode, program, supplied) = parse_agent_launch_args(
+            &mut ["claude".into(), "--model".into(), "sonnet".into()].into_iter(),
+        )
+        .unwrap();
+        assert_eq!(mode, AgentRunMode::Interactive);
+        assert_eq!(program, "claude");
+        assert_eq!(supplied, ["--model", "sonnet"]);
+
+        let (mode, program, supplied) = parse_agent_launch_args(
+            &mut [
+                "--mode=unattended".into(),
+                "codex".into(),
+                "--model".into(),
+                "gpt-test".into(),
+            ]
+            .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(mode, AgentRunMode::Unattended);
+        assert_eq!(program, "codex");
+        assert_eq!(supplied, ["--model", "gpt-test"]);
+
+        assert!(
+            parse_agent_launch_args(
+                &mut ["--mode".into(), "invalid".into(), "codex".into()].into_iter()
+            )
+            .is_err()
+        );
     }
 }

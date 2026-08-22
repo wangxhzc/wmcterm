@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use i18n::Language;
 use serde_json::{Value, json};
 use text_edit::{TextEditor, TextViewport};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
@@ -36,9 +36,10 @@ use wmcterm_config::{
 };
 use wmcterm_core::{
     Action, ActionRegistry, AgentActionRequest, AgentKindId, AgentLaunchInfo, AgentLifecycleEvent,
-    AgentLifecyclePhase, AgentRequestKind, AgentSession, AgentSessionEvent, AgentSessionEventKind,
-    AgentTelemetry, AppCommand, AppState, AttentionState, Notification, Pane, PaneCommand, PaneId,
-    PaneNode, SplitAxis, SurfaceId, SurfaceKind, TerminalId, WorkspaceCommand, WorkspaceId,
+    AgentLifecyclePhase, AgentRequestKind, AgentRunMode, AgentSession, AgentSessionEvent,
+    AgentSessionEventKind, AgentTelemetry, AppCommand, AppState, AttentionState, Notification,
+    Pane, PaneCommand, PaneId, PaneNode, SplitAxis, SurfaceId, SurfaceKind, TerminalId,
+    WorkspaceCommand, WorkspaceId,
 };
 use wmcterm_ipc::{
     AgentInteractionRequest, AgentRequestKind as IpcAgentRequestKind, AgentResolution,
@@ -242,6 +243,21 @@ struct ScrollbarDrag {
 }
 
 #[derive(Clone, Copy)]
+struct AgentRequestDetailScrollbarDrag {
+    grab_y: f32,
+}
+
+#[derive(Clone, Copy)]
+struct AgentRequestDetailLayout {
+    panel: ui::Bounds,
+    body: ui::Bounds,
+    total_lines: usize,
+    visible_lines: usize,
+    max_scroll: usize,
+    scrollbar: Option<(ui::Bounds, ui::Bounds)>,
+}
+
+#[derive(Clone, Copy)]
 struct MouseSelection {
     pane: PaneId,
     terminal: TerminalId,
@@ -265,6 +281,29 @@ enum PromptKind {
     ChangeWorkspaceDirectory,
     FindDirectory,
     FilterLogs,
+    ConfirmFullAccess(ManagedAgent),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ManagedAgent {
+    Claude,
+    Codex,
+}
+
+impl ManagedAgent {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Claude => "Claude Code",
+            Self::Codex => "Codex",
+        }
+    }
+
+    const fn full_access_command(self) -> &'static str {
+        match self {
+            Self::Claude => "claude --dangerously-skip-permissions",
+            Self::Codex => "codex --dangerously-bypass-approvals-and-sandbox",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -413,7 +452,6 @@ enum AgentApprovalAction {
     Deny,
     AllowOnce,
     AlwaysAllow,
-    AllTools,
 }
 
 const TAB_CONTEXT_ACTIONS: [TabContextAction; 3] = [
@@ -449,8 +487,36 @@ const WORKSPACE_CONTEXT_ACTIONS: [WorkspaceContextAction; 6] = [
 #[derive(Debug, Clone)]
 enum TerminalNotice {
     Exited(String),
+    Warning(String),
     Error(String),
     SpawnFailed(String),
+}
+
+fn terminal_notice_attention(notice: &TerminalNotice) -> Option<AttentionState> {
+    match notice {
+        TerminalNotice::Exited(_) => Some(AttentionState::Activity),
+        TerminalNotice::Warning(_) => None,
+        TerminalNotice::Error(_) | TerminalNotice::SpawnFailed(_) => Some(AttentionState::Error),
+    }
+}
+
+fn terminal_notice_is_error(notice: &TerminalNotice) -> bool {
+    matches!(
+        notice,
+        TerminalNotice::Error(_) | TerminalNotice::SpawnFailed(_)
+    )
+}
+
+fn clear_recoverable_terminal_notice(
+    notices: &mut HashMap<TerminalId, TerminalNotice>,
+    terminal: TerminalId,
+) -> bool {
+    if matches!(notices.get(&terminal), Some(TerminalNotice::Warning(_))) {
+        notices.remove(&terminal);
+        true
+    } else {
+        false
+    }
 }
 
 pub fn run() -> Result<()> {
@@ -571,6 +637,7 @@ struct WmctermApplication {
     agent_request_selection: usize,
     agent_request_action: usize,
     agent_request_detail: Option<(String, usize)>,
+    agent_request_detail_scrollbar_drag: Option<AgentRequestDetailScrollbarDrag>,
     sidebar_visible: bool,
     sidebar_scroll: usize,
     workspace_search: TextEditor,
@@ -742,6 +809,7 @@ impl WmctermApplication {
             agent_request_selection: 0,
             agent_request_action: 0,
             agent_request_detail: None,
+            agent_request_detail_scrollbar_drag: None,
             sidebar_visible: true,
             sidebar_scroll: 0,
             workspace_search: TextEditor::default(),
@@ -1114,7 +1182,20 @@ impl WmctermApplication {
         for tagged in events {
             let terminal_id = tagged.terminal;
             match tagged.event {
-                SessionEvent::Snapshot(snapshot) => { if let Some(runtime) = self.terminals.get_mut(&terminal_id) { runtime.snapshot = snapshot; runtime.snapshot_revision = runtime.snapshot_revision.wrapping_add(1); if visible_terminals.contains(&terminal_id) { changed = true; saw_snapshot |= active_terminal == Some(terminal_id); } } }
+                SessionEvent::Snapshot(snapshot) => {
+                    if let Some(runtime) = self.terminals.get_mut(&terminal_id) {
+                        runtime.snapshot = snapshot;
+                        runtime.snapshot_revision = runtime.snapshot_revision.wrapping_add(1);
+                        changed |= clear_recoverable_terminal_notice(
+                            &mut self.terminal_notices,
+                            terminal_id,
+                        );
+                        if visible_terminals.contains(&terminal_id) {
+                            changed = true;
+                            saw_snapshot |= active_terminal == Some(terminal_id);
+                        }
+                    }
+                }
                 SessionEvent::Exited(status) => {
                     tracing::info!(terminal=%tagged.terminal, %status, "terminal exited");
                     self.close_agent_session_for_terminal(terminal_id, status.clone());
@@ -1124,6 +1205,11 @@ impl WmctermApplication {
                 SessionEvent::Error(error) => {
                     tracing::error!(terminal=%tagged.terminal, %error, "PTY error");
                     self.report_terminal_notice(terminal_id, TerminalNotice::Error(error));
+                    changed = true;
+                }
+                SessionEvent::Warning(warning) => {
+                    tracing::warn!(terminal=%tagged.terminal, %warning, "recoverable terminal error");
+                    self.report_terminal_notice(terminal_id, TerminalNotice::Warning(warning));
                     changed = true;
                 }
                 SessionEvent::TitleChanged(title) => { if let Some(surface) = self.state.surfaces.values_mut().find(|surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal_id)) { surface.title = title; changed = true; } }
@@ -1285,19 +1371,23 @@ impl WmctermApplication {
     }
 
     fn report_terminal_notice(&mut self, terminal: TerminalId, notice: TerminalNotice) {
-        let attention = match &notice {
-            TerminalNotice::Exited(_) => AttentionState::Activity,
-            TerminalNotice::Error(_) | TerminalNotice::SpawnFailed(_) => AttentionState::Error,
-        };
-        if let Some(surface) = self
-            .state
-            .surfaces
-            .values_mut()
-            .find(|surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal))
+        if matches!(notice, TerminalNotice::Warning(_))
+            && self
+                .terminal_notices
+                .get(&terminal)
+                .is_some_and(terminal_notice_is_error)
+        {
+            return;
+        }
+        if let Some(attention) = terminal_notice_attention(&notice)
+            && let Some(surface) =
+                self.state.surfaces.values_mut().find(
+                    |surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal),
+                )
         {
             surface.attention = attention;
         }
-        if attention == AttentionState::Error
+        if terminal_notice_is_error(&notice)
             && let Some(index) = self.workspace_for_terminal(terminal)
             && let Some(workspace) = self.state.workspaces.get_mut(index)
         {
@@ -1552,6 +1642,14 @@ impl WmctermApplication {
 
     fn conclude_agent_request_state(&mut self, request: &AgentInteractionRequest) {
         let _ = self.resolve_agent_session_request(&request.request_id);
+        if self
+            .agent_request_detail
+            .as_ref()
+            .is_some_and(|(request_id, _)| request_id == &request.request_id)
+        {
+            self.agent_request_detail = None;
+            self.agent_request_detail_scrollbar_drag = None;
+        }
         if let Ok(surface) = uuid::Uuid::parse_str(&request.surface_id) {
             if let Some(notification) =
                 self.state
@@ -1848,13 +1946,27 @@ impl WmctermApplication {
         ) {
             return;
         }
-        if let Some((_, scroll)) = &mut self.agent_request_detail {
+        if self.agent_request_detail.is_some() {
             match event.logical_key {
                 Key::Named(NamedKey::Escape) | Key::Named(NamedKey::Enter) => {
                     self.agent_request_detail = None;
+                    self.agent_request_detail_scrollbar_drag = None;
                 }
-                Key::Named(NamedKey::ArrowUp) => *scroll = scroll.saturating_sub(1),
-                Key::Named(NamedKey::ArrowDown) => *scroll = scroll.saturating_add(1),
+                Key::Named(NamedKey::ArrowUp) => self.scroll_agent_request_detail(-1),
+                Key::Named(NamedKey::ArrowDown) => self.scroll_agent_request_detail(1),
+                Key::Named(NamedKey::PageUp) => {
+                    let page = self.agent_request_detail_page_size() as isize;
+                    self.scroll_agent_request_detail(-page);
+                }
+                Key::Named(NamedKey::PageDown) => {
+                    let page = self.agent_request_detail_page_size() as isize;
+                    self.scroll_agent_request_detail(page);
+                }
+                Key::Named(NamedKey::Home) => self.set_agent_request_detail_scroll(0),
+                Key::Named(NamedKey::End) => {
+                    let maximum = self.agent_request_detail_max_scroll();
+                    self.set_agent_request_detail_scroll(maximum);
+                }
                 _ => return,
             }
             self.rebuild_scene();
@@ -2438,11 +2550,9 @@ impl WmctermApplication {
                     }
                     Some('c') => {
                         if !self.copy_selection_to_clipboard()
-                            && let Some(runtime) = self
-                                .active_terminal_id()
-                                .and_then(|id| self.terminals.get(&id))
+                            && let Some(terminal) = self.active_terminal_id()
                         {
-                            let _ = runtime.session.send(SessionCommand::CopyAll);
+                            self.copy_all_to_clipboard(terminal);
                         }
                         return;
                     }
@@ -2779,10 +2889,34 @@ impl WmctermApplication {
             }
             "surface.filter_logs" => self.open_log_filter_prompt(),
             "agent.claude" => {
-                self.new_surface_command(Some("claude".into()));
+                self.new_surface_command(Some(managed_agent_command(
+                    AgentRunMode::Interactive,
+                    "claude",
+                )));
             }
             "agent.codex" => {
-                self.new_surface_command(Some(codex_teams_command()));
+                self.new_surface_command(Some(managed_agent_command(
+                    AgentRunMode::Interactive,
+                    "codex",
+                )));
+            }
+            "agent.claude.unattended" => {
+                self.new_surface_command(Some(managed_agent_command(
+                    AgentRunMode::Unattended,
+                    "claude",
+                )));
+            }
+            "agent.codex.unattended" => {
+                self.new_surface_command(Some(managed_agent_command(
+                    AgentRunMode::Unattended,
+                    "codex",
+                )));
+            }
+            "agent.claude.full_access" => {
+                self.open_full_access_prompt(ManagedAgent::Claude);
+            }
+            "agent.codex.full_access" => {
+                self.open_full_access_prompt(ManagedAgent::Codex);
             }
             "agent.gemini" => {
                 self.new_surface_command(Some("gemini".into()));
@@ -3237,6 +3371,52 @@ impl WmctermApplication {
             || agent.to_owned(),
             |workspace| format!("{agent} · {}", workspace.name),
         )
+    }
+
+    fn agent_request_detail_layout(
+        &self,
+        request: &AgentInteractionRequest,
+        scroll: usize,
+    ) -> AgentRequestDetailLayout {
+        agent_request_detail_layout(self.window_size, &request.message, scroll)
+    }
+
+    fn scroll_agent_request_detail(&mut self, delta: isize) {
+        let Some((request_id, current)) = self.agent_request_detail.as_ref() else {
+            return;
+        };
+        let Ok(Some(request)) = self.pending_agent_requests.get(request_id) else {
+            return;
+        };
+        let layout = self.agent_request_detail_layout(&request, *current);
+        let next = current.saturating_add_signed(delta).min(layout.max_scroll);
+        if let Some((_, scroll)) = &mut self.agent_request_detail {
+            *scroll = next;
+        }
+    }
+
+    fn agent_request_detail_scroll_metrics(&self) -> Option<(usize, usize)> {
+        let (request_id, scroll) = self.agent_request_detail.as_ref()?;
+        let request = self.pending_agent_requests.get(request_id).ok()??;
+        let layout = self.agent_request_detail_layout(&request, *scroll);
+        Some((layout.visible_lines, layout.max_scroll))
+    }
+
+    fn agent_request_detail_page_size(&self) -> usize {
+        self.agent_request_detail_scroll_metrics()
+            .map_or(1, |(visible, _)| visible.saturating_sub(1).max(1))
+    }
+
+    fn agent_request_detail_max_scroll(&self) -> usize {
+        self.agent_request_detail_scroll_metrics()
+            .map_or(0, |(_, maximum)| maximum)
+    }
+
+    fn set_agent_request_detail_scroll(&mut self, scroll: usize) {
+        let scroll = scroll.min(self.agent_request_detail_max_scroll());
+        if let Some((_, current)) = &mut self.agent_request_detail {
+            *current = scroll;
+        }
     }
 
     fn agent_request_range(&self, count: usize) -> std::ops::Range<usize> {
@@ -3715,6 +3895,7 @@ impl WmctermApplication {
             PromptKind::ChangeWorkspaceDirectory => workspace.cwd.display().to_string(),
             PromptKind::FindDirectory => String::new(),
             PromptKind::FilterLogs => String::new(),
+            PromptKind::ConfirmFullAccess(_) => String::new(),
         };
         self.prompt = Some(TextPrompt {
             kind,
@@ -3743,6 +3924,18 @@ impl WmctermApplication {
         self.rebuild_scene();
     }
 
+    fn open_full_access_prompt(&mut self, agent: ManagedAgent) {
+        if self.state.active_workspace().is_none() {
+            return;
+        }
+        self.prompt = Some(TextPrompt {
+            kind: PromptKind::ConfirmFullAccess(agent),
+            editor: TextEditor::default(),
+            error: None,
+        });
+        self.rebuild_scene();
+    }
+
     fn submit_prompt(&mut self) {
         let Some(prompt) = self.prompt.take() else {
             return;
@@ -3751,6 +3944,18 @@ impl WmctermApplication {
             return;
         };
         let input = prompt.editor.text().trim().to_owned();
+        if let PromptKind::ConfirmFullAccess(agent) = prompt.kind {
+            if input != "FULL ACCESS" {
+                self.prompt = Some(TextPrompt {
+                    error: Some(self.language.full_access_confirmation_error().into()),
+                    ..prompt
+                });
+                self.rebuild_scene();
+                return;
+            }
+            self.new_surface_command(Some(agent.full_access_command().into()));
+            return;
+        }
         let changes_directory = matches!(prompt.kind, PromptKind::ChangeWorkspaceDirectory);
         if matches!(prompt.kind, PromptKind::RenameWorkspace) && input.is_empty() {
             self.prompt = Some(TextPrompt {
@@ -3815,6 +4020,7 @@ impl WmctermApplication {
                 self.rebuild_scene();
                 return;
             }
+            PromptKind::ConfirmFullAccess(_) => unreachable!("handled before workspace command"),
         };
         let _ = self.state.execute(command);
         if changes_directory {
@@ -4975,10 +5181,7 @@ impl WmctermApplication {
                 SurfaceKind::Terminal(terminal) => self.terminal_notices.get(&terminal),
                 _ => None,
             })
-            .map(|notice| match notice {
-                TerminalNotice::Exited(_) => AttentionState::Activity,
-                TerminalNotice::Error(_) | TerminalNotice::SpawnFailed(_) => AttentionState::Error,
-            });
+            .and_then(terminal_notice_attention);
         let attention = [
             pending_state.map(|_| AttentionState::NeedsInput),
             notification_attention,
@@ -5034,10 +5237,9 @@ impl WmctermApplication {
                             _ => None,
                         })
                         .any(|terminal| {
-                            matches!(
-                                self.terminal_notices.get(&terminal),
-                                Some(TerminalNotice::Error(_) | TerminalNotice::SpawnFailed(_))
-                            )
+                            self.terminal_notices
+                                .get(&terminal)
+                                .is_some_and(terminal_notice_is_error)
                         })
                 });
         if let Some(workspace) = self.state.workspaces.get_mut(workspace_index) {
@@ -5215,9 +5417,7 @@ impl WmctermApplication {
                 }
             }
             TerminalContextAction::CopyAll => {
-                if let Some(runtime) = self.terminals.get(&menu.terminal) {
-                    let _ = runtime.session.send(SessionCommand::CopyAll);
-                }
+                self.copy_all_to_clipboard(menu.terminal);
             }
             TerminalContextAction::ClearScrollback => {
                 if let Some(runtime) = self.terminals.get(&menu.terminal) {
@@ -5596,8 +5796,46 @@ impl WmctermApplication {
             }
             return true;
         }
-        if self.agent_request_detail.is_some() {
+        if let Some((request_id, scroll)) = self.agent_request_detail.clone() {
+            let layout = self
+                .pending_agent_requests
+                .get(&request_id)
+                .ok()
+                .flatten()
+                .map(|request| self.agent_request_detail_layout(&request, scroll));
+            if let Some(layout) = layout {
+                if let Some((track, thumb)) = layout.scrollbar
+                    && (ui::Bounds {
+                        x: track.x - 6.0,
+                        width: track.width + 12.0,
+                        ..track
+                    })
+                    .contains(x, y)
+                {
+                    let grab_y = if y >= thumb.y && y < thumb.y + thumb.height {
+                        y - thumb.y
+                    } else {
+                        thumb.height / 2.0
+                    };
+                    self.set_agent_request_detail_scroll(scrollbar_scroll_for_pointer(
+                        track,
+                        thumb,
+                        layout.max_scroll,
+                        y,
+                        grab_y,
+                    ));
+                    self.agent_request_detail_scrollbar_drag =
+                        Some(AgentRequestDetailScrollbarDrag { grab_y });
+                    self.mouse_pressed = true;
+                    self.rebuild_scene();
+                    return true;
+                }
+                if layout.panel.contains(x, y) {
+                    return true;
+                }
+            }
             self.agent_request_detail = None;
+            self.agent_request_detail_scrollbar_drag = None;
             self.rebuild_scene();
             return true;
         }
@@ -6277,7 +6515,46 @@ impl WmctermApplication {
         false
     }
 
+    fn update_agent_request_detail_scrollbar_drag(&mut self) -> bool {
+        let Some(drag) = self.agent_request_detail_scrollbar_drag else {
+            return false;
+        };
+        let Some((request_id, scroll)) = self.agent_request_detail.clone() else {
+            self.agent_request_detail_scrollbar_drag = None;
+            return false;
+        };
+        let Some(layout) = self
+            .pending_agent_requests
+            .get(&request_id)
+            .ok()
+            .flatten()
+            .map(|request| self.agent_request_detail_layout(&request, scroll))
+        else {
+            self.agent_request_detail_scrollbar_drag = None;
+            return false;
+        };
+        let Some((track, thumb)) = layout.scrollbar else {
+            self.agent_request_detail_scrollbar_drag = None;
+            return false;
+        };
+        let next = scrollbar_scroll_for_pointer(
+            track,
+            thumb,
+            layout.max_scroll,
+            self.cursor_position.1,
+            drag.grab_y,
+        );
+        if next != scroll {
+            self.set_agent_request_detail_scroll(next);
+            self.rebuild_scene();
+        }
+        true
+    }
+
     fn update_mouse_action(&mut self) {
+        if self.update_agent_request_detail_scrollbar_drag() {
+            return;
+        }
         if self.update_text_edit_drag() {
             return;
         }
@@ -6497,6 +6774,9 @@ impl WmctermApplication {
         self.mouse_pressed = false;
         self.selection_last_redraw = None;
         self.selection_autoscroll_last = None;
+        if self.agent_request_detail_scrollbar_drag.take().is_some() {
+            return;
+        }
         if self.text_edit_drag.take().is_some() {
             self.rebuild_scene();
             return;
@@ -6566,7 +6846,7 @@ impl WmctermApplication {
         ))
     }
 
-    fn copy_selection_to_clipboard(&self) -> bool {
+    fn copy_selection_to_clipboard(&mut self) -> bool {
         let Some(selection) = self
             .selection
             .filter(|selection| selection.start != selection.end)
@@ -6580,13 +6860,29 @@ impl WmctermApplication {
             column: column.min(u16::MAX as usize) as u16,
             screen_row: screen_row.min(u32::MAX as usize) as u32,
         };
-        runtime
-            .session
-            .send(SessionCommand::CopySelection {
-                start: point(selection.start),
-                end: point(selection.end),
-            })
-            .is_ok()
+        let send_result = runtime.session.send(SessionCommand::CopySelection {
+            start: point(selection.start),
+            end: point(selection.end),
+        });
+        if send_result.is_ok() {
+            return true;
+        }
+        let Some(text) = snapshot_selection_text(&runtime.snapshot, selection.start, selection.end)
+        else {
+            return false;
+        };
+        self.set_clipboard_text(text).is_ok()
+    }
+
+    fn copy_all_to_clipboard(&mut self, terminal: TerminalId) -> bool {
+        let Some(runtime) = self.terminals.get(&terminal) else {
+            return false;
+        };
+        if runtime.session.send(SessionCommand::CopyAll).is_ok() {
+            return true;
+        }
+        let text = runtime.snapshot.to_plain_text();
+        self.set_clipboard_text(text).is_ok()
     }
 
     fn set_clipboard_text(&mut self, text: String) -> Result<(), String> {
@@ -7857,6 +8153,7 @@ impl WmctermApplication {
             {
                 let message = match notice {
                     TerminalNotice::Exited(status) => self.language.terminal_exited(status),
+                    TerminalNotice::Warning(warning) => self.language.terminal_warning(warning),
                     TerminalNotice::Error(error) => self.language.terminal_error(error),
                     TerminalNotice::SpawnFailed(error) => {
                         self.language.terminal_spawn_failed(error)
@@ -7879,7 +8176,7 @@ impl WmctermApplication {
                     width: rect.width - 20.0,
                     height: self.cell_height(),
                     color: match notice {
-                        TerminalNotice::Exited(_) => theme_yellow,
+                        TerminalNotice::Exited(_) | TerminalNotice::Warning(_) => theme_yellow,
                         TerminalNotice::Error(_) | TerminalNotice::SpawnFailed(_) => theme_red,
                     },
                     font_size: self.terminal_font_size,
@@ -8097,11 +8394,16 @@ impl WmctermApplication {
             let panel = self.prompt_panel();
             let input = self.prompt_input_bounds();
             let label = match prompt.kind {
-                PromptKind::RenameWorkspace => self.language.rename_workspace(),
-                PromptKind::DescribeWorkspace => self.language.workspace_description(),
-                PromptKind::ChangeWorkspaceDirectory => self.language.change_workspace_directory(),
-                PromptKind::FindDirectory => self.language.find_workspace(),
-                PromptKind::FilterLogs => self.language.filter_logs(),
+                PromptKind::RenameWorkspace => self.language.rename_workspace().to_owned(),
+                PromptKind::DescribeWorkspace => self.language.workspace_description().to_owned(),
+                PromptKind::ChangeWorkspaceDirectory => {
+                    self.language.change_workspace_directory().to_owned()
+                }
+                PromptKind::FindDirectory => self.language.find_workspace().to_owned(),
+                PromptKind::FilterLogs => self.language.filter_logs().to_owned(),
+                PromptKind::ConfirmFullAccess(agent) => {
+                    self.language.full_access_confirmation(agent.name())
+                }
             };
             overlay_rectangles.push(RectBlock {
                 left: 0.0,
@@ -8147,7 +8449,7 @@ impl WmctermApplication {
                 },
             );
             overlay_blocks.push(TextBlock {
-                text: label.into(),
+                text: label,
                 spans: vec![],
                 left: panel.x + 18.0,
                 top: panel.y + 14.0,
@@ -8384,7 +8686,11 @@ impl WmctermApplication {
                         color: theme_yellow,
                     });
                     overlay_blocks.push(TextBlock {
-                        text: format!("{} · Details", self.agent_request_source(request)),
+                        text: format!(
+                            "{} · {}",
+                            self.agent_request_source(request),
+                            self.language.details()
+                        ),
                         spans: vec![],
                         left: card.content.x,
                         top: card.content.y,
@@ -8436,15 +8742,18 @@ impl WmctermApplication {
                             },
                         });
                         let label = agent_approval_action_label(self.language, *action);
+                        let font_size = 12.0;
+                        let (label, left) =
+                            ui::centered_truncated_text_left(*button, label, font_size);
                         overlay_blocks.push(TextBlock {
-                            text: label.into(),
+                            text: label,
                             spans: vec![],
-                            left: ui::centered_text_left(*button, label, 12.0),
+                            left,
                             top: button.y + 4.0,
                             width: button.width,
                             height: button.height - 4.0,
                             color: theme_text,
-                            font_size: 12.0,
+                            font_size,
                             line_height: 19.0,
                         });
                     }
@@ -8628,14 +8937,8 @@ impl WmctermApplication {
         if let Some((request_id, scroll)) = &self.agent_request_detail
             && let Ok(Some(request)) = self.pending_agent_requests.get(request_id)
         {
-            let width = 620.0_f32.min((self.window_size.width as f32 - 40.0).max(260.0));
-            let height = 420.0_f32.min((self.window_size.height as f32 - 80.0).max(180.0));
-            let panel = ui::Bounds {
-                x: (self.window_size.width as f32 - width) / 2.0,
-                y: (self.window_size.height as f32 - height) / 2.0,
-                width,
-                height,
-            };
+            let layout = self.agent_request_detail_layout(&request, *scroll);
+            let panel = layout.panel;
             overlay_rectangles.push(RectBlock {
                 left: 0.0,
                 top: 40.0,
@@ -8659,21 +8962,57 @@ impl WmctermApplication {
                 font_size: 15.0,
                 line_height: 21.0,
             });
-            let columns = ((panel.width - 36.0) / (13.0 * 0.6)).floor() as usize;
-            let lines = ui::notification_lines(&request.message, columns);
-            let capacity = ((panel.height - 70.0) / 20.0).floor() as usize;
-            let start = (*scroll).min(lines.len().saturating_sub(capacity));
-            for (index, line) in lines.into_iter().skip(start).take(capacity).enumerate() {
+            let columns = ((layout.body.width - 18.0) / (13.0 * 0.6)).floor().max(1.0) as usize;
+            let lines = agent_request_detail_lines(&request.message, columns);
+            let start = (*scroll).min(layout.max_scroll);
+            for (index, line) in lines
+                .into_iter()
+                .skip(start)
+                .take(layout.visible_lines)
+                .enumerate()
+            {
                 overlay_blocks.push(TextBlock {
                     text: line,
                     spans: vec![],
                     left: panel.x + 18.0,
                     top: panel.y + 48.0 + index as f32 * 20.0,
-                    width: panel.width - 36.0,
+                    width: panel.width - 54.0,
                     height: 20.0,
                     color: theme_text,
                     font_size: 13.0,
                     line_height: 19.0,
+                });
+            }
+            if let Some((track, thumb)) = layout.scrollbar {
+                overlay_rectangles.push(RectBlock {
+                    left: track.x,
+                    top: track.y,
+                    width: track.width,
+                    height: track.height,
+                    color: theme_crust,
+                });
+                overlay_rectangles.push(RectBlock {
+                    left: thumb.x - 2.0,
+                    top: thumb.y,
+                    width: thumb.width + 4.0,
+                    height: thumb.height,
+                    color: theme_subtext,
+                });
+                overlay_blocks.push(TextBlock {
+                    text: format!(
+                        "{}–{} / {}",
+                        start + 1,
+                        (start + layout.visible_lines).min(layout.total_lines),
+                        layout.total_lines
+                    ),
+                    spans: vec![],
+                    left: panel.x + panel.width - 130.0,
+                    top: panel.y + 15.0,
+                    width: 96.0,
+                    height: 20.0,
+                    color: theme_subtext,
+                    font_size: 12.0,
+                    line_height: 18.0,
                 });
             }
         }
@@ -9260,7 +9599,7 @@ impl WmctermApplication {
                 .and_then(|session| session.lifecycle.external_id.clone())
                 .unwrap_or_else(|| format!("{source}:{thread_id}"))
         });
-        let summary = format!("[{source}] {kind} · {method} {request_params}");
+        let summary = agent_approval_message(self.language, source, kind, method, request_params);
         let interaction = AgentInteractionRequest {
             request_id: approval_id.clone(),
             surface_id: surface_id.to_string(),
@@ -9304,7 +9643,8 @@ impl WmctermApplication {
                     self.active_surface_id(),
                     surface_id,
                 ) {
-                    show_native_notification(self.language.agent_approval(), &summary);
+                    let preview = summary.split("\n\n").next().unwrap_or(&summary);
+                    show_native_notification(self.language.agent_approval(), preview);
                 }
                 self.rebuild_scene();
                 Ok(json!({"status":"pending","approval_id":approval_id}))
@@ -10269,9 +10609,9 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                         cell_height,
                     ),
                 };
-                if let Some((_, scroll)) = &mut self.agent_request_detail {
+                if self.agent_request_detail.is_some() {
                     if lines != 0 {
-                        *scroll = scroll.saturating_add_signed(lines.signum());
+                        self.scroll_agent_request_detail(lines);
                         self.rebuild_scene();
                     }
                     return;
@@ -10487,18 +10827,19 @@ fn terminal_command_spec(command: Option<&str>) -> CommandSpec {
     }
 }
 
-fn codex_teams_command() -> String {
+fn managed_agent_command(mode: AgentRunMode, program: &str) -> String {
+    let arguments = format!("agent --mode {mode} {program}");
     std::env::current_exe()
         .map(|path| {
             #[cfg(windows)]
-            return powershell_executable_command(&path, "codex-teams");
+            return powershell_executable_command(&path, &arguments);
             #[cfg(not(windows))]
             format!(
-                "{} codex-teams",
-                shell_quote_command(&path.to_string_lossy())
+                "{} {arguments}",
+                shell_quote_command(&path.to_string_lossy()),
             )
         })
-        .unwrap_or_else(|_| "wmcterm codex-teams".into())
+        .unwrap_or_else(|_| format!("wmcterm {arguments}"))
 }
 
 #[cfg(any(windows, test))]
@@ -11810,6 +12151,37 @@ fn ordered_cells(a: (usize, usize), b: (usize, usize)) -> ((usize, usize), (usiz
     }
 }
 
+fn snapshot_selection_text(
+    snapshot: &ScreenSnapshot,
+    start: (usize, usize),
+    end: (usize, usize),
+) -> Option<String> {
+    let (start, end) = ordered_cells(start, end);
+    let first_row = start.1.checked_sub(snapshot.screen_row_origin)?;
+    let last_row = end.1.checked_sub(snapshot.screen_row_origin)?;
+    if first_row >= snapshot.cells.len() || last_row >= snapshot.cells.len() {
+        return None;
+    }
+    let mut lines = Vec::with_capacity(last_row - first_row + 1);
+    for row_index in first_row..=last_row {
+        let row = &snapshot.cells[row_index];
+        let first_column = if row_index == first_row { start.0 } else { 0 };
+        let last_column = if row_index == last_row {
+            end.0
+        } else {
+            row.len().saturating_sub(1)
+        };
+        let mut line = String::new();
+        if first_column <= last_column {
+            for cell in row.iter().take(last_column + 1).skip(first_column) {
+                line.push_str(&cell.text);
+            }
+        }
+        lines.push(line.trim_end().to_owned());
+    }
+    Some(lines.join("\n"))
+}
+
 fn divider_at(
     node: &PaneNode,
     rect: Rect,
@@ -12344,6 +12716,110 @@ fn validate_agent_approval_protocol(source: &str, method: &str, kind: &str) -> R
         .ok_or_else(|| format!("unsupported {source} approval method/kind `{method}`/`{kind}`"))
 }
 
+fn agent_approval_message(
+    language: Language,
+    source: &str,
+    kind: &str,
+    method: &str,
+    params: &Value,
+) -> String {
+    let chinese = language.is_chinese();
+    let agent = match source {
+        "codex_app_server" => "Codex",
+        "claude_hook" => "Claude",
+        _ => "Agent",
+    };
+    let mut lines = Vec::new();
+    match (source, kind) {
+        ("codex_app_server", "command_execution") => lines.push(if chinese {
+            format!("{agent} 请求执行命令")
+        } else {
+            format!("{agent} requests to run a command")
+        }),
+        ("codex_app_server", "file_change") => lines.push(if chinese {
+            format!("{agent} 请求修改文件")
+        } else {
+            format!("{agent} requests to change files")
+        }),
+        ("codex_app_server", "permissions") => lines.push(if chinese {
+            format!("{agent} 请求额外权限")
+        } else {
+            format!("{agent} requests additional permissions")
+        }),
+        ("claude_hook", "permission") => {
+            let tool =
+                approval_text_field(params, &["tool_name", "toolName"]).unwrap_or("unknown tool");
+            lines.push(if chinese {
+                format!("{agent} 请求使用工具：{tool}")
+            } else {
+                format!("{agent} requests to use tool: {tool}")
+            });
+        }
+        _ => lines.push(if chinese {
+            format!("{agent} 请求授权")
+        } else {
+            format!("{agent} requests approval")
+        }),
+    }
+
+    let tool_input = params.get("tool_input").or_else(|| params.get("toolInput"));
+    let command = approval_text_field(params, &["command", "cmd"])
+        .or_else(|| tool_input.and_then(|input| approval_text_field(input, &["command", "cmd"])));
+    if let Some(command) = command {
+        lines.push(format!(
+            "{}: {command}",
+            if chinese { "命令" } else { "Command" }
+        ));
+    }
+    if let Some(cwd) =
+        approval_text_field(params, &["cwd", "working_directory", "workingDirectory"])
+    {
+        lines.push(format!(
+            "{}: {cwd}",
+            if chinese {
+                "工作目录"
+            } else {
+                "Working directory"
+            }
+        ));
+    }
+    if let Some(reason) = approval_text_field(params, &["reason", "justification", "description"]) {
+        lines.push(format!(
+            "{}: {reason}",
+            if chinese { "原因" } else { "Reason" }
+        ));
+    }
+    if kind == "permissions"
+        && let Some(permissions) = params.get("permissions").and_then(Value::as_object)
+        && !permissions.is_empty()
+    {
+        lines.push(format!(
+            "{}: {}",
+            if chinese { "权限" } else { "Permissions" },
+            permissions.keys().cloned().collect::<Vec<_>>().join(", ")
+        ));
+    }
+
+    let technical = serde_json::to_string_pretty(params).unwrap_or_else(|_| params.to_string());
+    lines.push(String::new());
+    lines.push(if chinese {
+        format!("技术详情（{method}）：")
+    } else {
+        format!("Technical details ({method}):")
+    });
+    lines.push(technical);
+    lines.join("\n")
+}
+
+fn approval_text_field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> {
+    names.iter().find_map(|name| {
+        value
+            .get(*name)
+            .and_then(Value::as_str)
+            .filter(|text| !text.trim().is_empty())
+    })
+}
+
 fn claude_approval_binding_matches(
     runtime_lifecycle: &str,
     metadata_agent: Option<&str>,
@@ -12396,7 +12872,6 @@ fn agent_approval_mode(action: AgentApprovalAction) -> &'static str {
         AgentApprovalAction::Deny => "deny",
         AgentApprovalAction::AllowOnce => "once",
         AgentApprovalAction::AlwaysAllow => "always",
-        AgentApprovalAction::AllTools => "all",
     }
 }
 
@@ -12432,7 +12907,7 @@ fn completed_approval_action(
         Some("deny") => Some(AgentApprovalAction::Deny),
         Some("once") => Some(AgentApprovalAction::AllowOnce),
         Some("always") => Some(AgentApprovalAction::AlwaysAllow),
-        Some("all") => Some(AgentApprovalAction::AllTools),
+        Some("all") => Some(AgentApprovalAction::AlwaysAllow),
         _ if resolution.approved == Some(false) => Some(AgentApprovalAction::Deny),
         _ if resolution.approved == Some(true) => Some(AgentApprovalAction::AllowOnce),
         _ => None,
@@ -12441,24 +12916,14 @@ fn completed_approval_action(
 
 fn agent_approval_actions(request: &AgentInteractionRequest) -> Vec<AgentApprovalAction> {
     let mut actions = vec![AgentApprovalAction::Deny, AgentApprovalAction::AllowOnce];
-    if request
-        .choices
-        .iter()
-        .any(|choice| agent_choice_has(choice, &["always", "permanent", "始终", "永久"]))
-    {
+    if request.choices.iter().any(|choice| choice.id == "always") {
         actions.push(AgentApprovalAction::AlwaysAllow);
-    }
-    if request.choices.iter().any(|choice| {
-        choice.id == "all"
-            || agent_choice_has(choice, &["all_tools", "all tools", "all-tools", "全部工具"])
-    }) {
-        actions.push(AgentApprovalAction::AllTools);
     }
     actions
 }
 
 fn agent_choice_has(choice: &wmcterm_ipc::AgentChoice, needles: &[&str]) -> bool {
-    let value = format!("{} {}", choice.id, choice.label).to_lowercase();
+    let value = choice.label.to_lowercase();
     needles.iter().any(|needle| value.contains(needle))
 }
 
@@ -12466,33 +12931,38 @@ fn agent_approval_resolution(
     request: &AgentInteractionRequest,
     action: AgentApprovalAction,
 ) -> AgentResolution {
-    let choice = request.choices.iter().find(|choice| match action {
-        AgentApprovalAction::Deny => {
-            agent_choice_has(choice, &["deny", "reject", "cancel", "拒绝"])
-        }
-        AgentApprovalAction::AllowOnce => {
-            !agent_choice_has(
-                choice,
-                &[
-                    "always",
-                    "permanent",
-                    "all_tools",
-                    "all tools",
-                    "始终",
-                    "永久",
-                    "全部工具",
-                ],
-            ) && (choice.id == "once"
-                || agent_choice_has(choice, &["allow", "approve", "once", "允许", "批准"]))
-        }
-        AgentApprovalAction::AlwaysAllow => {
-            agent_choice_has(choice, &["always", "permanent", "始终", "永久"])
-        }
-        AgentApprovalAction::AllTools => {
-            choice.id == "all"
-                || agent_choice_has(choice, &["all_tools", "all tools", "all-tools", "全部工具"])
-        }
-    });
+    let choice = match action {
+        AgentApprovalAction::Deny => request
+            .choices
+            .iter()
+            .find(|choice| choice.id == "deny")
+            .or_else(|| {
+                request
+                    .choices
+                    .iter()
+                    .find(|choice| agent_choice_has(choice, &["deny", "reject", "cancel", "拒绝"]))
+            }),
+        AgentApprovalAction::AllowOnce => request
+            .choices
+            .iter()
+            .find(|choice| choice.id == "once")
+            .or_else(|| {
+                request.choices.iter().find(|choice| {
+                    choice.id != "always"
+                        && agent_choice_has(choice, &["allow", "approve", "once", "允许", "批准"])
+                })
+            }),
+        AgentApprovalAction::AlwaysAllow => request
+            .choices
+            .iter()
+            .find(|choice| choice.id == "always")
+            .or_else(|| {
+                request.choices.iter().find(|choice| {
+                    choice.id == "all"
+                        || agent_choice_has(choice, &["always", "permanent", "始终", "永久"])
+                })
+            }),
+    };
     AgentResolution {
         choice_id: choice.map(|choice| choice.id.clone()),
         text: None,
@@ -12505,8 +12975,85 @@ fn agent_approval_action_label(language: Language, action: AgentApprovalAction) 
         AgentApprovalAction::Deny => language.deny(),
         AgentApprovalAction::AllowOnce => language.allow_once(),
         AgentApprovalAction::AlwaysAllow => language.always_allow(),
-        AgentApprovalAction::AllTools => language.allow_all_tools(),
     }
+}
+
+fn agent_request_detail_layout(
+    window_size: PhysicalSize<u32>,
+    message: &str,
+    scroll: usize,
+) -> AgentRequestDetailLayout {
+    let width = 620.0_f32.min((window_size.width as f32 - 40.0).max(260.0));
+    let height = 420.0_f32.min((window_size.height as f32 - 80.0).max(180.0));
+    let panel = ui::Bounds {
+        x: (window_size.width as f32 - width) / 2.0,
+        y: (window_size.height as f32 - height) / 2.0,
+        width,
+        height,
+    };
+    let body = ui::Bounds {
+        x: panel.x + 12.0,
+        y: panel.y + 42.0,
+        width: (panel.width - 24.0).max(1.0),
+        height: (panel.height - 54.0).max(1.0),
+    };
+    let columns = ((body.width - 18.0) / (13.0 * 0.6)).floor().max(1.0) as usize;
+    let total_lines = agent_request_detail_lines(message, columns).len();
+    let visible_lines = (body.height / 20.0).floor().max(1.0) as usize;
+    let max_scroll = total_lines.saturating_sub(visible_lines);
+    let scrollbar = ui::list_scrollbar(body, total_lines, visible_lines, scroll);
+    AgentRequestDetailLayout {
+        panel,
+        body,
+        total_lines,
+        visible_lines,
+        max_scroll,
+        scrollbar,
+    }
+}
+
+fn scrollbar_scroll_for_pointer(
+    track: ui::Bounds,
+    thumb: ui::Bounds,
+    max_scroll: usize,
+    pointer_y: f32,
+    grab_y: f32,
+) -> usize {
+    let travel = (track.height - thumb.height).max(0.0);
+    if max_scroll == 0 || travel <= f32::EPSILON {
+        return 0;
+    }
+    let position = (pointer_y - grab_y - track.y).clamp(0.0, travel);
+    (position / travel * max_scroll as f32).round() as usize
+}
+
+fn agent_request_detail_lines(text: &str, max_columns: usize) -> Vec<String> {
+    if max_columns == 0 {
+        return Vec::new();
+    }
+    let mut lines = Vec::new();
+    for source_line in text.split('\n') {
+        if source_line.is_empty() {
+            lines.push(String::new());
+        } else {
+            let mut line = String::new();
+            let mut width = 0;
+            for character in source_line.chars() {
+                let character_width = UnicodeWidthChar::width(character).unwrap_or(0);
+                if !line.is_empty() && width + character_width > max_columns {
+                    lines.push(std::mem::take(&mut line));
+                    width = 0;
+                }
+                line.push(character);
+                width += character_width;
+            }
+            lines.push(line);
+        }
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 fn notification_age_label(now_ms: u64, created_at_ms: u64, chinese: bool) -> String {
@@ -12847,11 +13394,10 @@ mod tests {
                 AgentApprovalAction::Deny,
                 AgentApprovalAction::AllowOnce,
                 AgentApprovalAction::AlwaysAllow,
-                AgentApprovalAction::AllTools,
             ]
         );
-        let resolution = agent_approval_resolution(&request, AgentApprovalAction::AllTools);
-        assert_eq!(resolution.choice_id.as_deref(), Some("all"));
+        let resolution = agent_approval_resolution(&request, AgentApprovalAction::AlwaysAllow);
+        assert_eq!(resolution.choice_id.as_deref(), Some("always"));
         assert_eq!(resolution.approved, Some(true));
         assert_eq!(
             agent_approval_resolved_json(AgentApprovalAction::Deny),
@@ -12865,6 +13411,109 @@ mod tests {
         assert_eq!(
             agent_approval_actions(&limited),
             vec![AgentApprovalAction::Deny, AgentApprovalAction::AllowOnce]
+        );
+    }
+
+    #[test]
+    fn agent_approval_resolution_prefers_exact_ids_before_label_matching() {
+        let request = AgentInteractionRequest {
+            request_id: "approval:ids".into(),
+            surface_id: uuid::Uuid::new_v4().to_string(),
+            lifecycle_id: "lifecycle".into(),
+            agent_pid: None,
+            pid_start_time: None,
+            kind: IpcAgentRequestKind::new(IpcAgentRequestKind::PERMISSION),
+            message: "request".into(),
+            choices: [
+                ("deny", "Approve"),
+                ("once", "Deny"),
+                ("always", "all tools"),
+                ("all", "all tools"),
+            ]
+            .into_iter()
+            .map(|(id, label)| wmcterm_ipc::AgentChoice {
+                id: id.into(),
+                label: label.into(),
+            })
+            .collect(),
+            deadline_unix_ms: None,
+        };
+        assert_eq!(
+            agent_approval_resolution(&request, AgentApprovalAction::Deny).choice_id,
+            Some("deny".into())
+        );
+        assert_eq!(
+            agent_approval_resolution(&request, AgentApprovalAction::AllowOnce).choice_id,
+            Some("once".into())
+        );
+        assert_eq!(
+            agent_approval_resolution(&request, AgentApprovalAction::AlwaysAllow).choice_id,
+            Some("always".into())
+        );
+    }
+
+    #[test]
+    fn agent_approval_messages_lead_with_readable_summaries_and_keep_json_details() {
+        let codex = agent_approval_message(
+            Language::SimplifiedChinese,
+            "codex_app_server",
+            "command_execution",
+            "item/commandExecution/requestApproval",
+            &json!({
+                "command": "cargo test --workspace",
+                "cwd": "/work/wmcterm",
+                "reason": "验证修改"
+            }),
+        );
+        assert!(codex.starts_with("Codex 请求执行命令\n命令: cargo test --workspace"));
+        assert!(codex.contains("工作目录: /work/wmcterm"));
+        assert!(codex.contains("原因: 验证修改"));
+        assert!(codex.contains("技术详情（item/commandExecution/requestApproval）："));
+        assert!(codex.contains("\n  \"command\": \"cargo test --workspace\""));
+
+        let claude = agent_approval_message(
+            Language::English,
+            "claude_hook",
+            "permission",
+            "PermissionRequest",
+            &json!({
+                "tool_name": "Bash",
+                "tool_input": {"command": "git status"},
+                "cwd": "/work/wmcterm"
+            }),
+        );
+        assert!(claude.starts_with("Claude requests to use tool: Bash\nCommand: git status"));
+        assert!(claude.contains("Technical details (PermissionRequest):"));
+    }
+
+    #[test]
+    fn approval_detail_scrollbar_tracks_bounded_line_progress() {
+        let message = (0..80)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let top = agent_request_detail_layout(PhysicalSize::new(1000, 650), &message, 0);
+        assert!(top.total_lines > top.visible_lines);
+        assert!(top.max_scroll > 0);
+        let (track, thumb) = top.scrollbar.expect("long details have a scrollbar");
+        assert_eq!(thumb.y, track.y);
+        assert_eq!(
+            scrollbar_scroll_for_pointer(
+                track,
+                thumb,
+                top.max_scroll,
+                track.y + track.height,
+                thumb.height,
+            ),
+            top.max_scroll
+        );
+
+        let bottom =
+            agent_request_detail_layout(PhysicalSize::new(1000, 650), &message, usize::MAX);
+        let (bottom_track, bottom_thumb) = bottom.scrollbar.unwrap();
+        assert!(
+            (bottom_thumb.y + bottom_thumb.height - bottom_track.y - bottom_track.height).abs()
+                < 0.001
         );
     }
 
@@ -12937,6 +13586,27 @@ mod tests {
     }
 
     #[test]
+    fn recoverable_terminal_notice_does_not_become_an_error_and_clears_on_snapshot() {
+        let terminal = uuid::Uuid::new_v4();
+        let mut notices = HashMap::from([(
+            terminal,
+            TerminalNotice::Warning("copy selection: invalid value".into()),
+        )]);
+
+        assert_eq!(
+            terminal_notice_attention(notices.get(&terminal).unwrap()),
+            None
+        );
+        assert!(!terminal_notice_is_error(notices.get(&terminal).unwrap()));
+        assert!(clear_recoverable_terminal_notice(&mut notices, terminal));
+        assert!(!notices.contains_key(&terminal));
+
+        notices.insert(terminal, TerminalNotice::Error("PTY closed".into()));
+        assert!(!clear_recoverable_terminal_notice(&mut notices, terminal));
+        assert!(terminal_notice_is_error(notices.get(&terminal).unwrap()));
+    }
+
+    #[test]
     fn newly_detected_foreground_agent_is_idle_until_work_is_submitted() {
         let metadata = detected_foreground_agent_metadata(AgentKind::Codex);
         assert_eq!(metadata.name, "codex");
@@ -12992,7 +13662,7 @@ mod tests {
             &mut results,
             &mut order,
             "third".into(),
-            AgentApprovalAction::AllTools,
+            AgentApprovalAction::Deny,
             2,
         );
 
@@ -13232,14 +13902,33 @@ mod tests {
     }
 
     #[test]
-    fn integrated_codex_launcher_uses_the_subagent_pane_bridge() {
-        assert!(codex_teams_command().ends_with(" codex-teams"));
+    fn managed_agent_launcher_encodes_explicit_safe_modes() {
+        assert!(
+            managed_agent_command(AgentRunMode::Interactive, "codex")
+                .ends_with(" agent --mode interactive codex")
+        );
+        assert!(
+            managed_agent_command(AgentRunMode::Unattended, "claude")
+                .ends_with(" agent --mode unattended claude")
+        );
         assert_eq!(
             powershell_executable_command(
                 std::path::Path::new(r"C:\Program Files\wmcterm\wmcterm.exe"),
-                "codex-teams",
+                "agent --mode unattended codex",
             ),
-            r"& 'C:\Program Files\wmcterm\wmcterm.exe' codex-teams"
+            r"& 'C:\Program Files\wmcterm\wmcterm.exe' agent --mode unattended codex"
+        );
+    }
+
+    #[test]
+    fn full_access_commands_are_provider_native_and_not_managed_cli_flags() {
+        assert_eq!(
+            ManagedAgent::Claude.full_access_command(),
+            "claude --dangerously-skip-permissions"
+        );
+        assert_eq!(
+            ManagedAgent::Codex.full_access_command(),
+            "codex --dangerously-bypass-approvals-and-sandbox"
         );
     }
 
@@ -13536,6 +14225,30 @@ mod tests {
     fn normalizes_reverse_terminal_selection() {
         assert_eq!(ordered_cells((8, 4), (2, 1)), ((2, 1), (8, 4)));
         assert_eq!(ordered_cells((1, 2), (5, 2)), ((1, 2), (5, 2)));
+    }
+
+    #[test]
+    fn exited_terminal_selection_can_be_copied_from_its_final_snapshot() {
+        let snapshot = ScreenSnapshot {
+            cols: 6,
+            rows: 2,
+            lines: vec![],
+            cells: vec![
+                ["a", "错", "", "b", " ", " "].map(selection_cell).to_vec(),
+                ["c", "d", "e", "f", " ", " "].map(selection_cell).to_vec(),
+            ],
+            cursor: None,
+            mouse_tracking: false,
+            scrollback_rows: 4,
+            viewport_offset: 0,
+            screen_row_origin: 4,
+        };
+
+        assert_eq!(
+            snapshot_selection_text(&snapshot, (1, 4), (2, 5)).as_deref(),
+            Some("错b\ncde")
+        );
+        assert_eq!(snapshot_selection_text(&snapshot, (0, 3), (1, 4)), None);
     }
 
     #[test]

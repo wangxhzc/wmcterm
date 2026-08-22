@@ -1979,7 +1979,16 @@ Plugin Marketplace
   状态，不删除通知，也不解决或隐藏 Agent 请求。
 - Agent 授权采用有界、可过期、幂等且 fail-closed 的请求/回复通道。请求绑定
   Surface、进程和 Terminal lifecycle，拒绝旧进程 Hook、重复或含糊回复以及
-  bypass/yolo 模式。通知中心可查看完整请求详情并执行受支持的选择。
+  普通审批回复中的 bypass/yolo 模式。审批卡仅提供拒绝、单次允许，以及 provider
+  明确给出精确规则或会话决策时的信任规则；不把“全部工具”或绕过伪装成单条请求
+  的批准选项。通知中心先按 Agent 和请求类型提取命令、工具、目录、原因与
+  权限等可读摘要，格式化 JSON 只作为技术详情保留；长详情提供行数进度、边界钳制、
+  滚轮和完整键盘导航以及可拖动滚动条。展示层不得改变受支持的决策或回复映射。
+- Agent 运行策略与单条审批分层：`interactive` 维持按需审批；`unattended` 使用
+  Codex `--approve-for-me`（自身启用 `workspace-write`）或 Claude `--permission-mode auto`，
+  允许原生低风险自动判断但保留隔离；`full-access` 关闭审批和沙箱，只能从命令面板
+  的显式动作启动，并要求再次输入 `FULL ACCESS`。完全访问只作用于新 Agent 进程，
+  不可持久化为配置，也不接受 CLI/Agent 自动化传入危险参数。
 - 待处理请求队列是审批状态的权威来源。每次注册、回复、取消、超时或进程退出
   都按 Surface 聚合剩余请求并重新派生 Agent、attention 和 Workspace 状态；权限
   请求优先显示 `WaitingForPermission`，其他可操作请求显示 `WaitingForInput`，仅在
