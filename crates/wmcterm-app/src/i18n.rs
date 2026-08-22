@@ -198,6 +198,52 @@ impl Language {
         }
     }
 
+    pub(crate) const fn codex_project_trust_title(self) -> &'static str {
+        if self.is_chinese() {
+            "信任此 Codex 项目？"
+        } else {
+            "Trust this Codex project?"
+        }
+    }
+
+    pub(crate) fn codex_project_trust_warning(self, path: &std::path::Path) -> String {
+        if self.is_chinese() {
+            format!(
+                "项目：{}\n信任后，项目级 config、Hooks 和 exec policies 将在启动时生效。",
+                path.display()
+            )
+        } else {
+            format!(
+                "Project: {}\nTrust enables project-local config, hooks, and exec policies at launch.",
+                path.display()
+            )
+        }
+    }
+
+    pub(crate) fn codex_project_trust_error(self, error: &str) -> String {
+        if self.is_chinese() {
+            format!("配置错误：{error}")
+        } else {
+            format!("Configuration error: {error}")
+        }
+    }
+
+    pub(crate) const fn continue_without_trust(self) -> &'static str {
+        if self.is_chinese() {
+            "不信任并继续"
+        } else {
+            "Continue restricted"
+        }
+    }
+
+    pub(crate) const fn trust_and_launch(self) -> &'static str {
+        if self.is_chinese() {
+            "信任并启动 (T)"
+        } else {
+            "Trust & launch (T)"
+        }
+    }
+
     pub(crate) const fn close_application_title(self) -> &'static str {
         if self.is_chinese() {
             "关闭 wmcterm？"

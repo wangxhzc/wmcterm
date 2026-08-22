@@ -179,6 +179,13 @@ transcript 加载到监视器。它识别所有携带线程 ID 的 `thread/*` �
 自动审查能力：Codex 使用 `--approve-for-me`（该参数自身启用 `workspace-write`
 沙箱），Claude 使用 `--permission-mode auto`；它不是“自动同意所有请求”，也不会
 关闭沙箱。
+从 GUI 首次为含 `.codex` 目录的工作区启动无人值守 Codex 时，wmcterm 会在启动前
+检查 Codex 用户配置中的精确项目路径。未信任的项目必须由用户选择“信任并启动”或
+“不信任并继续”；前者安全合并 `~/.codex/config.toml`，后者保持项目级 config、
+Hooks 和 exec policies 禁用。该人工信任入口不会暴露给 CLI、RPC 或 Agent。
+Codex 原生 `codex resume` 默认按当前 cwd 过滤（`--all` 才显示全部）；当前私有
+app-server 远程 TUI 的 `/resume` 可能显示全局会话，这是上游远程 picker 的兼容性
+差异，不代表 wmcterm 改变了会话归属或授权范围。
 对于这些托管 app-server 会话，通用 Codex `PermissionRequest` Hook 被视为重复遥测，
 不会创建第二个可操作请求；非托管 Codex 的 Hook 通知保持正常行为。
 如果根 Codex TUI 先回答同一个 app-server 请求，wmcterm 会消费 Codex 的

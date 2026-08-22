@@ -15,6 +15,7 @@ sys-locale.workspace = true
 wmcterm-agent = { path = "../wmcterm-agent" }
 wmcterm-core = { path = "../wmcterm-core" }
 wmcterm-config = { path = "../wmcterm-config" }
+wmcterm-codex = { path = "../wmcterm-codex" }
 wmcterm-ipc = { path = "../wmcterm-ipc" }
 wmcterm-pty = { path = "../wmcterm-pty" }
 wmcterm-renderer = { path = "../wmcterm-renderer" }

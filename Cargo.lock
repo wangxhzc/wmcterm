@@ -2539,6 +2539,7 @@ dependencies = [
  "indexmap",
  "toml_datetime 1.1.1+spec-1.1.0",
  "toml_parser",
+ "toml_writer",
  "winnow 1.0.4",
 ]
 
@@ -3441,6 +3442,7 @@ dependencies = [
  "windows-sys 0.61.2",
  "winit",
  "wmcterm-agent",
+ "wmcterm-codex",
  "wmcterm-config",
  "wmcterm-core",
  "wmcterm-ipc",
@@ -3465,9 +3467,11 @@ dependencies = [
 name = "wmcterm-codex"
 version = "0.1.0"
 dependencies = [
+ "directories",
  "serde",
  "serde_json",
  "thiserror 2.0.20",
+ "toml_edit",
  "tungstenite",
  "wmcterm-ipc",
 ]

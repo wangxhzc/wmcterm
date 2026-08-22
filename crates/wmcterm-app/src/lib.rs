@@ -340,6 +340,11 @@ struct CloseConfirmation {
     message: String,
 }
 
+struct CodexTrustConfirmation {
+    project_root: std::path::PathBuf,
+    error: Option<String>,
+}
+
 #[derive(Clone, Copy)]
 struct TabContextMenu {
     pane: PaneId,
@@ -370,6 +375,7 @@ struct NotificationContextMenu {
 enum NavigationHover {
     ConfirmationCancel,
     ConfirmationConfirm,
+    ConfirmationContinue,
     Workspace(usize),
     NewWorkspace,
     Tab(PaneId, usize),
@@ -668,6 +674,7 @@ struct WmctermApplication {
     terminal_font_size: f32,
     prompt: Option<TextPrompt>,
     close_confirmation: Option<CloseConfirmation>,
+    codex_trust_confirmation: Option<CodexTrustConfirmation>,
     tab_context_menu: Option<TabContextMenu>,
     workspace_context_menu: Option<WorkspaceContextMenu>,
     terminal_context_menu: Option<TerminalContextMenu>,
@@ -841,6 +848,7 @@ impl WmctermApplication {
             terminal_font_size,
             prompt: None,
             close_confirmation: None,
+            codex_trust_confirmation: None,
             tab_context_menu: None,
             workspace_context_menu: None,
             terminal_context_menu: None,
@@ -1972,6 +1980,22 @@ impl WmctermApplication {
             self.rebuild_scene();
             return;
         }
+        if self.codex_trust_confirmation.is_some() {
+            match &event.logical_key {
+                Key::Named(NamedKey::Escape) => {
+                    self.codex_trust_confirmation = None;
+                    self.update_navigation_hover();
+                    self.update_cursor_icon();
+                    self.rebuild_scene();
+                }
+                Key::Named(NamedKey::Enter) => self.continue_untrusted_codex(),
+                Key::Character(character) if character.eq_ignore_ascii_case("t") => {
+                    self.trust_and_start_unattended_codex();
+                }
+                _ => {}
+            }
+            return;
+        }
         if self.close_confirmation.is_some() {
             match event.logical_key {
                 Key::Named(NamedKey::Enter) => self.confirm_close(),
@@ -2725,7 +2749,10 @@ impl WmctermApplication {
     }
 
     fn commit_ime_text(&mut self, text: String) {
-        if text.is_empty() || self.close_confirmation.is_some() {
+        if text.is_empty()
+            || self.close_confirmation.is_some()
+            || self.codex_trust_confirmation.is_some()
+        {
             return;
         }
         self.reset_cursor_blink();
@@ -2767,7 +2794,7 @@ impl WmctermApplication {
     }
 
     fn update_ime_preedit(&mut self, text: &str) {
-        if self.close_confirmation.is_some() {
+        if self.close_confirmation.is_some() || self.codex_trust_confirmation.is_some() {
             return;
         }
         if self.workspace_search_focused {
@@ -2907,10 +2934,7 @@ impl WmctermApplication {
                 )));
             }
             "agent.codex.unattended" => {
-                self.new_surface_command(Some(managed_agent_command(
-                    AgentRunMode::Unattended,
-                    "codex",
-                )));
+                self.launch_unattended_codex();
             }
             "agent.claude.full_access" => {
                 self.open_full_access_prompt(ManagedAgent::Claude);
@@ -3219,6 +3243,33 @@ impl WmctermApplication {
             height,
         };
         (cancel, confirm)
+    }
+
+    fn codex_trust_buttons(&self) -> (ui::Bounds, ui::Bounds, ui::Bounds) {
+        let panel = self.confirmation_panel();
+        let width = 150.0;
+        let height = 34.0;
+        let gap = 10.0;
+        let top = panel.y + panel.height - height - 16.0;
+        let trust = ui::Bounds {
+            x: panel.x + panel.width - width - 16.0,
+            y: top,
+            width,
+            height,
+        };
+        let proceed = ui::Bounds {
+            x: trust.x - width - gap,
+            y: top,
+            width,
+            height,
+        };
+        let cancel = ui::Bounds {
+            x: proceed.x - 96.0 - gap,
+            y: top,
+            width: 96.0,
+            height,
+        };
+        (cancel, proceed, trust)
     }
 
     fn prompt_input_bounds(&self) -> ui::Bounds {
@@ -3934,6 +3985,63 @@ impl WmctermApplication {
             error: None,
         });
         self.rebuild_scene();
+    }
+
+    fn launch_unattended_codex(&mut self) {
+        let Some(workspace) = self.state.active_workspace() else {
+            return;
+        };
+        let project_root =
+            std::fs::canonicalize(&workspace.cwd).unwrap_or_else(|_| workspace.cwd.clone());
+        match wmcterm_codex::project_trust_state(&project_root) {
+            Ok(
+                wmcterm_codex::ProjectTrustState::NotApplicable
+                | wmcterm_codex::ProjectTrustState::Trusted,
+            ) => self.start_unattended_codex(),
+            Ok(wmcterm_codex::ProjectTrustState::Untrusted) => {
+                self.codex_trust_confirmation = Some(CodexTrustConfirmation {
+                    project_root,
+                    error: None,
+                });
+                self.rebuild_scene();
+            }
+            Err(error) => {
+                self.codex_trust_confirmation = Some(CodexTrustConfirmation {
+                    project_root,
+                    error: Some(error.to_string()),
+                });
+                self.rebuild_scene();
+            }
+        }
+    }
+
+    fn start_unattended_codex(&mut self) {
+        self.new_surface_command(Some(managed_agent_command(
+            AgentRunMode::Unattended,
+            "codex",
+        )));
+    }
+
+    fn trust_and_start_unattended_codex(&mut self) {
+        let Some(confirmation) = self.codex_trust_confirmation.take() else {
+            return;
+        };
+        match wmcterm_codex::trust_project(&confirmation.project_root) {
+            Ok(()) => self.start_unattended_codex(),
+            Err(error) => {
+                self.codex_trust_confirmation = Some(CodexTrustConfirmation {
+                    error: Some(error.to_string()),
+                    ..confirmation
+                });
+                self.rebuild_scene();
+            }
+        }
+    }
+
+    fn continue_untrusted_codex(&mut self) {
+        if self.codex_trust_confirmation.take().is_some() {
+            self.start_unattended_codex();
+        }
     }
 
     fn submit_prompt(&mut self) {
@@ -5784,6 +5892,20 @@ impl WmctermApplication {
 
     fn handle_overlay_click(&mut self) -> bool {
         let (x, y) = self.cursor_position;
+        if self.codex_trust_confirmation.is_some() {
+            let (cancel, proceed, trust) = self.codex_trust_buttons();
+            if trust.contains(x, y) {
+                self.trust_and_start_unattended_codex();
+            } else if proceed.contains(x, y) {
+                self.continue_untrusted_codex();
+            } else if cancel.contains(x, y) {
+                self.codex_trust_confirmation = None;
+                self.update_navigation_hover();
+                self.update_cursor_icon();
+                self.rebuild_scene();
+            }
+            return true;
+        }
         if self.close_confirmation.is_some() {
             let (cancel, confirm) = self.confirmation_buttons();
             if confirm.contains(x, y) {
@@ -6098,6 +6220,10 @@ impl WmctermApplication {
 
     fn navigation_hover_at_cursor(&self) -> Option<NavigationHover> {
         let (x, y) = self.cursor_position;
+        if self.codex_trust_confirmation.is_some() {
+            let (cancel, proceed, trust) = self.codex_trust_buttons();
+            return codex_trust_confirmation_hover(cancel, proceed, trust, x, y);
+        }
         if self.close_confirmation.is_some() {
             let (cancel, confirm) = self.confirmation_buttons();
             return confirmation_hover(cancel, confirm, x, y);
@@ -6287,7 +6413,14 @@ impl WmctermApplication {
 
     fn update_cursor_icon(&self) {
         let (x, y) = self.cursor_position;
-        let icon = if self.close_confirmation.is_some() {
+        let icon = if self.codex_trust_confirmation.is_some() {
+            let (cancel, proceed, trust) = self.codex_trust_buttons();
+            if codex_trust_confirmation_hover(cancel, proceed, trust, x, y).is_some() {
+                CursorIcon::Pointer
+            } else {
+                CursorIcon::Default
+            }
+        } else if self.close_confirmation.is_some() {
             let (cancel, confirm) = self.confirmation_buttons();
             confirmation_cursor_icon(cancel, confirm, x, y)
         } else if let Some(direction) = self.window_resize_direction(x, y) {
@@ -6479,7 +6612,7 @@ impl WmctermApplication {
     }
 
     fn pointer_over_overlay(&self) -> bool {
-        if self.close_confirmation.is_some() {
+        if self.close_confirmation.is_some() || self.codex_trust_confirmation.is_some() {
             return true;
         }
         if self.tab_context_menu.is_some()
@@ -8310,6 +8443,98 @@ impl WmctermApplication {
                 line_height: 19.0,
             });
         }
+        if let Some(confirmation) = &self.codex_trust_confirmation {
+            let panel = self.confirmation_panel();
+            let (cancel, proceed, trust) = self.codex_trust_buttons();
+            overlay_rectangles.push(RectBlock {
+                left: 0.0,
+                top: 40.0,
+                width: self.window_size.width as f32,
+                height: (self.window_size.height as f32 - 40.0).max(1.0),
+                color: [0, 0, 0, 150],
+            });
+            overlay_rectangles.extend(context_menu_frame(panel, theme_surface, theme_blue));
+            for (bounds, hovered, color) in [
+                (
+                    cancel,
+                    self.navigation_hover == Some(NavigationHover::ConfirmationCancel),
+                    theme_hover,
+                ),
+                (
+                    proceed,
+                    self.navigation_hover == Some(NavigationHover::ConfirmationContinue),
+                    theme_hover,
+                ),
+                (
+                    trust,
+                    self.navigation_hover == Some(NavigationHover::ConfirmationConfirm),
+                    theme_blue,
+                ),
+            ] {
+                overlay_rectangles.push(RectBlock {
+                    left: bounds.x,
+                    top: bounds.y,
+                    width: bounds.width,
+                    height: bounds.height,
+                    color: if hovered {
+                        brighten_rgba(color, 28)
+                    } else {
+                        color
+                    },
+                });
+            }
+            overlay_blocks.push(TextBlock {
+                text: self.language.codex_project_trust_title().into(),
+                spans: vec![],
+                left: panel.x + 20.0,
+                top: panel.y + 14.0,
+                width: panel.width - 40.0,
+                height: 24.0,
+                color: theme_blue,
+                font_size: 16.0,
+                line_height: 22.0,
+            });
+            let mut message = self
+                .language
+                .codex_project_trust_warning(&confirmation.project_root);
+            if let Some(error) = &confirmation.error {
+                message.push('\n');
+                message.push_str(&self.language.codex_project_trust_error(error));
+            }
+            overlay_blocks.push(TextBlock {
+                text: message,
+                spans: vec![],
+                left: panel.x + 20.0,
+                top: panel.y + 42.0,
+                width: panel.width - 40.0,
+                height: 62.0,
+                color: if confirmation.error.is_some() {
+                    theme_red
+                } else {
+                    theme_text
+                },
+                font_size: 13.0,
+                line_height: 18.0,
+            });
+            for (bounds, label) in [
+                (cancel, self.language.cancel()),
+                (proceed, self.language.continue_without_trust()),
+                (trust, self.language.trust_and_launch()),
+            ] {
+                let text_width = ui::display_width(label) as f32 * 13.0 * 0.6;
+                overlay_blocks.push(TextBlock {
+                    text: label.into(),
+                    spans: vec![],
+                    left: bounds.x + (bounds.width - text_width).max(0.0) / 2.0,
+                    top: bounds.y + 7.0,
+                    width: text_width.max(1.0),
+                    height: 22.0,
+                    color: theme_text,
+                    font_size: 13.0,
+                    line_height: 20.0,
+                });
+            }
+        }
         if let Some(confirmation) = &self.close_confirmation {
             let panel = self.confirmation_panel();
             let (cancel, confirm) = self.confirmation_buttons();
@@ -8624,6 +8849,7 @@ impl WmctermApplication {
         }
         if self.notifications_visible
             && self.close_confirmation.is_none()
+            && self.codex_trust_confirmation.is_none()
             && self.prompt.is_none()
             && !self.palette_visible
         {
@@ -10546,7 +10772,7 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                 button: MouseButton::Right,
                 ..
             } => {
-                if self.close_confirmation.is_some() {
+                if self.close_confirmation.is_some() || self.codex_trust_confirmation.is_some() {
                     return;
                 }
                 self.dismiss_notifications_outside_cursor();
@@ -10585,7 +10811,7 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                 button: MouseButton::Middle,
                 ..
             } => {
-                if self.close_confirmation.is_some() {
+                if self.close_confirmation.is_some() || self.codex_trust_confirmation.is_some() {
                     return;
                 }
                 self.dismiss_notifications_outside_cursor();
@@ -11996,6 +12222,24 @@ fn confirmation_hover(
     if cancel.contains(x, y) {
         Some(NavigationHover::ConfirmationCancel)
     } else if confirm.contains(x, y) {
+        Some(NavigationHover::ConfirmationConfirm)
+    } else {
+        None
+    }
+}
+
+fn codex_trust_confirmation_hover(
+    cancel: ui::Bounds,
+    proceed: ui::Bounds,
+    trust: ui::Bounds,
+    x: f32,
+    y: f32,
+) -> Option<NavigationHover> {
+    if cancel.contains(x, y) {
+        Some(NavigationHover::ConfirmationCancel)
+    } else if proceed.contains(x, y) {
+        Some(NavigationHover::ConfirmationContinue)
+    } else if trust.contains(x, y) {
         Some(NavigationHover::ConfirmationConfirm)
     } else {
         None
@@ -14482,6 +14726,44 @@ mod tests {
         assert_eq!(
             brighten_rgba([240, 250, 255, 128], 28),
             [255, 255, 255, 128]
+        );
+    }
+
+    #[test]
+    fn codex_trust_confirmation_distinguishes_all_three_actions() {
+        let cancel = ui::Bounds {
+            x: 10.0,
+            y: 20.0,
+            width: 90.0,
+            height: 30.0,
+        };
+        let proceed = ui::Bounds {
+            x: 110.0,
+            y: 20.0,
+            width: 140.0,
+            height: 30.0,
+        };
+        let trust = ui::Bounds {
+            x: 260.0,
+            y: 20.0,
+            width: 140.0,
+            height: 30.0,
+        };
+        assert_eq!(
+            codex_trust_confirmation_hover(cancel, proceed, trust, 15.0, 25.0),
+            Some(NavigationHover::ConfirmationCancel)
+        );
+        assert_eq!(
+            codex_trust_confirmation_hover(cancel, proceed, trust, 115.0, 25.0),
+            Some(NavigationHover::ConfirmationContinue)
+        );
+        assert_eq!(
+            codex_trust_confirmation_hover(cancel, proceed, trust, 265.0, 25.0),
+            Some(NavigationHover::ConfirmationConfirm)
+        );
+        assert_eq!(
+            codex_trust_confirmation_hover(cancel, proceed, trust, 105.0, 25.0),
+            None
         );
     }
 

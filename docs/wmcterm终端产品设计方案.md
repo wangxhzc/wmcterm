@@ -1989,6 +1989,13 @@ Plugin Marketplace
   允许原生低风险自动判断但保留隔离；`full-access` 关闭审批和沙箱，只能从命令面板
   的显式动作启动，并要求再次输入 `FULL ACCESS`。完全访问只作用于新 Agent 进程，
   不可持久化为配置，也不接受 CLI/Agent 自动化传入危险参数。
+- GUI 为含 `.codex` 目录的 Workspace 启动无人值守 Codex 前，按规范化的精确项目根
+  检查用户级 Codex 信任配置。未信任时由人工选择取消、不信任并继续，或信任并启动；
+  信任操作保留未知 TOML 和文件权限并原子替换配置，解析或写入失败时 fail closed。
+  该入口不属于 CLI/RPC/Agent 能力，防止无人值守进程自行提升项目 Hook 权限。
+- 原生 `codex resume` 默认按 cwd 过滤、`--all` 才展示全局会话。私有 app-server 的
+  远程 TUI `/resume` 当前可能展示全局线程，属于 provider 远程 picker 的兼容性差异；
+  wmcterm 不据此改变线程归属或审批路由，后续应优先采用 provider 的稳定过滤参数。
 - 待处理请求队列是审批状态的权威来源。每次注册、回复、取消、超时或进程退出
   都按 Surface 聚合剩余请求并重新派生 Agent、attention 和 Workspace 状态；权限
   请求优先显示 `WaitingForPermission`，其他可操作请求显示 `WaitingForInput`，仅在

@@ -4,6 +4,8 @@
 //! app-server command is experimental and may evolve independently.
 
 use std::collections::{HashMap, HashSet};
+use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::Arc;
@@ -13,6 +15,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use thiserror::Error;
+use toml_edit::{DocumentMut, table, value};
 use tungstenite::{Message, WebSocket, connect, stream::MaybeTlsStream};
 use wmcterm_ipc::{Request, call};
 
@@ -27,6 +30,178 @@ const THREAD_RECONCILE_DELAY: Duration = Duration::from_secs(1);
 pub const APPROVAL_REGISTER_METHOD: &str = "agent.approval.register";
 pub const APPROVAL_POLL_METHOD: &str = "agent.approval.poll";
 pub const APPROVAL_CANCEL_METHOD: &str = "agent.request.cancel";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectTrustState {
+    NotApplicable,
+    Trusted,
+    Untrusted,
+}
+
+/// Return the user-level Codex configuration path used by managed launches.
+pub fn user_config_path() -> Option<PathBuf> {
+    std::env::var_os("CODEX_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".codex")))
+        .map(|directory| directory.join("config.toml"))
+}
+
+/// Project trust is relevant whenever Codex can discover a project-local
+/// `.codex` directory. Codex requires an exact project-root entry; a trusted
+/// ancestor is intentionally not treated as sufficient here.
+pub fn project_trust_state(project_root: &Path) -> Result<ProjectTrustState, ProjectTrustError> {
+    if !project_root.join(".codex").is_dir() {
+        return Ok(ProjectTrustState::NotApplicable);
+    }
+    let Some(config_path) = user_config_path() else {
+        return Err(ProjectTrustError::HomeUnavailable);
+    };
+    project_trust_state_at(project_root, &config_path)
+}
+
+fn project_trust_state_at(
+    project_root: &Path,
+    config_path: &Path,
+) -> Result<ProjectTrustState, ProjectTrustError> {
+    if !project_root.join(".codex").is_dir() {
+        return Ok(ProjectTrustState::NotApplicable);
+    }
+    if !config_path.exists() {
+        return Ok(ProjectTrustState::Untrusted);
+    }
+    let document = read_config(config_path)?;
+    let key = project_root.to_string_lossy();
+    let trusted = document
+        .get("projects")
+        .and_then(|projects| projects.get(key.as_ref()))
+        .and_then(|project| project.get("trust_level"))
+        .and_then(|trust| trust.as_str())
+        == Some("trusted");
+    Ok(if trusted {
+        ProjectTrustState::Trusted
+    } else {
+        ProjectTrustState::Untrusted
+    })
+}
+
+/// Persist an explicit human decision to trust one exact Codex project root.
+pub fn trust_project(project_root: &Path) -> Result<(), ProjectTrustError> {
+    let config_path = user_config_path().ok_or(ProjectTrustError::HomeUnavailable)?;
+    trust_project_at(project_root, &config_path)
+}
+
+fn trust_project_at(project_root: &Path, config_path: &Path) -> Result<(), ProjectTrustError> {
+    let mut document = if config_path.exists() {
+        read_config(config_path)?
+    } else {
+        DocumentMut::new()
+    };
+    let key = project_root.to_string_lossy().into_owned();
+    if !document.contains_key("projects") {
+        document["projects"] = table();
+    }
+    if document["projects"].get(&key).is_none() {
+        document["projects"][&key] = table();
+    }
+    document["projects"][&key]["trust_level"] = value("trusted");
+    atomic_write_config(config_path, document.to_string().as_bytes())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ProjectTrustError {
+    #[error("Codex home directory is unavailable")]
+    HomeUnavailable,
+    #[error("could not read Codex configuration {path}: {source}")]
+    Read {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("could not parse Codex configuration {path}: {source}")]
+    Parse {
+        path: PathBuf,
+        #[source]
+        source: toml_edit::TomlError,
+    },
+    #[error("could not write Codex configuration {path}: {source}")]
+    Write {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+fn read_config(path: &Path) -> Result<DocumentMut, ProjectTrustError> {
+    let contents = fs::read_to_string(path).map_err(|source| ProjectTrustError::Read {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    contents.parse().map_err(|source| ProjectTrustError::Parse {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+static CONFIG_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+fn atomic_write_config(path: &Path, contents: &[u8]) -> Result<(), ProjectTrustError> {
+    let effective_path = if path.exists() {
+        fs::canonicalize(path).map_err(|source| ProjectTrustError::Write {
+            path: path.to_path_buf(),
+            source,
+        })?
+    } else {
+        path.to_path_buf()
+    };
+    let parent = effective_path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent).map_err(|source| ProjectTrustError::Write {
+        path: effective_path.clone(),
+        source,
+    })?;
+    let permissions = fs::metadata(&effective_path)
+        .ok()
+        .map(|metadata| metadata.permissions());
+    let file_name = effective_path
+        .file_name()
+        .unwrap_or_default()
+        .to_string_lossy();
+    let sequence = CONFIG_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let temporary_path = parent.join(format!(
+        ".{file_name}.wmcterm-{}-{sequence}.tmp",
+        std::process::id()
+    ));
+    let result = (|| -> std::io::Result<()> {
+        let mut temporary = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&temporary_path)?;
+        if let Some(permissions) = permissions {
+            temporary.set_permissions(permissions)?;
+        } else {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                temporary.set_permissions(fs::Permissions::from_mode(0o600))?;
+            }
+        }
+        temporary.write_all(contents)?;
+        temporary.sync_all()?;
+        drop(temporary);
+        fs::rename(&temporary_path, &effective_path)?;
+        #[cfg(unix)]
+        fs::File::open(parent)?.sync_all()?;
+        Ok(())
+    })();
+    if let Err(source) = result {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(ProjectTrustError::Write {
+            path: effective_path,
+            source,
+        });
+    }
+    Ok(())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -2388,5 +2563,86 @@ mod tests {
                 ApprovalDecision::Always
             ]
         );
+    }
+
+    fn trust_test_directory(name: &str) -> PathBuf {
+        let sequence = CONFIG_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!(
+            "wmcterm-codex-trust-{name}-{}-{sequence}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn project_trust_requires_an_exact_project_entry() {
+        let root = trust_test_directory("exact");
+        let project = root.join("parent/project");
+        fs::create_dir_all(project.join(".codex")).unwrap();
+        let config = root.join("home/config.toml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(
+            &config,
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                project.parent().unwrap().display()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            project_trust_state_at(&project, &config).unwrap(),
+            ProjectTrustState::Untrusted
+        );
+        trust_project_at(&project, &config).unwrap();
+        assert_eq!(
+            project_trust_state_at(&project, &config).unwrap(),
+            ProjectTrustState::Trusted
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn project_trust_update_preserves_existing_toml_and_permissions() {
+        let root = trust_test_directory("preserve");
+        let project = root.join("project with spaces");
+        fs::create_dir_all(project.join(".codex")).unwrap();
+        let config = root.join("home/config.toml");
+        fs::create_dir_all(config.parent().unwrap()).unwrap();
+        fs::write(&config, "# keep this comment\nmodel = \"gpt-test\"\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&config, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+
+        trust_project_at(&project, &config).unwrap();
+        let updated = fs::read_to_string(&config).unwrap();
+        assert!(updated.starts_with("# keep this comment\nmodel = \"gpt-test\"\n"));
+        assert!(updated.contains(&format!("[projects.\"{}\"]", project.display())));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&config).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn malformed_codex_config_is_never_overwritten() {
+        let root = trust_test_directory("malformed");
+        let project = root.join("project");
+        fs::create_dir_all(project.join(".codex")).unwrap();
+        let config = root.join("config.toml");
+        let invalid = "[projects.\n";
+        fs::write(&config, invalid).unwrap();
+
+        assert!(trust_project_at(&project, &config).is_err());
+        assert_eq!(fs::read_to_string(&config).unwrap(), invalid);
+        fs::remove_dir_all(root).unwrap();
     }
 }

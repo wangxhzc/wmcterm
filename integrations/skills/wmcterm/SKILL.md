@@ -43,6 +43,10 @@ from the currently focused UI item: the user may be viewing another workspace.
   Codex's native automatic reviewer; it is not blanket approval. Full Access is
   human-only in the wmcterm UI and must never be selected or reconstructed by an
   Agent.
+- The GUI may require a human project-trust decision before launching unattended
+  Codex when the workspace contains `.codex`. This decision is intentionally not
+  available through Agent, CLI, or RPC control; never edit Codex trust settings to
+  imitate it.
 
 ## Launch Claude safely
 

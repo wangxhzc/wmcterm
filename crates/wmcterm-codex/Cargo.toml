@@ -6,8 +6,10 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+directories.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+toml_edit.workspace = true
 wmcterm-ipc = { path = "../wmcterm-ipc" }
 thiserror.workspace = true
 tungstenite.workspace = true
