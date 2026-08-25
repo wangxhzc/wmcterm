@@ -355,6 +355,7 @@ fn codex_teams_config(
         codex_program: codex_program
             .map(PathBuf::from)
             .unwrap_or_else(resolve_codex_program),
+        workspace_cwd: env::current_dir().context("could not determine the Codex workspace cwd")?,
         max_auto_depth: max_auto_depth
             .and_then(|value| value.parse::<usize>().ok())
             .unwrap_or(2)
@@ -999,7 +1000,10 @@ fn run_cli(scope: String) -> Result<()> {
 /// with `--no-focus`.
 fn run_agent(mut args: impl Iterator<Item = String>) -> Result<()> {
     let (mode, program, supplied) = parse_agent_launch_args(&mut args)?;
-    let (executable, child_args) = plan_agent_process(mode, &program, &supplied)?;
+    let (mut executable, mut child_args) = plan_agent_process(mode, &program, &supplied)?;
+    if program == "claude" {
+        (executable, child_args) = resolve_claude_command(executable, child_args);
+    }
     let status = std::process::Command::new(&executable)
         .args(&child_args)
         .status()
@@ -1008,6 +1012,77 @@ fn run_agent(mut args: impl Iterator<Item = String>) -> Result<()> {
         bail!("managed Agent `{program}` exited with status {status}");
     }
     Ok(())
+}
+
+#[cfg(windows)]
+fn resolve_claude_command(fallback: PathBuf, child_args: Vec<String>) -> (PathBuf, Vec<String>) {
+    for name in ["claude.exe", "claude.cmd", "claude.bat"] {
+        let Ok(output) = std::process::Command::new("where.exe").arg(name).output() else {
+            continue;
+        };
+        if !output.status.success() {
+            continue;
+        }
+        for path in String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(PathBuf::from)
+        {
+            if path
+                .extension()
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("exe"))
+            {
+                return (path, child_args);
+            }
+            for native in claude_native_candidates(&path) {
+                if native.is_file() {
+                    return (native, child_args);
+                }
+            }
+            for entry in claude_node_entry_candidates(&path) {
+                if entry.is_file() {
+                    let node = path
+                        .parent()
+                        .map(|prefix| prefix.join("node.exe"))
+                        .filter(|candidate| candidate.is_file())
+                        .unwrap_or_else(|| PathBuf::from("node.exe"));
+                    let mut node_args = Vec::with_capacity(child_args.len() + 1);
+                    node_args.push(entry.display().to_string());
+                    node_args.extend(child_args);
+                    return (node, node_args);
+                }
+            }
+        }
+    }
+    (fallback, child_args)
+}
+
+#[cfg(not(windows))]
+fn resolve_claude_command(executable: PathBuf, child_args: Vec<String>) -> (PathBuf, Vec<String>) {
+    (executable, child_args)
+}
+
+#[cfg(any(windows, test))]
+fn claude_native_candidates(shim: &Path) -> Vec<PathBuf> {
+    let Some(prefix) = shim.parent() else {
+        return Vec::new();
+    };
+    vec![prefix.join("node_modules/@anthropic-ai/claude-code/bin/claude.exe")]
+}
+
+#[cfg(any(windows, test))]
+fn claude_node_entry_candidates(shim: &Path) -> Vec<PathBuf> {
+    let Some(prefix) = shim.parent() else {
+        return Vec::new();
+    };
+    ["cli-wrapper.cjs", "cli.js"]
+        .map(|entry| {
+            prefix
+                .join("node_modules/@anthropic-ai/claude-code")
+                .join(entry)
+        })
+        .into()
 }
 
 fn parse_agent_launch_args(
@@ -2168,6 +2243,29 @@ mod tests {
             candidates[0]
                 .to_string_lossy()
                 .contains("@openai/codex-win32-x64")
+        );
+    }
+
+    #[test]
+    fn windows_claude_npm_shim_resolves_node_entrypoint() {
+        let shim = Path::new("C:/Users/user/AppData/Roaming/npm/claude.cmd");
+        assert_eq!(
+            claude_native_candidates(shim),
+            [PathBuf::from(
+                "C:/Users/user/AppData/Roaming/npm/node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+            )]
+        );
+        let candidates = claude_node_entry_candidates(shim);
+        assert_eq!(
+            candidates,
+            [
+                PathBuf::from(
+                    "C:/Users/user/AppData/Roaming/npm/node_modules/@anthropic-ai/claude-code/cli-wrapper.cjs"
+                ),
+                PathBuf::from(
+                    "C:/Users/user/AppData/Roaming/npm/node_modules/@anthropic-ai/claude-code/cli.js"
+                )
+            ]
         );
     }
 

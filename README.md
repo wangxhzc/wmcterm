@@ -21,6 +21,8 @@
 在 Windows 上，默认 shell 是系统自带的 Windows PowerShell 5.1 可执行文件
 `powershell.exe`。通过 `SHELL` 显式选择时仍支持 PowerShell 7（`pwsh.exe`），
 但不会假定 Windows 10 已安装它。
+托管 Claude 启动同时支持原生 `claude.exe` 和 npm 安装生成的 `claude.cmd`/`claude.bat`
+shim；npm 布局会直接解析包内原生程序或 Node 入口，不经过命令 shell。
 
 运行 GPU 终端工作区：
 
@@ -183,9 +185,11 @@ transcript 加载到监视器。它识别所有携带线程 ID 的 `thread/*` �
 检查 Codex 用户配置中的精确项目路径。未信任的项目必须由用户选择“信任并启动”或
 “不信任并继续”；前者安全合并 `~/.codex/config.toml`，后者保持项目级 config、
 Hooks 和 exec policies 禁用。该人工信任入口不会暴露给 CLI、RPC 或 Agent。
-Codex 原生 `codex resume` 默认按当前 cwd 过滤（`--all` 才显示全部）；当前私有
-app-server 远程 TUI 的 `/resume` 可能显示全局会话，这是上游远程 picker 的兼容性
-差异，不代表 wmcterm 改变了会话归属或授权范围。
+Codex 原生 `codex resume` 默认按当前 cwd 过滤（`--all` 才显示全部）。wmcterm 会把
+Workspace cwd 显式传给私有 app-server 的远程 TUI。Codex 0.149.1 会话内部的
+`/resume` 会新建一个未继承 remote cwd 的 picker 连接，因此仍可能固定显示
+`Filter: All`；这个 provider 缺陷无法由外部启动参数修复。调用者显式传入
+`-C`/`--cd` 时以该目录为准。
 对于这些托管 app-server 会话，通用 Codex `PermissionRequest` Hook 被视为重复遥测，
 不会创建第二个可操作请求；非托管 Codex 的 Hook 通知保持正常行为。
 如果根 Codex TUI 先回答同一个 app-server 请求，wmcterm 会消费 Codex 的
@@ -270,7 +274,10 @@ command = "cargo test"
 
 工作区布局、表面、终端命令和受支持的 Agent 会话 ID 会从平台数据目录恢复。可见的
 回滚历史会保留；PTY 进程内存绝不会被序列化，命令以及 Claude/Codex/OpenCode 的
-resume 标识符会被重新启动。
+resume 标识符会被重新启动。`codex-teams` 子分区保存的私有 loopback
+app-server 地址只在当前进程内有效；重启后这些子分区会稳定降级为独立的
+`codex resume` 会话，不会重放已经失效的 `--remote` 地址。Claude Code 的
+session ID 和恢复命令不依赖此类临时 endpoint，保持原有恢复行为。
 
 可使用 `wmcterm config init`、`config show`、`config validate` 或
 `config import-ghostty [PATH]`。UI 每秒重新加载一次有效的配置变更。支持主题颜色、

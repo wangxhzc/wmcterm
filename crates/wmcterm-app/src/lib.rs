@@ -175,6 +175,7 @@ enum UserEvent {
 }
 
 const UNMODIFIED_TAB_FOCUS_GRACE: std::time::Duration = std::time::Duration::from_millis(120);
+const FOCUS_INPUT_QUARANTINE_GRACE: std::time::Duration = std::time::Duration::from_millis(120);
 
 #[derive(Debug)]
 struct WorkspaceMetadata {
@@ -538,15 +539,7 @@ pub fn run() -> Result<()> {
                 .terminals
                 .iter()
                 .filter_map(|terminal| {
-                    terminal
-                        .command
-                        .clone()
-                        .or_else(|| {
-                            terminal
-                                .agent
-                                .as_ref()
-                                .map(wmcterm_session::AgentResumeInfo::command)
-                        })
+                    restored_terminal_command(terminal)
                         .map(|command| (terminal.terminal_id, command))
                 })
                 .collect()
@@ -622,6 +615,48 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
+fn restored_terminal_command(terminal: &TerminalResume) -> Option<String> {
+    match (&terminal.command, &terminal.agent) {
+        (Some(command), Some(agent @ AgentResumeInfo::Codex { session_id }))
+            if is_stale_codex_teams_child_command(command, session_id) =>
+        {
+            Some(agent.command())
+        }
+        (Some(command), _) => Some(command.clone()),
+        (None, Some(agent)) => Some(agent.command()),
+        (None, None) => None,
+    }
+}
+
+/// `codex-teams` child panes attach to a private app-server on a loopback port.
+/// The server and port die with the owning wmcterm process, so replaying this
+/// expanded command after session restore can only fail. Match the exact tail
+/// emitted by `wmcterm-codex` and require its thread ID to agree with the Agent
+/// metadata before degrading it to a standalone `codex resume` command.
+fn is_stale_codex_teams_child_command(command: &str, session_id: &str) -> bool {
+    let mut parts = command.split_whitespace().rev();
+    let Some(thread_id) = parts.next() else {
+        return false;
+    };
+    let Some(endpoint) = parts.next() else {
+        return false;
+    };
+    let Some(remote) = parts.next() else {
+        return false;
+    };
+    let Some(resume) = parts.next() else {
+        return false;
+    };
+    let endpoint = endpoint.trim_end_matches('/');
+    let Some(port) = endpoint.strip_prefix("ws://127.0.0.1:") else {
+        return false;
+    };
+    thread_id == session_id
+        && remote == "--remote"
+        && resume == "resume"
+        && port.parse::<u16>().is_ok_and(|port| port != 0)
+}
+
 struct WmctermApplication {
     renderer: Option<GpuRenderer>,
     state: AppState,
@@ -632,6 +667,7 @@ struct WmctermApplication {
     modifiers: ModifiersState,
     physical_alt_pressed: bool,
     pending_unmodified_tab: Option<(KeyEvent, std::time::Instant)>,
+    focus_input_quarantine: bool,
     palette_visible: bool,
     palette_index: usize,
     palette_scroll: usize,
@@ -805,6 +841,7 @@ impl WmctermApplication {
             modifiers: ModifiersState::empty(),
             physical_alt_pressed: false,
             pending_unmodified_tab: None,
+            focus_input_quarantine: false,
             palette_visible: false,
             palette_index: 0,
             palette_scroll: 0,
@@ -1930,6 +1967,23 @@ impl WmctermApplication {
         let _ = session.apply_event(&event);
     }
 
+    fn should_quarantine_focus_input(&mut self) -> bool {
+        if !self.window_focused {
+            return true;
+        }
+        if !self.focus_input_quarantine {
+            return false;
+        }
+        if focus_input_should_remain_quarantined(
+            self.window_focus_gained_at.elapsed(),
+            platform_keyboard_has_pressed_keys(),
+        ) {
+            return true;
+        }
+        self.focus_input_quarantine = false;
+        false
+    }
+
     fn send_key(&mut self, event: &KeyEvent) {
         if matches!(
             event.physical_key,
@@ -1937,7 +1991,7 @@ impl WmctermApplication {
         ) {
             self.physical_alt_pressed = event.state == ElementState::Pressed;
         }
-        if event.state != ElementState::Pressed {
+        if self.should_quarantine_focus_input() || event.state != ElementState::Pressed {
             return;
         }
         self.reset_cursor_blink();
@@ -2750,6 +2804,7 @@ impl WmctermApplication {
 
     fn commit_ime_text(&mut self, text: String) {
         if text.is_empty()
+            || self.should_quarantine_focus_input()
             || self.close_confirmation.is_some()
             || self.codex_trust_confirmation.is_some()
         {
@@ -5516,6 +5571,7 @@ impl WmctermApplication {
                 {
                     let notifications_changed =
                         self.mark_terminal_notifications_read(menu.terminal);
+                    self.track_foreground_agent_paste(menu.terminal, &text);
                     if let Some(runtime) = self.terminals.get(&menu.terminal) {
                         let _ = runtime.session.send(SessionCommand::Paste(text));
                     }
@@ -7218,12 +7274,22 @@ impl WmctermApplication {
             return;
         };
         let notifications_changed = self.mark_terminal_notifications_read(terminal);
+        self.track_foreground_agent_paste(terminal, &text);
         if let Some(runtime) = self.terminals.get(&terminal) {
             let _ = runtime.session.send(SessionCommand::Paste(text));
         }
         self.reset_cursor_blink();
         if notifications_changed {
             self.rebuild_scene();
+        }
+    }
+
+    fn track_foreground_agent_paste(&mut self, terminal: TerminalId, text: &str) {
+        if self.foreground_agents.contains_key(&terminal) {
+            append_bounded_agent_input(
+                self.foreground_agent_input.entry(terminal).or_default(),
+                text,
+            );
         }
     }
 
@@ -7959,19 +8025,35 @@ impl WmctermApplication {
                     .map(|runtime| {
                         let cell_width = self.cell_width();
                         let cell_height = self.cell_height();
+                        let terminal_selection = self
+                            .selection
+                            .filter(|item| item.pane == pane_id && item.terminal == id)
+                            .map(|selection| ordered_cells(selection.start, selection.end));
                         for (row, cells) in runtime.snapshot.cells.iter().enumerate() {
                             for (col, cell) in cells.iter().enumerate() {
+                                let selected = terminal_selection.is_some_and(|selection| {
+                                    terminal_cell_is_selected(
+                                        col,
+                                        runtime.snapshot.screen_row_origin + row,
+                                        selection,
+                                    )
+                                });
+                                let selection_background =
+                                    selected.then(|| terminal_selection_background(cells, col));
+                                let foreground = selection_background
+                                    .map(contrasting_selection_foreground)
+                                    .unwrap_or([
+                                        cell.foreground.r,
+                                        cell.foreground.g,
+                                        cell.foreground.b,
+                                        255,
+                                    ]);
                                 if needs_grid_positioned_glyph(cell.text.as_str()) {
                                     terminal_wide_glyphs.push(TextBlock {
                                         text: String::new(),
                                         spans: vec![TextSpan {
                                             text: cell.text.clone(),
-                                            color: [
-                                                cell.foreground.r,
-                                                cell.foreground.g,
-                                                cell.foreground.b,
-                                                255,
-                                            ],
+                                            color: foreground,
                                             bold: cell.bold,
                                             italic: cell.italic,
                                         }],
@@ -8014,12 +8096,7 @@ impl WmctermApplication {
                                     });
                                 }
                                 if cell.underline || cell.strikethrough {
-                                    let color = [
-                                        cell.foreground.r,
-                                        cell.foreground.g,
-                                        cell.foreground.b,
-                                        255,
-                                    ];
+                                    let color = foreground;
                                     if cell.underline {
                                         rectangles.push(RectBlock {
                                             left: rect.x + 8.0 + col as f32 * cell_width,
@@ -8058,35 +8135,55 @@ impl WmctermApplication {
                                 }
                             }
                         }
-                        if let Some(selection) = self
-                            .selection
-                            .filter(|item| item.pane == pane_id && item.terminal == id)
-                        {
-                            let (start, end) = ordered_cells(selection.start, selection.end);
+                        if let Some((start, end)) = terminal_selection {
                             let origin = runtime.snapshot.screen_row_origin;
                             let viewport_end = origin
                                 .saturating_add(runtime.snapshot.rows.saturating_sub(1) as usize);
                             for screen_row in start.1.max(origin)..=end.1.min(viewport_end) {
                                 let row = screen_row - origin;
+                                let Some(cells) = runtime.snapshot.cells.get(row) else {
+                                    continue;
+                                };
                                 let from = if screen_row == start.1 { start.0 } else { 0 };
                                 let to = if screen_row == end.1 {
                                     end.0
                                 } else {
                                     runtime.snapshot.cols as usize - 1
                                 };
-                                let to = runtime
-                                    .snapshot
-                                    .cells
-                                    .get(row)
-                                    .map(|cells| wide_cell_end(cells, to))
-                                    .unwrap_or(to);
-                                rectangles.push(RectBlock {
-                                    left: rect.x + 8.0 + from as f32 * cell_width,
-                                    top: rect.y + 25.0 + row as f32 * cell_height,
-                                    width: (to.saturating_sub(from) + 1) as f32 * cell_width,
-                                    height: cell_height,
-                                    color: [69, 71, 90, 210],
-                                });
+                                let to =
+                                    wide_cell_end(cells, to).min(cells.len().saturating_sub(1));
+                                if from > to {
+                                    continue;
+                                }
+                                let mut run_start = from;
+                                let mut run_color = terminal_selection_background(cells, from);
+                                for col in from + 1..=to {
+                                    let color = terminal_selection_background(cells, col);
+                                    if color != run_color {
+                                        push_terminal_selection_rect(
+                                            &mut rectangles,
+                                            rect,
+                                            row,
+                                            run_start,
+                                            col - 1,
+                                            cell_width,
+                                            cell_height,
+                                            run_color,
+                                        );
+                                        run_start = col;
+                                        run_color = color;
+                                    }
+                                }
+                                push_terminal_selection_rect(
+                                    &mut rectangles,
+                                    rect,
+                                    row,
+                                    run_start,
+                                    to,
+                                    cell_width,
+                                    cell_height,
+                                    run_color,
+                                );
                             }
                         }
                         if let Some(cursor) = runtime.snapshot.cursor.filter(|cursor| {
@@ -8158,7 +8255,7 @@ impl WmctermApplication {
                         }
                         let mut spans = Vec::new();
                         for (row_index, row) in runtime.snapshot.cells.iter().enumerate() {
-                            for cell in row {
+                            for (col, cell) in row.iter().enumerate() {
                                 let text = if cell.text.is_empty()
                                     || needs_grid_positioned_glyph(cell.text.as_str())
                                 {
@@ -8166,13 +8263,20 @@ impl WmctermApplication {
                                 } else {
                                     cell.text.as_str()
                                 };
-                                push_terminal_span(
-                                    &mut spans,
-                                    text,
-                                    [cell.foreground.r, cell.foreground.g, cell.foreground.b, 255],
-                                    cell.bold,
-                                    cell.italic,
-                                );
+                                let color = if terminal_selection.is_some_and(|selection| {
+                                    terminal_cell_is_selected(
+                                        col,
+                                        runtime.snapshot.screen_row_origin + row_index,
+                                        selection,
+                                    )
+                                }) {
+                                    contrasting_selection_foreground(terminal_selection_background(
+                                        row, col,
+                                    ))
+                                } else {
+                                    [cell.foreground.r, cell.foreground.g, cell.foreground.b, 255]
+                                };
+                                push_terminal_span(&mut spans, text, color, cell.bold, cell.italic);
                             }
                             if row_index + 1 < runtime.snapshot.cells.len() {
                                 push_terminal_span(&mut spans, "\n", theme_text, false, false);
@@ -10715,12 +10819,23 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                 self.rebuild_scene();
                 if focused {
                     self.window_focus_gained_at = std::time::Instant::now();
+                    // System overlays can return focus before the shortcut
+                    // that dismissed them has been released. Windows may then
+                    // deliver the trailing character (for example the `c` in
+                    // a screenshot tool's Ctrl+C) to this window. Quarantine
+                    // all keyboard and IME input through a short cross-platform
+                    // focus grace period. On Windows, keep it active longer
+                    // while a physical key remains held. A subsequent mouse
+                    // press proves that the user intentionally reactivated the
+                    // window and clears the quarantine immediately.
+                    self.focus_input_quarantine = true;
                 } else {
                     // A window manager may consume the matching Alt release
                     // after Alt+Tab has transferred focus.
                     self.physical_alt_pressed = false;
                     self.modifiers = ModifiersState::empty();
                     self.pending_unmodified_tab = None;
+                    self.focus_input_quarantine = false;
                     if self.notifications_visible {
                         self.notifications_visible = false;
                         self.notification_scroll = 0;
@@ -10757,6 +10872,7 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                 button: MouseButton::Left,
                 ..
             } => {
+                self.focus_input_quarantine = false;
                 self.begin_mouse_action();
                 if self.quit_requested {
                     event_loop.exit();
@@ -10772,6 +10888,7 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                 button: MouseButton::Right,
                 ..
             } => {
+                self.focus_input_quarantine = false;
                 if self.close_confirmation.is_some() || self.codex_trust_confirmation.is_some() {
                     return;
                 }
@@ -10811,6 +10928,7 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                 button: MouseButton::Middle,
                 ..
             } => {
+                self.focus_input_quarantine = false;
                 if self.close_confirmation.is_some() || self.codex_trust_confirmation.is_some() {
                     return;
                 }
@@ -11956,6 +12074,61 @@ fn push_terminal_span(
     }
 }
 
+fn terminal_cell_is_selected(
+    column: usize,
+    screen_row: usize,
+    (start, end): ((usize, usize), (usize, usize)),
+) -> bool {
+    screen_row >= start.1
+        && screen_row <= end.1
+        && (screen_row != start.1 || column >= start.0)
+        && (screen_row != end.1 || column <= end.0)
+}
+
+fn terminal_selection_background(row: &[CellSnapshot], column: usize) -> [u8; 4] {
+    let cell = &row[wide_cell_lead(row, column)];
+    [cell.foreground.r, cell.foreground.g, cell.foreground.b, 255]
+}
+
+fn contrasting_selection_foreground(background: [u8; 4]) -> [u8; 4] {
+    let linear = |component: u8| {
+        let value = component as f32 / 255.0;
+        if value <= 0.04045 {
+            value / 12.92
+        } else {
+            ((value + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    let luminance = 0.2126 * linear(background[0])
+        + 0.7152 * linear(background[1])
+        + 0.0722 * linear(background[2]);
+    if luminance > 0.179 {
+        [0, 0, 0, 255]
+    } else {
+        [255, 255, 255, 255]
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn push_terminal_selection_rect(
+    rectangles: &mut Vec<RectBlock>,
+    terminal: Rect,
+    row: usize,
+    from: usize,
+    to: usize,
+    cell_width: f32,
+    cell_height: f32,
+    color: [u8; 4],
+) {
+    rectangles.push(RectBlock {
+        left: terminal.x + 8.0 + from as f32 * cell_width,
+        top: terminal.y + 25.0 + row as f32 * cell_height,
+        width: (to - from + 1) as f32 * cell_width,
+        height: cell_height,
+        color,
+    });
+}
+
 const fn brighten_rgba([red, green, blue, alpha]: [u8; 4], amount: u8) -> [u8; 4] {
     [
         red.saturating_add(amount),
@@ -12061,6 +12234,29 @@ fn is_window_switch_shortcut(
     let tab = matches!(logical_key, Key::Named(NamedKey::Tab))
         || matches!(physical_key, PhysicalKey::Code(KeyCode::Tab));
     tab && (modifiers.alt_key() || modifiers.super_key() || physical_alt_pressed)
+}
+
+#[cfg(windows)]
+fn platform_keyboard_has_pressed_keys() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState;
+
+    // Virtual-key values 0x08 through 0xfe cover keyboard keys while excluding
+    // the mouse-button range. The high bit reports the current physical state;
+    // the low bit is a process-global "pressed since last query" flag and must
+    // not keep the quarantine active.
+    (0x08..=0xfe).any(|virtual_key| unsafe { GetAsyncKeyState(virtual_key) } < 0)
+}
+
+#[cfg(not(windows))]
+fn platform_keyboard_has_pressed_keys() -> bool {
+    false
+}
+
+fn focus_input_should_remain_quarantined(
+    focused_for: std::time::Duration,
+    platform_keyboard_has_pressed_keys: bool,
+) -> bool {
+    platform_keyboard_has_pressed_keys || focused_for < FOCUS_INPUT_QUARANTINE_GRACE
 }
 
 fn should_suppress_focus_transition_key(
@@ -12265,9 +12461,28 @@ fn detected_foreground_agent_metadata(agent: AgentKind) -> wmcterm_core::AgentMe
     }
 }
 
+const MAX_TRACKED_AGENT_INPUT_BYTES: usize = 4096;
+
+fn append_bounded_agent_input(input: &mut String, pasted: &str) {
+    let remaining = MAX_TRACKED_AGENT_INPUT_BYTES.saturating_sub(input.len());
+    let mut end = pasted.len().min(remaining);
+    while !pasted.is_char_boundary(end) {
+        end -= 1;
+    }
+    input.push_str(&pasted[..end]);
+}
+
 fn agent_submission_starts_turn(input: &str) -> bool {
     let input = input.trim_start();
-    !input.is_empty() && !input.starts_with('/')
+    if !input.starts_with('/') {
+        return !input.is_empty();
+    }
+
+    let mut words = input.split_whitespace();
+    matches!(
+        (words.next(), words.next()),
+        (Some("/goal"), Some("resume"))
+    )
 }
 
 fn is_agent_interrupt(physical_key: PhysicalKey, modifiers: ModifiersState) -> bool {
@@ -12781,6 +12996,11 @@ fn agent_session_event_kind(
                 choices: Vec::new(),
             }))
         }
+        AgentEvent::TurnComplete { .. } => Some(AgentSessionEventKind::Telemetry(
+            AgentTelemetry::StateObserved {
+                state: wmcterm_core::AgentState::Idle,
+            },
+        )),
         // Hook Stop means the current turn has returned to the interactive
         // prompt; it does not mean that the long-lived Agent process exited.
         // The PTY exit path owns the actual lifecycle transition.
@@ -13097,7 +13317,7 @@ fn apply_claude_subagent_status(
         ClaudeHookKind::SubagentStop => {
             statuses.remove(&route_key);
         }
-        ClaudeHookKind::SessionEnd | ClaudeHookKind::Stop => {
+        ClaudeHookKind::SessionEnd => {
             statuses.retain(|_, subagent| {
                 subagent.surface != surface || subagent.session_id != hook.session_id
             });
@@ -13107,7 +13327,8 @@ fn apply_claude_subagent_status(
         | ClaudeHookKind::PostToolUse
         | ClaudeHookKind::PostToolUseFailure
         | ClaudeHookKind::PermissionRequest
-        | ClaudeHookKind::Notification => {}
+        | ClaudeHookKind::Notification
+        | ClaudeHookKind::Stop => {}
     }
 }
 
@@ -13442,6 +13663,80 @@ fn word_cell_bounds(row: &[CellSnapshot], clicked: usize) -> Option<(usize, usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn terminal_resume(command: Option<&str>, agent: Option<AgentResumeInfo>) -> TerminalResume {
+        TerminalResume {
+            terminal_id: TerminalId::new_v4(),
+            cwd: PathBuf::from("/tmp/project"),
+            command: command.map(str::to_owned),
+            agent,
+            scrollback: None,
+        }
+    }
+
+    #[test]
+    fn restored_codex_teams_child_degrades_to_standalone_resume() {
+        let terminal = terminal_resume(
+            Some("/opt/codex resume --remote ws://127.0.0.1:44459 child-thread"),
+            Some(AgentResumeInfo::Codex {
+                session_id: "child-thread".into(),
+            }),
+        );
+        assert_eq!(
+            restored_terminal_command(&terminal).as_deref(),
+            Some("codex resume child-thread")
+        );
+    }
+
+    #[test]
+    fn restored_commands_keep_roots_and_unverified_remote_commands() {
+        let root = terminal_resume(
+            Some("wmcterm codex-teams --model gpt-5"),
+            Some(AgentResumeInfo::Codex {
+                session_id: "root-thread".into(),
+            }),
+        );
+        assert_eq!(
+            restored_terminal_command(&root).as_deref(),
+            Some("wmcterm codex-teams --model gpt-5")
+        );
+
+        let mismatched = terminal_resume(
+            Some("codex resume --remote ws://127.0.0.1:44459 other-thread"),
+            Some(AgentResumeInfo::Codex {
+                session_id: "expected-thread".into(),
+            }),
+        );
+        assert_eq!(
+            restored_terminal_command(&mismatched).as_deref(),
+            Some("codex resume --remote ws://127.0.0.1:44459 other-thread")
+        );
+    }
+
+    #[test]
+    fn restored_claude_command_remains_stable() {
+        let terminal = terminal_resume(
+            Some("wmcterm agent claude"),
+            Some(AgentResumeInfo::Claude {
+                session_id: "claude-session".into(),
+            }),
+        );
+        assert_eq!(
+            restored_terminal_command(&terminal).as_deref(),
+            Some("wmcterm agent claude")
+        );
+
+        let resume_only = terminal_resume(
+            None,
+            Some(AgentResumeInfo::Claude {
+                session_id: "claude-session".into(),
+            }),
+        );
+        assert_eq!(
+            restored_terminal_command(&resume_only).as_deref(),
+            Some("claude --resume claude-session")
+        );
+    }
 
     #[test]
     fn screen_read_line_limit_returns_the_tail_without_changing_terminal_state() {
@@ -13862,10 +14157,14 @@ mod tests {
     }
 
     #[test]
-    fn codex_local_commands_do_not_start_an_agent_turn() {
+    fn codex_local_commands_do_not_start_an_agent_turn_except_goal_resume() {
         assert!(!agent_submission_starts_turn(""));
         assert!(!agent_submission_starts_turn("   /model"));
         assert!(!agent_submission_starts_turn("/compact now"));
+        assert!(!agent_submission_starts_turn("/goal"));
+        assert!(!agent_submission_starts_turn("/goal status"));
+        assert!(agent_submission_starts_turn("/goal resume"));
+        assert!(agent_submission_starts_turn("  /goal resume goal-id"));
         assert!(agent_submission_starts_turn("explain this failure"));
         assert!(is_agent_interrupt(
             PhysicalKey::Code(KeyCode::KeyC),
@@ -13875,6 +14174,21 @@ mod tests {
             PhysicalKey::Code(KeyCode::KeyC),
             ModifiersState::CONTROL | ModifiersState::ALT
         ));
+    }
+
+    #[test]
+    fn agent_paste_tracking_keeps_only_a_bounded_utf8_prefix() {
+        let mut tracked = String::from("prompt ");
+        append_bounded_agent_input(&mut tracked, &"中文🙂".repeat(2048));
+        assert!(tracked.len() <= MAX_TRACKED_AGENT_INPUT_BYTES);
+        assert!(tracked.is_char_boundary(tracked.len()));
+        assert!(tracked.starts_with("prompt 中文🙂"));
+
+        let full = tracked.clone();
+        append_bounded_agent_input(&mut tracked, "ignored");
+        assert!(tracked.starts_with(&full));
+        assert!(tracked.len() <= MAX_TRACKED_AGENT_INPUT_BYTES);
+        assert!(agent_submission_starts_turn(&tracked));
     }
 
     #[test]
@@ -14013,6 +14327,18 @@ mod tests {
                 .all(|status| status.surface == other_surface)
         );
 
+        let goal_stop = wmcterm_agent::normalize_claude_hook_event(
+            Some("Stop"),
+            &json!({
+                "hook_event_name": "Stop",
+                "session_id": "one",
+                "stop_hook_active": true
+            }),
+        )
+        .unwrap();
+        apply_claude_subagent_status(&mut statuses, other_surface, &goal_stop);
+        assert_eq!(statuses.len(), 2);
+
         let session_end = wmcterm_agent::normalize_claude_hook_event(
             Some("SessionEnd"),
             &json!({
@@ -14146,6 +14472,22 @@ mod tests {
     }
 
     #[test]
+    fn focus_input_quarantine_covers_late_cross_window_keys() {
+        assert!(focus_input_should_remain_quarantined(
+            std::time::Duration::from_millis(20),
+            false
+        ));
+        assert!(!focus_input_should_remain_quarantined(
+            FOCUS_INPUT_QUARANTINE_GRACE,
+            false
+        ));
+        assert!(focus_input_should_remain_quarantined(
+            FOCUS_INPUT_QUARANTINE_GRACE,
+            true
+        ));
+    }
+
+    #[test]
     fn managed_agent_launcher_encodes_explicit_safe_modes() {
         assert!(
             managed_agent_command(AgentRunMode::Interactive, "codex")
@@ -14263,6 +14605,63 @@ mod tests {
             Some(start),
             start + std::time::Duration::from_millis(17)
         ));
+    }
+
+    #[test]
+    fn terminal_selection_uses_cell_color_and_high_contrast_text() {
+        let mut bright = selection_cell("A");
+        bright.foreground = Rgb {
+            r: 240,
+            g: 200,
+            b: 80,
+        };
+        let mut dark = selection_cell("B");
+        dark.foreground = Rgb { r: 8, g: 20, b: 45 };
+        let row = [bright, dark];
+
+        let bright_background = terminal_selection_background(&row, 0);
+        let dark_background = terminal_selection_background(&row, 1);
+        assert_eq!(bright_background, [240, 200, 80, 255]);
+        assert_eq!(dark_background, [8, 20, 45, 255]);
+        assert_eq!(
+            contrasting_selection_foreground(bright_background),
+            [0, 0, 0, 255]
+        );
+        assert_eq!(
+            contrasting_selection_foreground(dark_background),
+            [255, 255, 255, 255]
+        );
+    }
+
+    #[test]
+    fn terminal_selection_handles_wide_continuations_and_blank_cells() {
+        let mut wide = selection_cell("中");
+        wide.foreground = Rgb {
+            r: 40,
+            g: 180,
+            b: 90,
+        };
+        let continuation = selection_cell("");
+        let mut blank = selection_cell(" ");
+        blank.foreground = Rgb {
+            r: 210,
+            g: 220,
+            b: 230,
+        };
+        let row = [wide, continuation, blank];
+
+        assert_eq!(terminal_selection_background(&row, 1), [40, 180, 90, 255]);
+        assert_eq!(terminal_selection_background(&row, 2), [210, 220, 230, 255]);
+    }
+
+    #[test]
+    fn terminal_selection_bounds_cover_only_the_inclusive_row_ranges() {
+        let selection = ((3, 10), (2, 12));
+        assert!(!terminal_cell_is_selected(2, 10, selection));
+        assert!(terminal_cell_is_selected(3, 10, selection));
+        assert!(terminal_cell_is_selected(0, 11, selection));
+        assert!(terminal_cell_is_selected(2, 12, selection));
+        assert!(!terminal_cell_is_selected(3, 12, selection));
     }
 
     #[test]

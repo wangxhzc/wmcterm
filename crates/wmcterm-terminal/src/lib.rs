@@ -533,6 +533,17 @@ impl TerminalEngine {
         }
     }
 
+    /// Return a manually scrolled viewport to the live terminal screen.
+    /// Returns whether the visible viewport changed.
+    pub fn scroll_to_bottom(&mut self) -> bool {
+        if self.viewport_offset == 0 {
+            return false;
+        }
+        self.terminal.scroll_viewport(ScrollViewport::Bottom);
+        self.viewport_offset = 0;
+        true
+    }
+
     pub fn select_all_text(&self) -> Result<String, TerminalError> {
         let total_rows = self.terminal.total_rows()?;
         if total_rows == 0 {
@@ -594,7 +605,8 @@ impl TerminalEngine {
     pub fn encode_paste(&self, text: &str) -> Result<Vec<u8>, TerminalError> {
         let mut input = text.as_bytes().to_vec();
         let mut output = vec![0_u8; input.len() + 16];
-        let written = libghostty_vt::paste::encode(&mut input, false, &mut output)?;
+        let bracketed = self.terminal.mode(Mode::BRACKETED_PASTE)?;
+        let written = libghostty_vt::paste::encode(&mut input, bracketed, &mut output)?;
         output.truncate(written);
         Ok(output)
     }
@@ -1183,21 +1195,33 @@ fn run_terminal_actor(
         match incoming {
             Incoming::SnapshotDeadline => continue,
             Incoming::Command(SessionCommand::Input(bytes)) => {
+                if engine.scroll_to_bottom() {
+                    publish_snapshot(&mut engine, &events, &mut snapshot_schedule, false);
+                }
                 let _ = pty.send(PtyCommand::Input(bytes));
             }
             Incoming::Command(SessionCommand::Key(input)) => {
                 if let Ok(bytes) = engine.encode_key(&input) {
+                    if engine.scroll_to_bottom() {
+                        publish_snapshot(&mut engine, &events, &mut snapshot_schedule, false);
+                    }
                     let _ = pty.send(PtyCommand::Input(bytes));
                 }
             }
             Incoming::Command(SessionCommand::Paste(text)) => {
                 if let Ok(bytes) = engine.encode_paste(&text) {
+                    if engine.scroll_to_bottom() {
+                        publish_snapshot(&mut engine, &events, &mut snapshot_schedule, false);
+                    }
                     let _ = pty.send(PtyCommand::Input(bytes));
                 }
             }
             Incoming::Command(SessionCommand::PasteLine(text)) => {
                 if let Ok(mut bytes) = engine.encode_paste(&text) {
                     bytes.push(b'\r');
+                    if engine.scroll_to_bottom() {
+                        publish_snapshot(&mut engine, &events, &mut snapshot_schedule, false);
+                    }
                     let _ = pty.send(PtyCommand::Input(bytes));
                 }
             }
@@ -1680,6 +1704,20 @@ mod tests {
     }
 
     #[test]
+    fn terminal_input_can_return_a_scrolled_viewport_to_live_output() {
+        let mut terminal = TerminalEngine::new(TerminalSize::new(20, 3).unwrap()).unwrap();
+        terminal.feed(b"line-0\r\nline-1\r\nline-2\r\nline-3\r\nline-4\r\n");
+        terminal.scroll(-2);
+        assert_eq!(terminal.snapshot().unwrap().viewport_offset, 2);
+
+        assert!(terminal.scroll_to_bottom());
+        let bottom = terminal.snapshot().unwrap();
+        assert_eq!(bottom.viewport_offset, 0);
+        assert!(bottom.to_plain_text().contains("line-4"));
+        assert!(!terminal.scroll_to_bottom());
+    }
+
+    #[test]
     fn logical_scrollback_limit_bounds_scroll_search_and_copy_all() {
         let mut terminal = TerminalEngine::new_with_scrollback_limits(
             TerminalSize::new(20, 2).unwrap(),
@@ -1828,6 +1866,77 @@ mod tests {
             }
         }
         assert!(found);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn long_paste_followed_by_separate_enter_preserves_pty_byte_order() {
+        const PASTE_LEN: usize = 256 * 1024;
+        let command = "stty raw -echo; printf '\\033[?2004hREADY'; \
+             prefix=$(dd bs=6 count=1 iflag=fullblock 2>/dev/null | od -An -tx1); \
+             dd bs=4096 count=64 iflag=fullblock 2>/dev/null >/dev/null; \
+             suffix=$(dd bs=7 count=1 iflag=fullblock 2>/dev/null | od -An -tx1); \
+             stty sane; printf '\\r\\nprefix=%s suffix=%s\\r\\n' \"$prefix\" \"$suffix\"";
+        let session = TerminalSession::spawn(
+            CommandSpec::new("sh").args(["-lc", command]),
+            TerminalSize::new(80, 4).unwrap(),
+        )
+        .unwrap();
+
+        let mut ready = false;
+        while let Ok(event) = session
+            .events()
+            .recv_timeout(std::time::Duration::from_secs(2))
+        {
+            match event {
+                SessionEvent::Snapshot(snapshot) if snapshot.to_plain_text().contains("READY") => {
+                    ready = true;
+                    break;
+                }
+                SessionEvent::Error(error) => panic!("{error}"),
+                SessionEvent::Exited(status) => panic!("PTY exited before paste: {status}"),
+                _ => {}
+            }
+        }
+        assert!(ready, "PTY did not enable bracketed paste in time");
+
+        session
+            .send(SessionCommand::Paste("x".repeat(PASTE_LEN)))
+            .unwrap();
+        session
+            .send(SessionCommand::Key(KeyInput {
+                key: InputKey::Enter,
+                text: None,
+                modifiers: KeyModifiers::default(),
+                repeat: false,
+            }))
+            .unwrap();
+
+        let mut output = String::new();
+        while let Ok(event) = session
+            .events()
+            .recv_timeout(std::time::Duration::from_secs(5))
+        {
+            match event {
+                SessionEvent::Snapshot(snapshot) => {
+                    output = snapshot.to_plain_text();
+                    if output.contains("suffix=") {
+                        break;
+                    }
+                }
+                SessionEvent::Error(error) => panic!("{error}"),
+                SessionEvent::Exited(_) => break,
+                _ => {}
+            }
+        }
+        assert!(
+            output.contains("prefix= 1b 5b 32 30 30 7e"),
+            "missing bracketed-paste prefix: {output:?}"
+        );
+        assert!(
+            output.contains("suffix= 1b 5b 32 30 31 7e 0d"),
+            "Enter did not immediately follow the paste suffix: {output:?}"
+        );
     }
 
     #[test]

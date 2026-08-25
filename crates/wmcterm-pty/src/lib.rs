@@ -192,6 +192,20 @@ fn run_actor(
             }
         }
     });
+    // A PTY write can block indefinitely when the foreground program stops
+    // consuming input (a large paste is the common case). Keep that blocking
+    // syscall off the lifecycle actor so Shutdown can still kill the child and
+    // let TerminalSession::drop return without freezing the UI thread.
+    let (input_tx, input_rx) = flume::unbounded::<Vec<u8>>();
+    let writer_events = events.clone();
+    thread::spawn(move || {
+        while let Ok(bytes) = input_rx.recv() {
+            if let Err(error) = writer.write_all(&bytes).and_then(|_| writer.flush()) {
+                let _ = writer_events.send(PtyEvent::Error(error.to_string()));
+                return;
+            }
+        }
+    });
 
     #[cfg(any(unix, windows))]
     let mut next_process_check = Instant::now();
@@ -259,8 +273,8 @@ fn run_actor(
         }
         match commands.recv_timeout(Duration::from_millis(8)) {
             Ok(PtyCommand::Input(bytes)) => {
-                if let Err(error) = writer.write_all(&bytes).and_then(|_| writer.flush()) {
-                    let _ = events.send(PtyEvent::Error(error.to_string()));
+                if input_tx.send(bytes).is_err() {
+                    let _ = events.send(PtyEvent::Error("PTY writer stopped".into()));
                     return;
                 }
             }
@@ -497,6 +511,28 @@ mod tests {
             }
         }
         assert!(String::from_utf8_lossy(&output).contains("got:ping"));
+    }
+
+    #[test]
+    fn shutdown_does_not_wait_for_a_blocked_large_input_write() {
+        let session = PtySession::spawn(
+            CommandSpec::new("sh").args(["-lc", "sleep 10"]),
+            PtySize::new(80, 24),
+        )
+        .unwrap();
+        session
+            .send(PtyCommand::Input(vec![b'x'; 8 * 1024 * 1024]))
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let started = Instant::now();
+        drop(session);
+
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "PTY shutdown waited for blocked input: {:?}",
+            started.elapsed()
+        );
     }
 
     #[test]

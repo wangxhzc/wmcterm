@@ -451,6 +451,10 @@ pub enum AgentEvent {
     NeedsInput {
         message: String,
     },
+    TurnComplete {
+        continuing: bool,
+        message: Option<String>,
+    },
     Stop {
         success: bool,
         message: Option<String>,
@@ -487,6 +491,8 @@ pub struct ClaudeHookEvent {
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    #[serde(default)]
+    pub stop_hook_active: bool,
 }
 
 /// Stable actions consumed by a future app-side Claude pane coordinator.
@@ -531,14 +537,15 @@ impl ClaudeHookEvent {
     pub const fn pane_action(&self) -> ClaudePaneAction {
         match self.kind {
             ClaudeHookKind::SessionStart => ClaudePaneAction::BindSession,
-            ClaudeHookKind::SessionEnd | ClaudeHookKind::Stop => ClaudePaneAction::ReleaseSession,
+            ClaudeHookKind::SessionEnd => ClaudePaneAction::ReleaseSession,
             ClaudeHookKind::SubagentStart => ClaudePaneAction::OpenSubagentStatus,
             ClaudeHookKind::SubagentStop => ClaudePaneAction::CloseSubagentStatus,
             ClaudeHookKind::PreToolUse
             | ClaudeHookKind::PostToolUse
             | ClaudeHookKind::PostToolUseFailure
             | ClaudeHookKind::PermissionRequest
-            | ClaudeHookKind::Notification => ClaudePaneAction::UpdateAgentStatus,
+            | ClaudeHookKind::Notification
+            | ClaudeHookKind::Stop => ClaudePaneAction::UpdateAgentStatus,
         }
     }
 
@@ -551,8 +558,12 @@ impl ClaudeHookEvent {
                 agent: AgentKind::Claude.to_string(),
                 session_id: Some(self.session_id.clone()),
             },
-            ClaudeHookKind::SessionEnd | ClaudeHookKind::Stop => AgentEvent::Stop {
+            ClaudeHookKind::SessionEnd => AgentEvent::Stop {
                 success: true,
+                message: self.message.clone().or_else(|| self.reason.clone()),
+            },
+            ClaudeHookKind::Stop => AgentEvent::TurnComplete {
+                continuing: self.stop_hook_active,
                 message: self.message.clone().or_else(|| self.reason.clone()),
             },
             ClaudeHookKind::PermissionRequest => AgentEvent::PermissionRequest {
@@ -676,6 +687,10 @@ pub fn normalize_claude_hook_event(
         message: find_string(payload, &["message", "last_assistant_message", "error"])
             .and_then(optional_nonempty),
         reason: direct_string(payload, "reason"),
+        stop_hook_active: payload
+            .get("stop_hook_active")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
     })
 }
 
@@ -1414,6 +1429,11 @@ pub fn reduce(event: &AgentEvent) -> AgentTransition {
             attention: AttentionState::NeedsInput,
             notification: Some(message.clone()),
         },
+        AgentEvent::TurnComplete { .. } => AgentTransition {
+            state: AgentState::Idle,
+            attention: AttentionState::None,
+            notification: None,
+        },
         AgentEvent::Stop {
             success: true,
             message,
@@ -1866,6 +1886,51 @@ mod tests {
             AgentEvent::Stop { success: true, message: Some(message) }
                 if message == "prompt_input_exit"
         ));
+    }
+
+    #[test]
+    fn claude_stop_is_a_turn_boundary_and_preserves_goal_continuation() {
+        let stopped = normalize_claude_hook_event(
+            None,
+            &serde_json::json!({
+                "session_id": "goal-session",
+                "hook_event_name": "Stop",
+                "stop_hook_active": false,
+                "last_assistant_message": "Checking the goal"
+            }),
+        )
+        .unwrap();
+        assert_eq!(stopped.pane_action(), ClaudePaneAction::UpdateAgentStatus);
+        assert!(matches!(
+            stopped.to_agent_event(),
+            AgentEvent::TurnComplete {
+                continuing: false,
+                ..
+            }
+        ));
+        assert_eq!(reduce(&stopped.to_agent_event()).state, AgentState::Idle);
+
+        let continuing = normalize_claude_hook_event(
+            None,
+            &serde_json::json!({
+                "session_id": "goal-session",
+                "hook_event_name": "Stop",
+                "stop_hook_active": true,
+                "last_assistant_message": "Continuing toward the goal"
+            }),
+        )
+        .unwrap();
+        assert!(continuing.stop_hook_active);
+        assert!(matches!(
+            continuing.to_agent_event(),
+            AgentEvent::TurnComplete {
+                continuing: true,
+                ..
+            }
+        ));
+        // `stop_hook_active` records that a previous Stop hook continued the
+        // turn; it does not reveal whether this Stop will be blocked again.
+        assert_eq!(reduce(&continuing.to_agent_event()).state, AgentState::Idle);
     }
 
     #[test]

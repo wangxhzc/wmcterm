@@ -509,6 +509,7 @@ pub struct BridgeConfig {
     pub workspace_id: String,
     pub root_surface_id: String,
     pub codex_program: PathBuf,
+    pub workspace_cwd: PathBuf,
     #[serde(default = "default_depth")]
     pub max_auto_depth: usize,
 }
@@ -532,6 +533,16 @@ fn codex_launch_plan_for_endpoint(
     codex_args: &[String],
 ) -> CodexLaunchPlan {
     let mut root_args = vec!["--remote".to_owned(), client_endpoint.to_owned()];
+    // A remote Codex TUI cannot infer the server-side workspace cwd. Give it
+    // an explicit override so `/resume` sends a cwd filter to `thread/list`,
+    // matching the behavior of a local `codex resume` picker. Preserve a cwd
+    // supplied by the caller as the more specific choice.
+    if !has_explicit_cwd(codex_args) {
+        root_args.extend([
+            "--cd".to_owned(),
+            config.workspace_cwd.to_string_lossy().into_owned(),
+        ]);
+    }
     root_args.extend_from_slice(codex_args);
     CodexLaunchPlan {
         app_server_args: vec![
@@ -541,6 +552,19 @@ fn codex_launch_plan_for_endpoint(
         ],
         root_args,
     }
+}
+
+fn has_explicit_cwd(args: &[String]) -> bool {
+    args.iter()
+        .take_while(|argument| argument.as_str() != "--")
+        .any(|argument| {
+            argument == "-C"
+                || argument == "--cd"
+                || argument.starts_with("--cd=")
+                || argument
+                    .strip_prefix("-C")
+                    .is_some_and(|value| !value.is_empty())
+        })
 }
 
 const fn default_depth() -> usize {
@@ -1583,6 +1607,7 @@ mod tests {
             workspace_id: "workspace".into(),
             root_surface_id: "surface".into(),
             codex_program: "codex".into(),
+            workspace_cwd: PathBuf::from("/tmp/project"),
             max_auto_depth: default_depth(),
         }
     }
@@ -1710,12 +1735,52 @@ mod tests {
             [
                 "--remote",
                 "ws://127.0.0.1:43123",
+                "--cd",
+                "/tmp/project",
                 "--model",
                 "gpt-test",
                 "prompt text"
             ]
         );
         assert!(!plan.root_args.iter().any(|arg| arg == "app-server"));
+    }
+
+    #[test]
+    fn launch_plan_preserves_an_explicit_workspace_directory() {
+        let config = test_config("ws://127.0.0.1:43123".into());
+        for args in [
+            vec!["--cd".into(), "/work/override".into()],
+            vec!["--cd=/work/override".into()],
+            vec!["-C".into(), "/work/override".into()],
+            vec!["-C/work/override".into()],
+        ] {
+            let plan = codex_launch_plan(&config, &args);
+            assert_eq!(
+                plan.root_args
+                    .iter()
+                    .filter(|argument| matches!(argument.as_str(), "--cd" | "-C"))
+                    .count(),
+                usize::from(matches!(args[0].as_str(), "--cd" | "-C"))
+            );
+            assert!(plan.root_args.ends_with(&args));
+            assert!(
+                !plan
+                    .root_args
+                    .windows(2)
+                    .any(|pair| pair == ["--cd", "/tmp/project"])
+            );
+        }
+    }
+
+    #[test]
+    fn cwd_like_prompt_after_option_terminator_does_not_disable_filtering() {
+        let config = test_config("ws://127.0.0.1:43123".into());
+        let plan = codex_launch_plan(&config, &["--".into(), "--cd=prompt".into()]);
+        assert!(
+            plan.root_args
+                .windows(2)
+                .any(|pair| pair == ["--cd", "/tmp/project"])
+        );
     }
 
     #[test]

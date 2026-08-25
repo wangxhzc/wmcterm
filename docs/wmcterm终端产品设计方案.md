@@ -1994,8 +1994,11 @@ Plugin Marketplace
   信任操作保留未知 TOML 和文件权限并原子替换配置，解析或写入失败时 fail closed。
   该入口不属于 CLI/RPC/Agent 能力，防止无人值守进程自行提升项目 Hook 权限。
 - 原生 `codex resume` 默认按 cwd 过滤、`--all` 才展示全局会话。私有 app-server 的
-  远程 TUI `/resume` 当前可能展示全局线程，属于 provider 远程 picker 的兼容性差异；
-  wmcterm 不据此改变线程归属或审批路由，后续应优先采用 provider 的稳定过滤参数。
+  远程 TUI 无法自行推断服务端目录，因此 wmcterm 会把 Workspace cwd 作为稳定的
+  `--cd` 参数传给根 TUI。Codex 0.149.1 会话内的 `/resume` 会新建一个没有
+  继承 remote cwd override 的 picker 连接，因此仍可能锁定在全部会话；该
+  provider 内部行为无法由 wmcterm 的外部启动参数修复。调用者显式传入
+  `-C`/`--cd` 时优先使用该目录；过滤不改变线程归属或审批路由。
 - 待处理请求队列是审批状态的权威来源。每次注册、回复、取消、超时或进程退出
   都按 Surface 聚合剩余请求并重新派生 Agent、attention 和 Workspace 状态；权限
   请求优先显示 `WaitingForPermission`，其他可操作请求显示 `WaitingForInput`，仅在
@@ -2028,6 +2031,11 @@ Plugin Marketplace
 - `config import-ghostty` 读取 Ghostty 配置并输出合并预览，不覆盖原配置。
 - 会话恢复持久化 Workspace/Pane/Surface 布局、可见 scrollback、命令和支持的
   Agent resume ID；不会序列化 PTY 进程内存，恢复时重新启动对应命令。
+- `codex-teams` 子分区的私有 loopback app-server endpoint 是单次运行时状态，
+  不得在程序重启后重放。当持久化命令的 thread ID 与 Codex Agent
+  resume ID 一致时，恢复逻辑将其降级为独立 `codex resume` 会话；根
+  `codex-teams` 命令和无法验证归属的命令保持不变。Claude Code 的恢复不依赖
+  私有 loopback endpoint，继续使用稳定的 session ID 恢复语义。
 - 仓库包含 Linux x86_64 Debian 与 Windows x86_64 NSIS 打包脚本、桌面入口、
   应用图标，以及作为默认字体随包分发的 Maple Mono Normal NF（含 OFL 许可）。
   Windows 安装器检查 build 17763 门槛、注册 App Paths，并维护系统 `PATH`；
@@ -2220,7 +2228,20 @@ Enter、收到 ToolUse/Activity 或明确的运行状态观测后才进入 `Runn
 生命周期 `Running` 仅表示 Codex/Claude 进程仍存活，不能直接聚合为工作区“运行中”。
 新打开 Agent 并停在输入框时工作区显示空闲，避免把等待首次输入误报为正在执行任务。
 
-## 33.11 性能与显示修复：cmux 参考边界
+## 33.11 已修复缺陷：Claude Goal 续跑被误标为已完成
+
+修复状态（2026-08-23）：Claude Code 的 `Stop` Hook 是可被 `/goal` 或用户 Stop Hook
+拒绝的本轮停止提议，不再映射为根会话 `Completed` 或释放会话路由。wmcterm 保留
+Hook 的 `stop_hook_active` 字段用于保留诊断上下文，但该字段只说明此前发生过 Hook
+续跑，不能表示本次 Stop 的最终裁决。因此所有 `Stop` 都保守映射为 `Idle`；如果
+Goal 继续执行，后续工具或活动事件会重新映射为 `Running`。只有 `SessionEnd` 才表示
+Claude 会话真正完成，并清理该会话的子 Agent 状态。
+
+该区分避免 Goal 尚未满足时 Workspace 短暂或持续显示“已完成”，也避免一次可撤销
+的 `Stop` 提前清除仍属于活动会话的子 Agent 路由。回归测试覆盖普通 Stop、Goal
+续跑 Stop 和 SessionEnd 清理边界。
+
+## 33.12 性能与显示修复：cmux 参考边界
 
 修复状态（2026-08-21）：高频终端快照只标记 scene dirty，UI 合并唤醒并在
 60 Hz 上限内消费最新状态。每个终端的待处理队列只保留最新快照；隐藏工作区、
