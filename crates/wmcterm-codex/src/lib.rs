@@ -1057,12 +1057,10 @@ impl CodexWatcher {
         let target = self
             .last_surface
             .as_deref()
-            .unwrap_or(&self.config.root_surface_id);
-        let direction = if self.last_surface.is_some() {
-            "down"
-        } else {
-            "right"
-        };
+            .unwrap_or(&self.config.root_surface_id)
+            .to_owned();
+        let used_cached_surface = self.last_surface.is_some();
+        let direction = if used_cached_surface { "down" } else { "right" };
         let command = resume_command(
             &self.config.codex_program,
             self.client_endpoint
@@ -1090,15 +1088,29 @@ impl CodexWatcher {
             self.opened.insert(child.thread_id);
             return Ok(());
         }
-        let response = call(
-            &self.config.control_socket,
-            &Request {
-                id: format!("codex-team-{}", RPC_ID.fetch_add(1, Ordering::Relaxed)),
-                method: "pane.split".into(),
-                params,
-            },
-        )
-        .map_err(|error| BridgeError::Control(error.to_string()))?;
+        let split = |params| {
+            call(
+                &self.config.control_socket,
+                &Request {
+                    id: format!("codex-team-{}", RPC_ID.fetch_add(1, Ordering::Relaxed)),
+                    method: "pane.split".into(),
+                    params,
+                },
+            )
+            .map_err(|error| BridgeError::Control(error.to_string()))
+        };
+        let mut response = split(params.clone())?;
+        if used_cached_surface
+            && response
+                .error
+                .as_ref()
+                .is_some_and(|error| error.message == "target surface not found")
+        {
+            self.last_surface = None;
+            params["surface"] = self.config.root_surface_id.clone().into();
+            params["direction"] = "right".into();
+            response = split(params)?;
+        }
         if let Some(error) = response.error {
             return Err(BridgeError::Control(error.message));
         }
@@ -2251,6 +2263,56 @@ mod tests {
         assert_eq!(watcher.depths.get("two"), Some(&1));
         assert_eq!(watcher.open_attempts.get("one"), Some(&1));
         assert_eq!(watcher.open_attempts.get("two"), Some(&1));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn missing_cached_split_surface_retries_from_root_surface() {
+        let control_path = std::env::temp_dir().join(format!(
+            "wmcterm-codex-stale-surface-{}-{}.sock",
+            std::process::id(),
+            next_rpc_id()
+        ));
+        let targets = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded_targets = Arc::clone(&targets);
+        let _control_server = wmcterm_ipc::UnixServer::spawn(&control_path, move |request| {
+            assert_eq!(request.method, "pane.split");
+            let target = request.params["surface"].as_str().unwrap().to_owned();
+            recorded_targets.lock().unwrap().push(target.clone());
+            if target == "closed-child-surface" {
+                wmcterm_ipc::Response::error(request.id, -32601, "target surface not found")
+            } else {
+                wmcterm_ipc::Response::success(
+                    request.id,
+                    json!({"surface_id": "replacement-child-surface"}),
+                )
+            }
+        })
+        .unwrap();
+
+        let mut config = test_config("ws://127.0.0.1:1".into());
+        config.control_socket = control_path;
+        let mut watcher = CodexWatcher::new(config);
+        watcher.depths.insert("root".into(), 0);
+        watcher.last_surface = Some("closed-child-surface".into());
+
+        watcher
+            .observe(&json!({
+                "id": "new-child",
+                "source": {"subAgent": {"thread_spawn": {"parent_thread_id": "root"}}}
+            }))
+            .unwrap();
+
+        assert_eq!(
+            *targets.lock().unwrap(),
+            ["closed-child-surface", "surface"]
+        );
+        assert_eq!(
+            watcher.last_surface.as_deref(),
+            Some("replacement-child-surface")
+        );
+        assert!(watcher.opened.contains("new-child"));
+        assert!(!watcher.open_attempts.contains_key("new-child"));
     }
 
     #[test]

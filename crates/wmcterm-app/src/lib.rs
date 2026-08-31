@@ -13456,14 +13456,16 @@ fn agent_session_event_kind(
                 summary: Some(tool.clone()),
             }))
         }
-        AgentEvent::PermissionRequest { message } => {
-            Some(AgentSessionEventKind::ActionRequired(AgentActionRequest {
-                request_id: format!("permission:{request_suffix}"),
-                kind: AgentRequestKind::Permission,
-                message: message.clone(),
-                choices: Vec::new(),
-            }))
-        }
+        // Hook and OSC permission events are notifications that the provider's
+        // own UI is waiting. They have no reply channel, so exposing them as
+        // actionable requests would create approval buttons whose decisions
+        // can never reach the provider. Real Claude and Codex approvals enter
+        // through `agent.approval.register` instead.
+        AgentEvent::PermissionRequest { .. } => Some(AgentSessionEventKind::Telemetry(
+            AgentTelemetry::StateObserved {
+                state: wmcterm_core::AgentState::WaitingForPermission,
+            },
+        )),
         AgentEvent::NeedsInput { message } => {
             Some(AgentSessionEventKind::ActionRequired(AgentActionRequest {
                 request_id: format!("input:{request_suffix}"),
@@ -16042,12 +16044,9 @@ mod tests {
         .unwrap();
         assert!(matches!(
             permission,
-            AgentSessionEventKind::ActionRequired(AgentActionRequest {
-                request_id,
-                kind: AgentRequestKind::Permission,
-                message,
-                ..
-            }) if request_id == "permission:17" && message == "allow shell?"
+            AgentSessionEventKind::Telemetry(AgentTelemetry::StateObserved {
+                state: AgentState::WaitingForPermission
+            })
         ));
 
         let input = agent_session_event_kind(

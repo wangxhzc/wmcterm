@@ -2024,9 +2024,14 @@ Plugin Marketplace
 - watcher 从所有携带 thread ID 的 `thread/*` 通知发现新目标，而不是只依赖
   `thread/started`；同时周期性回查 `thread/loaded/list` 并同步确认每次
   `thread/resume` 成功，以恢复丢失或版本差异导致的 resume 通知。
+- watcher 可以沿最后创建的子 Agent 表面继续分割；若该缓存表面已被用户关闭且
+  `pane.split` 明确返回 `target surface not found`，则清除缓存并立即从根 Codex
+  表面重试一次。其他控制错误不得被该回退吞掉。
 - 受管 `codex-teams` 的 app-server 会为 Hook 子进程导出内部 approval-bridge 标记；
   此时通用 `PermissionRequest` Hook 仅作为重复遥测确认，不再创建无法关联完成回执的
-  `permission:*` 请求。非受管 Codex Hook 仍按原语义上报权限提醒。
+  `permission:*` 请求。非受管 Codex Hook 没有决策回传通道，只作为等待权限的状态
+  观测和普通通知处理；通知可将用户引回对应终端，但不得创建允许/拒绝审批卡。真正
+  可操作的 Codex 审批只来自 app-server 的 `agent.approval.register` 路径。
 - 已实现 Claude Code Hook、Codex app-server、OSC 9/99、wmcterm OSC 777，
   并可归一化 Claude、Codex、OpenCode、Gemini 等 Agent 生命周期事件。
   Claude 内部 subagent 仍属于其 Claude 进程；独立可见 Agent 通过受管命令在

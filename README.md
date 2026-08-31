@@ -181,6 +181,8 @@ CLI 也是稳定的 Agent 控制接口。在 wmcterm 终端内启动的命令会
 `WMCTERM_CODEX_MAX_AUTO_DEPTH` 限制。此集成要求 Codex CLI 提供
 `app-server --listen` 和 `--remote` 选项。如果可选的 app-server 集成无法启动，
 托管 Codex 会报告原因并回退到普通 Codex TUI，而不会导致 Codex 不可用。
+如果长时间运行期间最后创建的子 Agent 窗格已被关闭，后续线程会自动回退到仍存活的
+根 Codex 表面继续分割，不会因缓存的表面 ID 失效而放弃创建窗格。
 监视器会恢复启动时已加载的线程，以及之后公告且排除了 turns 的线程。这样，初始线程或
 通过 `/resume` 选择的根线程所发出的 app-server 审批，可以进入集中式 UI，而无需将
 transcript 加载到监视器。它识别所有携带线程 ID 的 `thread/*` 公告，并定期校对已加载
@@ -202,7 +204,9 @@ Workspace cwd 显式传给私有 app-server 的远程 TUI。Codex 0.149.1 会话
 `Filter: All`；这个 provider 缺陷无法由外部启动参数修复。调用者显式传入
 `-C`/`--cd` 时以该目录为准。
 对于这些托管 app-server 会话，通用 Codex `PermissionRequest` Hook 被视为重复遥测，
-不会创建第二个可操作请求；非托管 Codex 的 Hook 通知保持正常行为。
+不会创建第二个可操作请求。手动启动的非托管 Codex 没有审批回复通道，因此其
+`PermissionRequest` Hook 只更新等待状态并发送普通通知；用户仍需回到 Codex TUI
+完成原生审批，通知中心不会显示无法生效的允许/拒绝按钮。
 如果根 Codex TUI 先回答同一个 app-server 请求，wmcterm 会消费 Codex 的
 `serverRequest/resolved` 确认或精确匹配的 item lifecycle 事件，并且只关闭对应的
 通知卡片；终端按键和无关 item 活动绝不会清除审批。
