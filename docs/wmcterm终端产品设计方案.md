@@ -1952,6 +1952,9 @@ Plugin Marketplace
 
 无边框 winit 窗口已经包含工作区侧栏、Surface 标签、Pane 分隔条、导航栏、
 命令面板、终端查找、通知中心、Agent 授权卡片和双语（英文/简体中文）界面。
+工作区侧栏允许按住整行拖动排序：超过小幅移动阈值后显示跟随指针的预览和明确的
+插入位置，释放时复用核心 `WorkspaceCommand::Move` 提交顺序。筛选工作区期间禁用
+拖动排序，避免可见过滤顺序与持久顺序不一致。
 工作区筛选、命令面板查询、终端/文档查找和通用提示框共用单行 UTF-8 编辑模型；
 当内容宽于输入区域时，界面按终端显示单元格建立光标跟随的水平视口。文本、选区、
 鼠标命中、拖选、光标覆盖层和 IME 候选位置使用同一视口偏移，完整输入仍保留在模型
@@ -1962,7 +1965,8 @@ Plugin Marketplace
 ## 33.3 CLI、IPC 与 Agent 控制面
 
 - 本地控制面使用 JSON-RPC，协议能力由 `wmcterm capabilities` 自描述；当前
-  协议版本为 3。
+  协议版本为 4；无排序语义的 `workspace.pin` 已移除，顺序调整统一使用
+  `workspace.move`。
 - CLI/RPC 覆盖 workspace、pane、surface、screen、terminal、notification、
   Agent request/approval、配置、Hook、Skill 和远程命令入口。
 - wmcterm 创建的终端导出 `WMCTERM_WORKSPACE_ID`、`WMCTERM_PANE_ID`、
@@ -2008,6 +2012,11 @@ Plugin Marketplace
   watcher 在收到 Codex 的 `serverRequest/resolved` 明确回执，或 thread/turn/item ID
   精确匹配的 item started/completed 生命周期事件后取消对应待处理卡片；不会根据
   键盘输入或无关 item 活动推断审批结果。
+- Codex 0.150.0 的 `item/commandExecution/requestApproval` 使用
+  `kind: "writeStdin"` 表示向已有命令发送输入。审批桥将其作为独立类型，
+  优先使用 `approvalId` 精确路由，仅提供拒绝与单次允许；即使收到持久
+  允许回复也必须 fail closed。通知摘要始终标明这是已有命令的输入审批；
+  stdin 或 process ID 只在 provider 实际传入时展示，不将它们视为 wire schema 必填字段。
 - watcher 初始化时恢复已加载 thread，并在收到携带 thread ID 的 `thread/*` 通知后立即通过
   `thread/resume { excludeTurns: true }` 恢复新建或由 `/resume` 选中的 thread；
   WebSocket 重连后重新建立这些订阅。`thread/read` 只能观察通知，不能让 watcher
@@ -2022,6 +2031,9 @@ Plugin Marketplace
   并可归一化 Claude、Codex、OpenCode、Gemini 等 Agent 生命周期事件。
   Claude 内部 subagent 仍属于其 Claude 进程；独立可见 Agent 通过受管命令在
   新 Pane/Surface 启动。实验性 `codex-teams` 可将 Codex 子线程映射为原生 Pane。
+- Codex 0.150.0 `Interrupt` Hook 归一化为当前 turn 完成且不继续，使
+  Workspace 从运行中恢复 Idle；该事件不是 SessionEnd，不得结束仍存活的
+  Codex surface 或 PTY lifecycle。
 
 ## 33.4 配置、恢复与发布
 
@@ -2031,6 +2043,11 @@ Plugin Marketplace
 - `config import-ghostty` 读取 Ghostty 配置并输出合并预览，不覆盖原配置。
 - 会话恢复持久化 Workspace/Pane/Surface 布局、可见 scrollback、命令和支持的
   Agent resume ID；不会序列化 PTY 进程内存，恢复时重新启动对应命令。
+- 系统代理由 `wmcterm-app` 的后台缓存统一提供给 PTY 创建入口，因此新建和恢复的
+  Shell、Codex、Claude 使用同一规则。Linux 读取 GNOME/KDE 静态手动代理，Windows
+  读取当前用户 WinINet；PAC/WPAD 安全跳过。缓存低频刷新，创建前执行有界刷新，
+  UI 超时后使用最近有效快照，检测失败不清空缓存。父进程及 RPC 显式代理变量按协议
+  优先，桌面代理只补缺；现有进程的环境和生命周期不受缓存变化影响。
 - `codex-teams` 子分区的私有 loopback app-server endpoint 是单次运行时状态，
   不得在程序重启后重放。当持久化命令的 thread ID 与 Codex Agent
   resume ID 一致时，恢复逻辑将其降级为独立 `codex resume` 会话；根

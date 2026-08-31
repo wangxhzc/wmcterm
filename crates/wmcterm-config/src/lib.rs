@@ -553,7 +553,6 @@ fn canonical_action(action: &str) -> Option<&'static str> {
         "workspace.rename" => "workspace.rename",
         "workspace.change_directory" => "workspace.change_directory",
         "workspace.describe" => "workspace.describe",
-        "workspace.pin" => "workspace.pin",
         "surface.new" => "surface.new",
         "surface.close" => "surface.close",
         "agent.claude" => "agent.claude",

@@ -21,6 +21,13 @@
 在 Windows 上，默认 shell 是系统自带的 Windows PowerShell 5.1 可执行文件
 `powershell.exe`。通过 `SHELL` 显式选择时仍支持 PowerShell 7（`pwsh.exe`），
 但不会假定 Windows 10 已安装它。
+
+wmcterm 会为新建或恢复的 Shell、Codex 和 Claude 读取当前桌面代理：Linux 支持
+GNOME 与 KDE 的静态手动代理，Windows 读取当前用户的 WinINet 设置。代理缓存每
+5 秒在后台刷新，创建进程前也会请求刷新；已经运行的进程不会被重启或修改环境。
+现有 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`、`NO_PROXY`（不区分大小写）以及
+RPC 显式环境变量始终优先，桌面设置只补缺且 `NO_PROXY` 不合并。PAC/WPAD 无法
+无损转换为静态环境变量，因此不会自动注入。
 托管 Claude 启动同时支持原生 `claude.exe` 和 npm 安装生成的 `claude.cmd`/`claude.bat`
 shim；npm 布局会直接解析包内原生程序或 Node 入口，不经过命令 shell。
 
@@ -86,6 +93,8 @@ cargo run
 
 侧边栏中的 `+ New Workspace` 条目可以点击。相同命令也可从命令面板使用。
 允许关闭最后一个工作区；空应用视图会保留一个可点击的新建工作区入口。
+工作区条目支持按住整行拖动排序；移动超过少量阈值后才进入拖动状态，拖动时会显示
+跟随指针的条目预览和插入位置线。搜索工作区时暂不启用排序，以免过滤结果改变持久顺序。
 
 ## CLI 和 IPC
 
@@ -100,7 +109,6 @@ cargo run -- workspace rename WORKSPACE_ID "Agent review"
 cargo run -- workspace describe WORKSPACE_ID "Reviewing parser changes"
 cargo run -- workspace cwd WORKSPACE_ID /path/to/project
 cargo run -- workspace move WORKSPACE_ID -1
-cargo run -- workspace pin WORKSPACE_ID [--off]
 cargo run -- pane split --right
 cargo run -- pane split --down --command "codex"
 cargo run -- pane list
@@ -153,6 +161,8 @@ Hook 接收器会继承由 wmcterm 启动的终端所含的 wmcterm 上下文变
 项目或用户作用域安全合并 Codex、Claude Code 和 Gemini 的 JSON Hook 定义，重复安装
 会自动去重。对于插件格式无法安全合并的其他受支持 Agent，仍会提供安装计划。Codex
 新安装或发生变化的命令 Hook 必须先通过 `/hooks` 审核才能运行。
+Codex 0.150.0 的 `Interrupt` Hook 会在用户中断当前 turn 时立即清除运行中
+状态，但不会把仍在等待下一次输入的 Codex 进程标记为已退出。
 
 CLI 也是稳定的 Agent 控制接口。在 wmcterm 终端内启动的命令会继承 `WMCTERM=1`、
 `WMCTERM_WORKSPACE_ID`、`WMCTERM_PANE_ID`、`WMCTERM_SURFACE_ID`、
@@ -161,8 +171,9 @@ CLI 也是稳定的 Agent 控制接口。在 wmcterm 终端内启动的命令会
 为兼容旧版本，还会导出 `WMCTERM_SOCKET` 别名。因此，屏幕读取、发送、控制键、搜索、
 滚动、通知和表面操作默认都以调用 Agent 自己的终端为目标。要显式编排另一终端，请使用
 `--surface ID`。`wmcterm capabilities` 返回机器可读的协议版本、RPC method 列表、
-上下文变量、屏幕控制功能及受支持的控制键。协议版本 3 新增了 `send.line`、屏幕
-revision 和非侵入式回滚历史读取。
+上下文变量、屏幕控制功能及受支持的控制键。协议版本 4 移除了无排序效果的
+`workspace.pin`；工作区顺序统一由 `workspace.move` 控制。版本 3 新增了
+`send.line`、屏幕 revision 和非侵入式回滚历史读取。
 
 `wmcterm codex-teams [CODEX_ARG...]` 会启动实验性的私有 Codex app-server，并连接
 根 Codex TUI。子 Agent 的线程创建事件会生成原生 wmcterm 窗格且不抢夺焦点：第一个
@@ -195,6 +206,10 @@ Workspace cwd 显式传给私有 app-server 的远程 TUI。Codex 0.149.1 会话
 如果根 Codex TUI 先回答同一个 app-server 请求，wmcterm 会消费 Codex 的
 `serverRequest/resolved` 确认或精确匹配的 item lifecycle 事件，并且只关闭对应的
 通知卡片；终端按键和无关 item 活动绝不会清除审批。
+Codex 0.150.0 把向已运行命令发送输入表示为同一 app-server method 下的
+`kind: "writeStdin"` 审批。wmcterm 会单独展示输入和进程标识，并且只允许
+拒绝或本次允许。当 provider 提供 stdin 或进程标识时，技术详情会保留并
+展示它们；该请求不会生成持久或会话级授权。
 显式指定的审批或沙箱选项仍然优先。托管启动器拒绝 Codex/Claude 的 bypass 参数、
 `danger-full-access` 沙箱和 CLI `--mode full-access`。命令面板另有明确标为“完全访问…”
 的人工入口；选择后还必须输入 `FULL ACCESS`，且只影响新启动的 Agent 会话，不写入

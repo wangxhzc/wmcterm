@@ -21,6 +21,9 @@ cat >"$HOME/.codex/hooks.json" <<'JSON'
     "Stop": [
       {"hooks": [{"type": "command", "command": "/old/wmcterm hook receive --agent codex"}]},
       {"hooks": [{"type": "command", "command": "keep-codex-hook"}]}
+    ],
+    "Interrupt": [
+      {"hooks": [{"type": "command", "command": "keep-codex-interrupt"}]}
     ]
   }
 }
@@ -86,7 +89,9 @@ claude_text = json.dumps(claude_settings)
 assert "/old/wmcterm" not in codex_text
 assert "/old/wmcterm" not in claude_text
 assert "keep-codex-hook" in codex_text
+assert "keep-codex-interrupt" in codex_text
 assert "keep-claude-hook" in claude_text
+assert codex_hooks["hooks"]["Interrupt"]
 
 skill_paths = (
     home / ".agents/skills/wmcterm/SKILL.md",

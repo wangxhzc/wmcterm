@@ -47,6 +47,11 @@ from the currently focused UI item: the user may be viewing another workspace.
   Codex when the workspace contains `.codex`. This decision is intentionally not
   available through Agent, CLI, or RPC control; never edit Codex trust settings to
   imitate it.
+- Treat Codex approval requests with `kind: "writeStdin"` as input to an
+  existing command, not as a new command launch. They may be denied or approved
+  once, but must never be converted into a persistent or session-wide grant.
+- A Codex `Interrupt` hook ends the active turn without ending the live Codex
+  session. Do not close its pane, surface, or PTY in response to that event.
 
 ## Launch Claude safely
 

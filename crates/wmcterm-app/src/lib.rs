@@ -1,4 +1,5 @@
 mod i18n;
+mod system_proxy;
 mod text_edit;
 mod ui;
 
@@ -67,6 +68,106 @@ const TERMINAL_PROGRAM: &str = "wmcterm";
 const FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
 const MAX_FRAME_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 const CURSOR_BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
+const SYSTEM_PROXY_REFRESH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+const SYSTEM_PROXY_SPAWN_REFRESH_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_millis(500);
+const SYSTEM_PROXY_SPAWN_COALESCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
+struct SystemProxyRefresh {
+    completed: SyncSender<()>,
+}
+
+struct SystemProxyCache {
+    current: Arc<Mutex<system_proxy::SystemProxy>>,
+    last_attempt: Arc<Mutex<std::time::Instant>>,
+    refresh: SyncSender<SystemProxyRefresh>,
+}
+
+impl SystemProxyCache {
+    fn new() -> Self {
+        // Initial discovery happens before the window/event loop starts. Subsequent
+        // potentially blocking desktop queries are confined to this worker.
+        let initial = system_proxy::detect().unwrap_or_default();
+        Self::with_detector(initial, system_proxy::detect)
+    }
+
+    fn with_detector(
+        initial: system_proxy::SystemProxy,
+        mut detect: impl FnMut() -> Result<system_proxy::SystemProxy, ()> + Send + 'static,
+    ) -> Self {
+        let current = Arc::new(Mutex::new(initial));
+        let last_attempt = Arc::new(Mutex::new(std::time::Instant::now()));
+        let (refresh, refresh_rx) = mpsc::sync_channel::<SystemProxyRefresh>(1);
+        let worker_current = Arc::clone(&current);
+        let worker_last_attempt = Arc::clone(&last_attempt);
+        thread::Builder::new()
+            .name("wmcterm-system-proxy".into())
+            .spawn(move || {
+                loop {
+                    match refresh_rx.recv_timeout(SYSTEM_PROXY_REFRESH_INTERVAL) {
+                        Ok(refresh) => {
+                            if let Ok(detected) = detect() {
+                                *worker_current
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner()) = detected;
+                            }
+                            *worker_last_attempt
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner()) =
+                                std::time::Instant::now();
+                            let _ = refresh.completed.try_send(());
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if let Ok(detected) = detect() {
+                                *worker_current
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner()) = detected;
+                            }
+                            *worker_last_attempt
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner()) =
+                                std::time::Instant::now();
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+            })
+            .expect("failed to spawn system proxy refresh worker");
+        Self {
+            current,
+            last_attempt,
+            refresh,
+        }
+    }
+
+    fn environment_for_child(
+        &self,
+        explicit: &[(String, String)],
+    ) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+        let explicit = explicit.iter().cloned().collect::<HashMap<_, _>>();
+        let snapshot_is_fresh = self
+            .last_attempt
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .elapsed()
+            < SYSTEM_PROXY_SPAWN_COALESCE_INTERVAL;
+        if !snapshot_is_fresh {
+            let (completed, completed_rx) = mpsc::sync_channel(1);
+            if self
+                .refresh
+                .try_send(SystemProxyRefresh { completed })
+                .is_ok()
+            {
+                let _ = completed_rx.recv_timeout(SYSTEM_PROXY_SPAWN_REFRESH_TIMEOUT);
+            }
+        }
+        let current = self
+            .current
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        system_proxy::environment_for_child(&current, &explicit)
+    }
+}
 
 fn terminal_text_cell_width(text: &str) -> usize {
     UnicodeWidthStr::width(text).max(1)
@@ -205,6 +306,12 @@ struct TerminalRuntime {
     lifecycle_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TerminalOpenTarget {
+    Url(String),
+    Path(PathBuf),
+}
+
 #[derive(Debug, Clone, Default)]
 struct TerminalCreateOptions {
     command: Option<String>,
@@ -246,6 +353,17 @@ struct ScrollbarDrag {
 #[derive(Clone, Copy)]
 struct AgentRequestDetailScrollbarDrag {
     grab_y: f32,
+}
+
+#[derive(Clone, Copy)]
+struct WorkspaceDrag {
+    workspace: WorkspaceId,
+    source_index: usize,
+    source_row: usize,
+    target_index: usize,
+    press_y: f32,
+    grab_y: f32,
+    active: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -360,6 +478,11 @@ struct WorkspaceContextMenu {
 }
 
 #[derive(Clone, Copy)]
+struct SidebarContextMenu {
+    anchor: (f32, f32),
+}
+
+#[derive(Clone, Copy)]
 struct TerminalContextMenu {
     pane: PaneId,
     terminal: TerminalId,
@@ -432,10 +555,11 @@ enum TabContextAction {
 #[derive(Clone, Copy)]
 enum WorkspaceContextAction {
     NewSurface,
+    OpenFileManager,
+    OpenTerminal,
     Rename,
     Describe,
     ChangeDirectory,
-    TogglePin,
     Close,
 }
 
@@ -468,6 +592,7 @@ const TAB_CONTEXT_ACTIONS: [TabContextAction; 3] = [
 ];
 const TAB_CONTEXT_WIDTH: f32 = 240.0;
 const WORKSPACE_CONTEXT_WIDTH: f32 = 250.0;
+const SIDEBAR_CONTEXT_WIDTH: f32 = 210.0;
 const TERMINAL_CONTEXT_WIDTH: f32 = 220.0;
 const TERMINAL_CONTEXT_ACTIONS: [TerminalContextAction; 4] = [
     TerminalContextAction::Copy,
@@ -482,12 +607,13 @@ const NOTIFICATION_CONTEXT_ACTIONS: [NotificationContextAction; 3] = [
 ];
 const NOTIFICATION_CONTEXT_WIDTH: f32 = 210.0;
 
-const WORKSPACE_CONTEXT_ACTIONS: [WorkspaceContextAction; 6] = [
+const WORKSPACE_CONTEXT_ACTIONS: [WorkspaceContextAction; 7] = [
     WorkspaceContextAction::NewSurface,
+    WorkspaceContextAction::OpenFileManager,
+    WorkspaceContextAction::OpenTerminal,
     WorkspaceContextAction::Rename,
     WorkspaceContextAction::Describe,
     WorkspaceContextAction::ChangeDirectory,
-    WorkspaceContextAction::TogglePin,
     WorkspaceContextAction::Close,
 ];
 
@@ -690,6 +816,7 @@ struct WmctermApplication {
     _ipc: Option<UnixServer>,
     control_socket_path: Option<std::path::PathBuf>,
     config: Config,
+    system_proxy: SystemProxyCache,
     cursor_position: (f32, f32),
     commands: HashMap<TerminalId, String>,
     clipboard: Option<arboard::Clipboard>,
@@ -700,6 +827,7 @@ struct WmctermApplication {
     selection_autoscroll_last: Option<std::time::Instant>,
     split_drag: Option<SplitDrag>,
     sidebar_drag: bool,
+    workspace_drag: Option<WorkspaceDrag>,
     scrollbar_drag: Option<ScrollbarDrag>,
     mouse_pressed: bool,
     text_edit_drag: Option<TextEditTarget>,
@@ -713,6 +841,7 @@ struct WmctermApplication {
     codex_trust_confirmation: Option<CodexTrustConfirmation>,
     tab_context_menu: Option<TabContextMenu>,
     workspace_context_menu: Option<WorkspaceContextMenu>,
+    sidebar_context_menu: Option<SidebarContextMenu>,
     terminal_context_menu: Option<TerminalContextMenu>,
     notification_context_menu: Option<NotificationContextMenu>,
     restored_history: HashMap<TerminalId, String>,
@@ -865,6 +994,7 @@ impl WmctermApplication {
             _ipc: ipc,
             control_socket_path,
             config,
+            system_proxy: SystemProxyCache::new(),
             cursor_position: (0.0, 0.0),
             commands,
             clipboard: arboard::Clipboard::new().ok(),
@@ -875,6 +1005,7 @@ impl WmctermApplication {
             selection_autoscroll_last: None,
             split_drag: None,
             sidebar_drag: false,
+            workspace_drag: None,
             scrollbar_drag: None,
             mouse_pressed: false,
             text_edit_drag: None,
@@ -888,6 +1019,7 @@ impl WmctermApplication {
             codex_trust_confirmation: None,
             tab_context_menu: None,
             workspace_context_menu: None,
+            sidebar_context_menu: None,
             terminal_context_menu: None,
             notification_context_menu: None,
             restored_history,
@@ -1031,6 +1163,12 @@ impl WmctermApplication {
             spec = spec
                 .env("WMCTERM_CONTROL_SOCKET", path.as_os_str())
                 .env("WMCTERM_SOCKET", path.as_os_str());
+        }
+        for (key, value) in self
+            .system_proxy
+            .environment_for_child(&options.environment)
+        {
+            spec = spec.env(key, value);
         }
         for (key, value) in &options.environment {
             spec = spec.env(key, value);
@@ -2065,11 +2203,13 @@ impl WmctermApplication {
         }
         if self.tab_context_menu.is_some()
             || self.workspace_context_menu.is_some()
+            || self.sidebar_context_menu.is_some()
             || self.terminal_context_menu.is_some()
             || self.notification_context_menu.is_some()
         {
             self.tab_context_menu = None;
             self.workspace_context_menu = None;
+            self.sidebar_context_menu = None;
             self.terminal_context_menu = None;
             self.notification_context_menu = None;
             self.rebuild_scene();
@@ -2951,17 +3091,6 @@ impl WmctermApplication {
             "workspace.describe" => self.open_workspace_prompt(PromptKind::DescribeWorkspace),
             "workspace.change_directory" => {
                 self.open_workspace_prompt(PromptKind::ChangeWorkspaceDirectory)
-            }
-            "workspace.pin" => {
-                if let Some(workspace) = self.state.active_workspace() {
-                    let _ = self
-                        .state
-                        .execute(AppCommand::Workspace(WorkspaceCommand::Pin {
-                            id: workspace.id,
-                            pinned: !workspace.pinned,
-                        }));
-                    self.rebuild_scene();
-                }
             }
             "pane.split_right" => self.split_active(SplitAxis::Vertical),
             "pane.split_down" => self.split_active(SplitAxis::Horizontal),
@@ -5438,6 +5567,7 @@ impl WmctermApplication {
             anchor: self.cursor_position,
         });
         self.workspace_context_menu = None;
+        self.sidebar_context_menu = None;
         self.terminal_context_menu = None;
         self.notification_context_menu = None;
         self.rebuild_scene();
@@ -5466,10 +5596,34 @@ impl WmctermApplication {
             workspace: workspace.id,
             anchor: self.cursor_position,
         });
+        self.sidebar_context_menu = None;
         self.tab_context_menu = None;
         self.terminal_context_menu = None;
         self.notification_context_menu = None;
         self.resize_terminals();
+        self.rebuild_scene();
+        true
+    }
+
+    fn open_sidebar_context_menu(&mut self) -> bool {
+        let (x, y) = self.cursor_position;
+        if !self.sidebar_visible || x >= self.sidebar_width() || y < 40.0 {
+            return false;
+        }
+        let layout = self.sidebar_layout();
+        if self.workspace_search_bounds().contains(x, y)
+            || layout.new_workspace.contains(x, y)
+            || layout.rows.iter().any(|row| row.bounds.contains(x, y))
+        {
+            return false;
+        }
+        self.sidebar_context_menu = Some(SidebarContextMenu {
+            anchor: self.cursor_position,
+        });
+        self.tab_context_menu = None;
+        self.workspace_context_menu = None;
+        self.terminal_context_menu = None;
+        self.notification_context_menu = None;
         self.rebuild_scene();
         true
     }
@@ -5488,6 +5642,7 @@ impl WmctermApplication {
         });
         self.tab_context_menu = None;
         self.workspace_context_menu = None;
+        self.sidebar_context_menu = None;
         self.notification_context_menu = None;
         self.mark_terminal_notifications_read(terminal);
         self.rebuild_scene();
@@ -5524,6 +5679,7 @@ impl WmctermApplication {
         });
         self.tab_context_menu = None;
         self.workspace_context_menu = None;
+        self.sidebar_context_menu = None;
         self.terminal_context_menu = None;
         self.rebuild_scene();
         true
@@ -5677,6 +5833,20 @@ impl WmctermApplication {
             WorkspaceContextAction::NewSurface => {
                 self.new_surface_command(None);
             }
+            WorkspaceContextAction::OpenFileManager => {
+                let cwd = self.state.workspaces[index].cwd.clone();
+                if let Err(error) = open_directory_in_file_manager(&cwd) {
+                    tracing::error!(%error, path=%cwd.display(), "opening workspace in file manager failed");
+                }
+                self.rebuild_scene();
+            }
+            WorkspaceContextAction::OpenTerminal => {
+                let cwd = self.state.workspaces[index].cwd.clone();
+                if let Err(error) = open_directory_in_terminal(&cwd) {
+                    tracing::error!(%error, path=%cwd.display(), "opening workspace in terminal failed");
+                }
+                self.rebuild_scene();
+            }
             WorkspaceContextAction::Rename => {
                 self.open_workspace_prompt(PromptKind::RenameWorkspace);
             }
@@ -5685,16 +5855,6 @@ impl WmctermApplication {
             }
             WorkspaceContextAction::ChangeDirectory => {
                 self.open_workspace_prompt(PromptKind::ChangeWorkspaceDirectory);
-            }
-            WorkspaceContextAction::TogglePin => {
-                let pinned = self.state.workspaces[index].pinned;
-                let _ = self
-                    .state
-                    .execute(AppCommand::Workspace(WorkspaceCommand::Pin {
-                        id: menu.workspace,
-                        pinned: !pinned,
-                    }));
-                self.rebuild_scene();
             }
             WorkspaceContextAction::Close => self.request_close_workspace(),
         }
@@ -5728,6 +5888,9 @@ impl WmctermApplication {
             return;
         }
         if self.begin_scrollbar_action() {
+            return;
+        }
+        if self.begin_workspace_drag() {
             return;
         }
         if let Some(workspace) = self.state.active_workspace() {
@@ -5777,6 +5940,13 @@ impl WmctermApplication {
             && self.mark_terminal_notifications_read(terminal)
         {
             self.rebuild_scene();
+        }
+        if self.modifiers.control_key()
+            && let Some(target) = self.terminal_open_target_at_cursor()
+        {
+            self.mouse_pressed = false;
+            open_terminal_target(target);
+            return;
         }
         if !self.modifiers.shift_key()
             && self.send_terminal_mouse(MouseActionInput::Press, Some(MouseButtonInput::Left))
@@ -5840,6 +6010,33 @@ impl WmctermApplication {
         let row = snapshot.cells.get(viewport_row)?;
         let (start, end) = word_cell_bounds(row, cell.0)?;
         Some(((start, cell.1), (end, cell.1)))
+    }
+
+    /// Resolve only the row under the pointer. Ordinary rendering and pointer
+    /// movement never scan the viewport or scrollback for plain-text links.
+    fn terminal_open_target_at_cursor(&self) -> Option<TerminalOpenTarget> {
+        const MAX_LINK_ROW_CELLS: usize = 4_096;
+
+        let (_, terminal, (column, screen_row)) = self.cell_at_cursor()?;
+        let runtime = self.terminals.get(&terminal)?;
+        let viewport_row = screen_row.checked_sub(runtime.snapshot.screen_row_origin)?;
+        let row = runtime.snapshot.cells.get(viewport_row)?;
+        if row.len() > MAX_LINK_ROW_CELLS {
+            return None;
+        }
+        if let Some(uri) = row.get(column)?.hyperlink.as_deref() {
+            return terminal_target_from_osc8(uri, &self.cwd_for_terminal(terminal)?);
+        }
+
+        let mut text = String::new();
+        let mut clicked_byte = None;
+        for (index, cell) in row.iter().enumerate() {
+            if index == column {
+                clicked_byte = Some(text.len());
+            }
+            text.push_str(&cell.text);
+        }
+        terminal_target_in_line(&text, clicked_byte?, &self.cwd_for_terminal(terminal)?)
     }
 
     fn scrollbar_at_cursor(&self) -> Option<(PaneId, TerminalId, ui::ScrollbarLayout)> {
@@ -6102,6 +6299,25 @@ impl WmctermApplication {
             }
             return true;
         }
+        if let Some(menu) = self.sidebar_context_menu {
+            let bounds = ui::popup_menu(
+                menu.anchor.0,
+                menu.anchor.1,
+                self.window_size.width as f32,
+                self.window_size.height as f32,
+                SIDEBAR_CONTEXT_WIDTH,
+                30.0,
+                1,
+            );
+            if ui::menu_row_at(bounds, x, y, 30.0, 1).is_some() {
+                self.sidebar_context_menu = None;
+                self.new_workspace();
+            } else {
+                self.sidebar_context_menu = None;
+                self.rebuild_scene();
+            }
+            return true;
+        }
         if self.prompt.is_some() {
             let input = self.prompt_input_bounds();
             if input.contains(x, y)
@@ -6347,6 +6563,19 @@ impl WmctermApplication {
             )
             .then_some(NavigationHover::ContextAction(index));
         }
+        if let Some(menu) = self.sidebar_context_menu {
+            let panel = ui::popup_menu(
+                menu.anchor.0,
+                menu.anchor.1,
+                self.window_size.width as f32,
+                self.window_size.height as f32,
+                SIDEBAR_CONTEXT_WIDTH,
+                30.0,
+                1,
+            );
+            ui::menu_row_at(panel, x, y, 30.0, 1)?;
+            return Some(NavigationHover::ContextAction(0));
+        }
         if self.prompt.is_some() || self.palette_visible {
             return None;
         }
@@ -6552,6 +6781,10 @@ impl WmctermApplication {
                     SplitAxis::Vertical => CursorIcon::ColResize,
                     SplitAxis::Horizontal => CursorIcon::RowResize,
                 }
+            } else if self.modifiers.control_key()
+                && self.terminal_open_target_at_cursor().is_some()
+            {
+                CursorIcon::Pointer
             } else if self.terminal_at_cursor().is_some() {
                 CursorIcon::Text
             } else {
@@ -6673,6 +6906,7 @@ impl WmctermApplication {
         }
         if self.tab_context_menu.is_some()
             || self.workspace_context_menu.is_some()
+            || self.sidebar_context_menu.is_some()
             || self.terminal_context_menu.is_some()
             || self.notification_context_menu.is_some()
         {
@@ -6757,6 +6991,9 @@ impl WmctermApplication {
         if self.update_scrollbar_drag() {
             return;
         }
+        if self.update_workspace_drag() {
+            return;
+        }
         if self.terminal_mouse_capture.is_some() {
             self.send_captured_terminal_mouse(
                 MouseActionInput::Motion,
@@ -6799,6 +7036,66 @@ impl WmctermApplication {
         }
     }
 
+    fn begin_workspace_drag(&mut self) -> bool {
+        if !self.sidebar_visible || !self.workspace_search.text().trim().is_empty() {
+            return false;
+        }
+        let (x, y) = self.cursor_position;
+        if x >= self.sidebar_width() {
+            return false;
+        }
+        let layout = self.sidebar_layout();
+        let Some((source_row, row)) = layout
+            .rows
+            .iter()
+            .enumerate()
+            .find(|(_, row)| row.bounds.contains(x, y))
+        else {
+            return false;
+        };
+        let source_index = row.index;
+        let Some(workspace) = self.state.workspaces.get(source_index) else {
+            return false;
+        };
+        self.state.active_workspace = source_index;
+        self.workspace_drag = Some(WorkspaceDrag {
+            workspace: workspace.id,
+            source_index,
+            source_row,
+            target_index: source_index,
+            press_y: y,
+            grab_y: y - row.bounds.y,
+            active: false,
+        });
+        self.resize_terminals();
+        self.rebuild_scene();
+        true
+    }
+
+    fn update_workspace_drag(&mut self) -> bool {
+        const START_THRESHOLD: f32 = 5.0;
+
+        let Some(mut drag) = self.workspace_drag else {
+            return false;
+        };
+        if !drag.active && (self.cursor_position.1 - drag.press_y).abs() < START_THRESHOLD {
+            return true;
+        }
+        drag.active = true;
+        let layout = self.sidebar_layout();
+        if !layout.rows.is_empty() {
+            let target_row = ui::workspace_drag_target(
+                &layout.rows,
+                drag.source_row.min(layout.rows.len() - 1),
+                self.cursor_position.1,
+            );
+            drag.target_index = layout.rows[target_row].index;
+        }
+        self.workspace_drag = Some(drag);
+        self.rebuild_scene();
+        true
+    }
+
     fn update_selection_autoscroll(&mut self) -> bool {
         const INTERVAL: std::time::Duration = std::time::Duration::from_millis(32);
 
@@ -6811,6 +7108,7 @@ impl WmctermApplication {
             || self.scrollbar_drag.is_some()
             || self.split_drag.is_some()
             || self.sidebar_drag
+            || self.workspace_drag.is_some()
         {
             self.selection_autoscroll_last = None;
             return false;
@@ -6976,6 +7274,19 @@ impl WmctermApplication {
             return;
         }
         if self.scrollbar_drag.take().is_some() {
+            return;
+        }
+        if let Some(drag) = self.workspace_drag.take() {
+            if drag.active && drag.target_index != drag.source_index {
+                let _ = self
+                    .state
+                    .execute(AppCommand::Workspace(WorkspaceCommand::Move {
+                        id: drag.workspace,
+                        offset: drag.target_index as isize - drag.source_index as isize,
+                    }));
+                self.resize_terminals();
+            }
+            self.rebuild_scene();
             return;
         }
         if self.terminal_mouse_capture.is_some() {
@@ -7562,14 +7873,8 @@ impl WmctermApplication {
                     } else {
                         16.0
                     };
-                let pinned = if item.pinned {
-                    format!(" {}", self.language.pinned())
-                } else {
-                    String::new()
-                };
                 let text_width = (row.bounds.x + row.bounds.width - 12.0 - text_left).max(1.0);
                 let text_columns = (text_width / (14.0 * 0.6)).max(1.0) as usize;
-                let name_columns = text_columns.saturating_sub(ui::display_width(&pinned));
                 let agent_priority = self.workspace_agent_priority(row.index);
                 let subagent_count = self.workspace_claude_subagent_count(row.index);
                 let agent_state = if subagent_count == 0 {
@@ -7629,11 +7934,7 @@ impl WmctermApplication {
                     });
                 }
                 blocks.push(TextBlock {
-                    text: format!(
-                        "{}{}",
-                        ui::truncate_display_width(&item.name, name_columns),
-                        pinned
-                    ),
+                    text: ui::truncate_display_width(&item.name, text_columns),
                     spans: vec![],
                     left: text_left,
                     top: row.bounds.y + 3.0,
@@ -9604,6 +9905,57 @@ impl WmctermApplication {
                 });
             }
         }
+        if let Some(drag) = self.workspace_drag.filter(|drag| drag.active) {
+            let layout = self.sidebar_layout();
+            if let Some(source) = layout
+                .rows
+                .iter()
+                .find(|row| row.index == drag.source_index)
+            {
+                let ghost_y = (self.cursor_position.1 - drag.grab_y).clamp(
+                    88.0,
+                    self.window_size.height as f32 - source.bounds.height - 32.0,
+                );
+                overlay_rectangles.push(RectBlock {
+                    left: source.bounds.x + 6.0,
+                    top: ghost_y + 1.0,
+                    width: (source.bounds.width - 12.0).max(1.0),
+                    height: source.bounds.height - 2.0,
+                    color: theme_selection,
+                });
+                if let Some(workspace) = self.state.workspaces.get(drag.source_index) {
+                    overlay_blocks.push(TextBlock {
+                        text: ui::truncate_display_width(&workspace.name, 28),
+                        spans: vec![],
+                        left: source.bounds.x + 16.0,
+                        top: ghost_y + 3.0,
+                        width: (source.bounds.width - 28.0).max(1.0),
+                        height: 20.0,
+                        color: theme_text,
+                        font_size: 14.0,
+                        line_height: 19.0,
+                    });
+                }
+                if let Some(target) = layout
+                    .rows
+                    .iter()
+                    .find(|row| row.index == drag.target_index)
+                {
+                    let insertion_y = if drag.target_index < drag.source_index {
+                        target.bounds.y
+                    } else {
+                        target.bounds.y + target.bounds.height
+                    };
+                    overlay_rectangles.push(RectBlock {
+                        left: target.bounds.x + 8.0,
+                        top: insertion_y - 1.5,
+                        width: (target.bounds.width - 16.0).max(1.0),
+                        height: 3.0,
+                        color: theme_blue,
+                    });
+                }
+            }
+        }
         if let Some(menu) = self.terminal_context_menu {
             let panel = ui::popup_menu(
                 menu.anchor.0,
@@ -9727,36 +10079,24 @@ impl WmctermApplication {
                 WORKSPACE_CONTEXT_ACTIONS.len(),
             );
             overlay_rectangles.extend(context_menu_frame(panel, theme_surface, theme_border));
-            let pinned = self
-                .state
-                .workspaces
-                .iter()
-                .find(|workspace| workspace.id == menu.workspace)
-                .is_some_and(|workspace| workspace.pinned);
             let labels = if self.language.is_chinese() {
                 [
                     "新建终端标签",
+                    self.language.open_in_file_manager(),
+                    self.language.open_in_terminal(),
                     "重命名工作区",
                     "编辑工作区描述",
                     "更改目录",
-                    if pinned {
-                        "取消置顶"
-                    } else {
-                        "置顶工作区"
-                    },
                     "关闭工作区",
                 ]
             } else {
                 [
                     "New Terminal Tab",
+                    self.language.open_in_file_manager(),
+                    self.language.open_in_terminal(),
                     "Rename Workspace",
                     "Edit Description",
                     "Change Directory",
-                    if pinned {
-                        "Unpin Workspace"
-                    } else {
-                        "Pin Workspace"
-                    },
                     "Close Workspace",
                 ]
             };
@@ -9802,6 +10142,45 @@ impl WmctermApplication {
                     line_height: 21.0,
                 });
             }
+        }
+        if let Some(menu) = self.sidebar_context_menu {
+            let panel = ui::popup_menu(
+                menu.anchor.0,
+                menu.anchor.1,
+                self.window_size.width as f32,
+                self.window_size.height as f32,
+                SIDEBAR_CONTEXT_WIDTH,
+                30.0,
+                1,
+            );
+            overlay_rectangles.extend(context_menu_frame(panel, theme_surface, theme_border));
+            if self.navigation_hover == Some(NavigationHover::ContextAction(0)) {
+                overlay_rectangles.push(RectBlock {
+                    left: panel.x + 3.0,
+                    top: panel.y + 2.0,
+                    width: panel.width - 6.0,
+                    height: 26.0,
+                    color: theme_hover,
+                });
+                overlay_rectangles.push(RectBlock {
+                    left: panel.x + 3.0,
+                    top: panel.y + 2.0,
+                    width: 3.0,
+                    height: 26.0,
+                    color: theme_blue,
+                });
+            }
+            overlay_blocks.push(TextBlock {
+                text: self.language.new_workspace().into(),
+                spans: vec![],
+                left: panel.x + 14.0,
+                top: panel.y + 5.0,
+                width: panel.width - 28.0,
+                height: 25.0,
+                color: theme_text,
+                font_size: 15.0,
+                line_height: 21.0,
+            });
         }
         self.update_ime_cursor_area();
         if let Some(renderer) = &mut self.renderer {
@@ -10027,7 +10406,7 @@ impl WmctermApplication {
                 "unread_notifications": self.state.notifications.iter().filter(|item| !item.read).count(),
             })),
             "app.capabilities" => Ok(json!({
-                "protocol_version": 3,
+                "protocol_version": 4,
                 "product": "wmcterm",
                 "version": env!("CARGO_PKG_VERSION"),
                 "context": {
@@ -10062,7 +10441,7 @@ impl WmctermApplication {
                 },
                 "methods": [
                     "app.status", "workspace.list", "workspace.create", "workspace.activate",
-                    "workspace.rename", "workspace.describe", "workspace.move", "workspace.pin",
+                    "workspace.rename", "workspace.describe", "workspace.move",
                     "workspace.cwd",
                     "workspace.close", "pane.list", "pane.split", "pane.focus", "pane.zoom",
                     "pane.close", "pane.close-others", "surface.list", "surface.new", "surface.activate",
@@ -10081,11 +10460,11 @@ impl WmctermApplication {
                 self.state
                     .workspaces
                     .iter()
-                    .map(|w| json!({"id": w.id, "name": w.name, "cwd": w.cwd, "status": w.status, "description": w.description, "git_branch": w.git_branch, "pull_request": w.pull_request, "listening_ports": w.listening_ports, "pinned": w.pinned}))
+                    .map(|w| json!({"id": w.id, "name": w.name, "cwd": w.cwd, "status": w.status, "description": w.description, "git_branch": w.git_branch, "pull_request": w.pull_request, "listening_ports": w.listening_ports}))
                     .collect::<Vec<_>>()
             )),
             "workspace.activate" | "workspace.rename" | "workspace.describe" | "workspace.cwd"
-            | "workspace.move" | "workspace.pin" | "workspace.close" => request
+            | "workspace.move" | "workspace.close" => request
                 .params
                 .get("id")
                 .and_then(Value::as_str)
@@ -10138,10 +10517,6 @@ impl WmctermApplication {
                                 .get("offset")
                                 .and_then(Value::as_i64)
                                 .unwrap_or(0) as isize,
-                        },
-                        "workspace.pin" => WorkspaceCommand::Pin {
-                            id: workspace,
-                            pinned: request.params.get("pinned").and_then(Value::as_bool).unwrap_or(true),
                         },
                         "workspace.close" => {
                             let closed = self.remove_workspace_by_id(workspace);
@@ -10809,7 +11184,10 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                     event_loop.exit();
                 }
             }
-            WindowEvent::ModifiersChanged(value) => self.modifiers = value.state(),
+            WindowEvent::ModifiersChanged(value) => {
+                self.modifiers = value.state();
+                self.update_cursor_icon();
+            }
             WindowEvent::Ime(Ime::Commit(text)) => self.commit_ime_text(text),
             WindowEvent::Ime(Ime::Preedit(text, _)) => self.update_ime_preedit(&text),
             WindowEvent::Ime(Ime::Disabled) => self.update_ime_preedit(""),
@@ -10844,6 +11222,7 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                         self.rebuild_scene();
                     }
                     self.sidebar_drag = false;
+                    self.workspace_drag = None;
                     self.scrollbar_drag = None;
                     self.text_edit_drag = None;
                     if self.terminal_mouse_capture.is_some() {
@@ -10895,6 +11274,7 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                 self.dismiss_notifications_outside_cursor();
                 if self.open_notification_context_menu()
                     || self.open_workspace_context_menu()
+                    || self.open_sidebar_context_menu()
                     || self.open_tab_context_menu()
                     || self.pointer_over_overlay()
                     || (!self.modifiers.shift_key() && self.open_terminal_context_menu())
@@ -11591,11 +11971,107 @@ const fn workspace_context_action_enabled(
     match action {
         WorkspaceContextAction::Close => workspace_count > 0,
         WorkspaceContextAction::NewSurface
+        | WorkspaceContextAction::OpenFileManager
+        | WorkspaceContextAction::OpenTerminal
         | WorkspaceContextAction::Rename
         | WorkspaceContextAction::Describe
-        | WorkspaceContextAction::ChangeDirectory
-        | WorkspaceContextAction::TogglePin => true,
+        | WorkspaceContextAction::ChangeDirectory => true,
     }
+}
+
+fn open_directory_in_file_manager(path: &Path) -> Result<()> {
+    anyhow::ensure!(
+        path.is_dir(),
+        "workspace directory does not exist: {}",
+        path.display()
+    );
+    #[cfg(target_os = "linux")]
+    ProcessCommand::new("xdg-open")
+        .arg(path)
+        .spawn()
+        .context("starting xdg-open")?;
+    #[cfg(target_os = "macos")]
+    ProcessCommand::new("open")
+        .arg(path)
+        .spawn()
+        .context("starting open")?;
+    #[cfg(windows)]
+    ProcessCommand::new("explorer.exe")
+        .arg(path)
+        .spawn()
+        .context("starting Explorer")?;
+    Ok(())
+}
+
+fn open_directory_in_terminal(path: &Path) -> Result<()> {
+    anyhow::ensure!(
+        path.is_dir(),
+        "workspace directory does not exist: {}",
+        path.display()
+    );
+    #[cfg(target_os = "linux")]
+    {
+        let directory_argument = format!("--working-directory={}", path.display());
+        let candidates: [(&str, &[&std::ffi::OsStr]); 6] = [
+            ("x-terminal-emulator", &[]),
+            ("gnome-terminal", &[directory_argument.as_ref()]),
+            ("konsole", &["--workdir".as_ref(), path.as_os_str()]),
+            ("xfce4-terminal", &[directory_argument.as_ref()]),
+            ("kitty", &["--directory".as_ref(), path.as_os_str()]),
+            (
+                "alacritty",
+                &["--working-directory".as_ref(), path.as_os_str()],
+            ),
+        ];
+        let mut last_error = None;
+        for (program, arguments) in candidates {
+            match ProcessCommand::new(program)
+                .args(arguments)
+                .current_dir(path)
+                .spawn()
+            {
+                Ok(_) => return Ok(()),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error
+            .map(anyhow::Error::from)
+            .unwrap_or_else(|| anyhow::anyhow!("no supported terminal emulator found")))
+        .context("starting an external terminal")
+    }
+    #[cfg(target_os = "macos")]
+    ProcessCommand::new("open")
+        .args(["-a", "Terminal"])
+        .arg(path)
+        .spawn()
+        .context("starting Terminal")?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::System::Threading::CREATE_NEW_CONSOLE;
+
+        // Launch a real console process instead of the wt.exe app-execution
+        // alias: an alias can be created successfully and then exit without a
+        // window. Windows routes this new console through the configured
+        // default terminal host (Windows Terminal on systems that select it).
+        let mut powershell = ProcessCommand::new("powershell.exe");
+        powershell
+            .args(["-NoLogo", "-NoExit"])
+            .current_dir(path)
+            .creation_flags(CREATE_NEW_CONSOLE);
+        if powershell.spawn().is_err() {
+            let mut command_prompt = ProcessCommand::new("cmd.exe");
+            command_prompt
+                .arg("/D")
+                .current_dir(path)
+                .creation_flags(CREATE_NEW_CONSOLE);
+            command_prompt
+                .spawn()
+                .context("starting the fallback Windows terminal")?;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    Ok(())
 }
 
 fn context_menu_frame(panel: ui::Bounds, background: [u8; 4], border: [u8; 4]) -> [RectBlock; 3] {
@@ -13169,6 +13645,7 @@ fn validate_agent_approval_protocol(source: &str, method: &str, kind: &str) -> R
         "codex_app_server" => matches!(
             (method, kind),
             ("item/commandExecution/requestApproval", "command_execution")
+                | ("item/commandExecution/requestApproval", "write_stdin")
                 | ("item/fileChange/requestApproval", "file_change")
                 | ("item/permissions/requestApproval", "permissions")
         ),
@@ -13199,6 +13676,11 @@ fn agent_approval_message(
             format!("{agent} 请求执行命令")
         } else {
             format!("{agent} requests to run a command")
+        }),
+        ("codex_app_server", "write_stdin") => lines.push(if chinese {
+            format!("{agent} 请求向运行中的命令发送输入")
+        } else {
+            format!("{agent} requests to send input to a running command")
         }),
         ("codex_app_server", "file_change") => lines.push(if chinese {
             format!("{agent} 请求修改文件")
@@ -13234,6 +13716,20 @@ fn agent_approval_message(
             "{}: {command}",
             if chinese { "命令" } else { "Command" }
         ));
+    }
+    if kind == "write_stdin" {
+        if let Some(stdin) = approval_text_field(params, &["stdin", "input"]) {
+            lines.push(format!(
+                "{}: {stdin}",
+                if chinese { "输入" } else { "Input" }
+            ));
+        }
+        if let Some(process_id) = approval_text_field(params, &["processId", "process_id"]) {
+            lines.push(format!(
+                "{}: {process_id}",
+                if chinese { "进程" } else { "Process" }
+            ));
+        }
     }
     if let Some(cwd) =
         approval_text_field(params, &["cwd", "working_directory", "workingDirectory"])
@@ -13595,6 +14091,151 @@ fn terminal_double_click(previous: std::time::Instant, current: std::time::Insta
     current.saturating_duration_since(previous) <= MAX_DELAY
 }
 
+fn terminal_target_from_osc8(uri: &str, cwd: &Path) -> Option<TerminalOpenTarget> {
+    if uri.starts_with("http://") || uri.starts_with("https://") {
+        Some(TerminalOpenTarget::Url(uri.to_owned()))
+    } else if let Some(path) = uri.strip_prefix("file://") {
+        resolve_terminal_path(path, cwd).map(TerminalOpenTarget::Path)
+    } else {
+        None
+    }
+}
+
+fn terminal_target_in_line(
+    line: &str,
+    clicked_byte: usize,
+    cwd: &Path,
+) -> Option<TerminalOpenTarget> {
+    if clicked_byte > line.len() || !line.is_char_boundary(clicked_byte) {
+        return None;
+    }
+    let start = line[..clicked_byte]
+        .char_indices()
+        .rev()
+        .find_map(|(index, character)| {
+            character
+                .is_whitespace()
+                .then_some(index + character.len_utf8())
+        })
+        .unwrap_or(0);
+    let end = line[clicked_byte..]
+        .char_indices()
+        .find_map(|(index, character)| character.is_whitespace().then_some(clicked_byte + index))
+        .unwrap_or(line.len());
+    let token = &line[start..end];
+    let trimmed = token.trim_start_matches(|character: char| {
+        matches!(character, '"' | '\'' | '<' | '(' | '[' | '{')
+    });
+    let trimmed = trimmed.trim_end_matches(|character: char| {
+        matches!(
+            character,
+            '"' | '\'' | '>' | ')' | ']' | '}' | '.' | ',' | ';' | '!' | '?'
+        )
+    });
+    let trimmed_start = start + token.find(trimmed)?;
+    if clicked_byte < trimmed_start || clicked_byte >= trimmed_start + trimmed.len() {
+        return None;
+    }
+    if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        return Some(TerminalOpenTarget::Url(trimmed.to_owned()));
+    }
+    resolve_terminal_path(trimmed, cwd).map(TerminalOpenTarget::Path)
+}
+
+fn resolve_terminal_path(value: &str, cwd: &Path) -> Option<PathBuf> {
+    let value = strip_source_position(value);
+    let looks_like_path = value.starts_with('/')
+        || value.starts_with("./")
+        || value.starts_with("../")
+        || value.starts_with("~/")
+        || value.as_bytes().get(1) == Some(&b':')
+        || value.contains('/');
+    if !looks_like_path || value.contains("://") {
+        return None;
+    }
+    if let Some(relative) = value.strip_prefix("~/") {
+        let home = env::var_os(if cfg!(windows) { "USERPROFILE" } else { "HOME" })?;
+        return Some(PathBuf::from(home).join(relative));
+    }
+    let path = PathBuf::from(value);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        cwd.join(path)
+    })
+}
+
+fn strip_source_position(value: &str) -> &str {
+    let Some((without_last, last)) = value.rsplit_once(':') else {
+        return value;
+    };
+    if !last.chars().all(|character| character.is_ascii_digit()) {
+        return value;
+    }
+    if let Some((without_both, line)) = without_last.rsplit_once(':')
+        && line.chars().all(|character| character.is_ascii_digit())
+    {
+        without_both
+    } else {
+        without_last
+    }
+}
+
+fn open_terminal_target(target: TerminalOpenTarget) {
+    thread::spawn(move || {
+        let result = match target {
+            TerminalOpenTarget::Url(url) => open_url_with_system(&url),
+            TerminalOpenTarget::Path(path) => open_path_in_file_manager(&path),
+        };
+        if let Err(error) = result {
+            tracing::warn!(%error, "opening terminal link target failed");
+        }
+    });
+}
+
+fn open_url_with_system(url: &str) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    ProcessCommand::new("xdg-open")
+        .arg(url)
+        .spawn()
+        .context("starting xdg-open")?;
+    #[cfg(target_os = "macos")]
+    ProcessCommand::new("open")
+        .arg(url)
+        .spawn()
+        .context("starting open")?;
+    #[cfg(windows)]
+    ProcessCommand::new("rundll32.exe")
+        .args(["url.dll,FileProtocolHandler", url])
+        .spawn()
+        .context("starting browser")?;
+    Ok(())
+}
+
+fn open_path_in_file_manager(path: &Path) -> Result<()> {
+    if path.is_dir() {
+        return open_directory_in_file_manager(path);
+    }
+    anyhow::ensure!(path.is_file(), "path does not exist: {}", path.display());
+    #[cfg(target_os = "linux")]
+    ProcessCommand::new("xdg-open")
+        .arg(path.parent().unwrap_or(path))
+        .spawn()
+        .context("starting xdg-open")?;
+    #[cfg(target_os = "macos")]
+    ProcessCommand::new("open")
+        .arg("-R")
+        .arg(path)
+        .spawn()
+        .context("starting open")?;
+    #[cfg(windows)]
+    ProcessCommand::new("explorer.exe")
+        .arg(format!("/select,{}", path.display()))
+        .spawn()
+        .context("starting Explorer")?;
+    Ok(())
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CellWordClass {
     Whitespace,
@@ -13663,6 +14304,67 @@ fn word_cell_bounds(row: &[CellSnapshot], clicked: usize) -> Option<(usize, usiz
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn child_spawn_proxy_refresh_coalesces_bursts_and_keeps_last_good_on_failure() {
+        let refreshed = system_proxy::SystemProxy {
+            http: Some("http://desktop:8080".into()),
+            ..Default::default()
+        };
+        let expected = refreshed.clone();
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let detector_calls = Arc::clone(&calls);
+        let cache =
+            SystemProxyCache::with_detector(system_proxy::SystemProxy::default(), move || {
+                if detector_calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Ok(refreshed.clone())
+                } else {
+                    Err(())
+                }
+            });
+        *cache
+            .last_attempt
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            std::time::Instant::now() - SYSTEM_PROXY_SPAWN_COALESCE_INTERVAL;
+
+        let _ = cache.environment_for_child(&[]);
+        assert_eq!(
+            *cache
+                .current
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            expected
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let _ = cache.environment_for_child(&[]);
+        assert_eq!(
+            *cache
+                .current
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            expected
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "bursty child spawns should share the freshly detected snapshot"
+        );
+        *cache
+            .last_attempt
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) =
+            std::time::Instant::now() - SYSTEM_PROXY_SPAWN_COALESCE_INTERVAL;
+        let _ = cache.environment_for_child(&[]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            *cache
+                .current
+                .lock()
+                .unwrap_or_else(|error| error.into_inner()),
+            expected
+        );
+    }
 
     fn terminal_resume(command: Option<&str>, agent: Option<AgentResumeInfo>) -> TerminalResume {
         TerminalResume {
@@ -13849,6 +14551,7 @@ mod tests {
     fn selection_cell(text: &str) -> CellSnapshot {
         CellSnapshot {
             text: text.into(),
+            hyperlink: None,
             foreground: Rgb { r: 0, g: 0, b: 0 },
             background: Rgb { r: 0, g: 0, b: 0 },
             background_explicit: false,
@@ -13857,6 +14560,43 @@ mod tests {
             underline: false,
             strikethrough: false,
         }
+    }
+
+    #[test]
+    fn terminal_link_detection_trims_delimiters_and_rejects_unsafe_schemes() {
+        let cwd = Path::new("/work/project");
+        assert_eq!(
+            terminal_target_in_line("see (https://example.com/a).", 10, cwd),
+            Some(TerminalOpenTarget::Url("https://example.com/a".into()))
+        );
+        assert_eq!(
+            terminal_target_in_line("see (https://example.com/a).", 27, cwd),
+            None
+        );
+        assert_eq!(
+            terminal_target_in_line("[http://localhost:8080/x]", 8, cwd),
+            Some(TerminalOpenTarget::Url("http://localhost:8080/x".into()))
+        );
+        assert_eq!(terminal_target_in_line("javascript:alert(1)", 3, cwd), None);
+        assert_eq!(terminal_target_in_line("ssh://host/path", 5, cwd), None);
+    }
+
+    #[test]
+    fn terminal_path_detection_resolves_cwd_and_source_positions() {
+        let cwd = Path::new("/work/project");
+        assert_eq!(
+            terminal_target_in_line("src/main.rs:12:3", 4, cwd),
+            Some(TerminalOpenTarget::Path(cwd.join("src/main.rs")))
+        );
+        assert_eq!(
+            terminal_target_in_line("../README.md:9", 3, cwd),
+            Some(TerminalOpenTarget::Path(cwd.join("../README.md")))
+        );
+        assert_eq!(
+            terminal_target_from_osc8("file:///tmp/report.txt", cwd),
+            Some(TerminalOpenTarget::Path(PathBuf::from("/tmp/report.txt")))
+        );
+        assert_eq!(terminal_target_in_line("ordinary", 3, cwd), None);
     }
 
     #[test]
@@ -14009,6 +14749,45 @@ mod tests {
         assert!(codex.contains("原因: 验证修改"));
         assert!(codex.contains("技术详情（item/commandExecution/requestApproval）："));
         assert!(codex.contains("\n  \"command\": \"cargo test --workspace\""));
+
+        let write_stdin = agent_approval_message(
+            Language::English,
+            "codex_app_server",
+            "write_stdin",
+            "item/commandExecution/requestApproval",
+            &json!({
+                "kind": "writeStdin",
+                "stdin": "y\n",
+                "processId": "process-42",
+                "cwd": "/work/wmcterm"
+            }),
+        );
+        assert!(write_stdin.starts_with(
+            "Codex requests to send input to a running command\nInput: y\n\nProcess: process-42"
+        ));
+        assert!(write_stdin.contains("Working directory: /work/wmcterm"));
+
+        let wire_write_stdin = agent_approval_message(
+            Language::English,
+            "codex_app_server",
+            "write_stdin",
+            "item/commandExecution/requestApproval",
+            &json!({
+                "kind": "writeStdin",
+                "threadId": "thread-a",
+                "turnId": "turn-a",
+                "itemId": "item-a",
+                "approvalId": "approval-a",
+                "startedAtMs": 42,
+                "availableDecisions": ["accept", "decline"]
+            }),
+        );
+        assert!(
+            wire_write_stdin.starts_with(
+                "Codex requests to send input to a running command\n\nTechnical details"
+            )
+        );
+        assert!(wire_write_stdin.contains("\"kind\": \"writeStdin\""));
 
         let claude = agent_approval_message(
             Language::English,
@@ -14239,6 +15018,14 @@ mod tests {
                 "codex_app_server",
                 "item/commandExecution/requestApproval",
                 "command_execution"
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_agent_approval_protocol(
+                "codex_app_server",
+                "item/commandExecution/requestApproval",
+                "write_stdin"
             )
             .is_ok()
         );

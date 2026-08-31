@@ -196,8 +196,6 @@ pub struct Workspace {
     pub pull_request: Option<String>,
     #[serde(default)]
     pub listening_ports: Vec<u16>,
-    #[serde(default)]
-    pub pinned: bool,
 }
 
 impl Workspace {
@@ -214,7 +212,6 @@ impl Workspace {
             git_branch: None,
             pull_request: None,
             listening_ports: Vec::new(),
-            pinned: false,
         }
     }
 }
@@ -973,10 +970,6 @@ pub enum WorkspaceCommand {
         id: WorkspaceId,
         offset: isize,
     },
-    Pin {
-        id: WorkspaceId,
-        pinned: bool,
-    },
     Close {
         id: WorkspaceId,
     },
@@ -1141,16 +1134,6 @@ impl Default for ActionRegistry {
                         AppCommand::Workspace(WorkspaceCommand::ChangeDirectory {
                             id: Uuid::nil(),
                             cwd: PathBuf::new(),
-                        })
-                    },
-                },
-                BuiltinAction {
-                    id: "workspace.pin",
-                    title: "Pin or Unpin Workspace",
-                    command: || {
-                        AppCommand::Workspace(WorkspaceCommand::Pin {
-                            id: Uuid::nil(),
-                            pinned: true,
                         })
                     },
                 },
@@ -1437,14 +1420,6 @@ impl AppState {
                     self.workspaces.insert(target, workspace);
                     self.active_workspace = target;
                 }
-                Ok(CommandOutcome::StateChanged)
-            }
-            AppCommand::Workspace(WorkspaceCommand::Pin { id, pinned }) => {
-                self.workspaces
-                    .iter_mut()
-                    .find(|item| item.id == id)
-                    .ok_or(CommandError::WorkspaceNotFound(id))?
-                    .pinned = pinned;
                 Ok(CommandOutcome::StateChanged)
             }
             AppCommand::Workspace(WorkspaceCommand::Close { id }) => {

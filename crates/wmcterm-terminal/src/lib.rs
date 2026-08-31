@@ -104,6 +104,8 @@ pub struct MouseInput {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CellSnapshot {
     pub text: String,
+    /// OSC 8 hyperlink attached to this cell, when present.
+    pub hyperlink: Option<Arc<str>>,
     pub foreground: Rgb,
     pub background: Rgb,
     /// The cell requests a non-default background, including SGR inverse.
@@ -318,13 +320,49 @@ impl TerminalEngine {
         let mut all_cells = Vec::with_capacity(rows as usize);
         let mut row_iter = self.rows.update(&snapshot)?;
 
+        let mut viewport_y = 0_u32;
+        let mut hyperlink_buffer = Vec::new();
         while let Some(row) = row_iter.next() {
             let mut line = String::new();
             let mut row_cells = Vec::with_capacity(cols as usize);
+            let mut previous_hyperlink: Option<Arc<str>> = None;
             let mut cell_iter = self.cells.update(row)?;
+            let mut viewport_x = 0_u16;
             while let Some(cell) = cell_iter.next() {
                 let graphemes = cell.graphemes()?;
-                let wide = cell.raw_cell()?.wide()?;
+                let raw_cell = cell.raw_cell()?;
+                let wide = raw_cell.wide()?;
+                let hyperlink = if !raw_cell.has_hyperlink()? {
+                    None
+                } else {
+                    let grid_ref = self.terminal.grid_ref(Point::Viewport(PointCoordinate {
+                        x: viewport_x,
+                        y: viewport_y,
+                    }))?;
+                    match grid_ref.hyperlink_uri(&mut []) {
+                        Ok(0) => None,
+                        Ok(_) => None,
+                        Err(libghostty_vt::Error::OutOfSpace { required })
+                            if required <= 16_384 =>
+                        {
+                            hyperlink_buffer.resize(required, 0);
+                            let length = grid_ref.hyperlink_uri(&mut hyperlink_buffer)?;
+                            match std::str::from_utf8(&hyperlink_buffer[..length]) {
+                                Ok(uri) if previous_hyperlink.as_deref() == Some(uri) => {
+                                    previous_hyperlink.clone()
+                                }
+                                Ok(uri) => {
+                                    let uri: Arc<str> = Arc::from(uri);
+                                    previous_hyperlink = Some(uri.clone());
+                                    Some(uri)
+                                }
+                                Err(_) => None,
+                            }
+                        }
+                        Err(libghostty_vt::Error::OutOfSpace { .. }) => None,
+                        Err(error) => return Err(error.into()),
+                    }
+                };
                 let text: String = if graphemes.is_empty()
                     && matches!(wide, CellWide::SpacerTail | CellWide::SpacerHead)
                 {
@@ -363,6 +401,7 @@ impl TerminalEngine {
                 }
                 row_cells.push(CellSnapshot {
                     text,
+                    hyperlink,
                     foreground,
                     background,
                     background_explicit: background_color.is_some() || style.inverse,
@@ -371,9 +410,11 @@ impl TerminalEngine {
                     underline: style.underline != Underline::None,
                     strikethrough: style.strikethrough,
                 });
+                viewport_x = viewport_x.saturating_add(1);
             }
             lines.push(line.trim_end().to_owned());
             all_cells.push(row_cells);
+            viewport_y = viewport_y.saturating_add(1);
         }
         let actual_scrollback_rows = self.terminal.scrollback_rows()?;
         Ok(ScreenSnapshot {
@@ -612,19 +653,17 @@ impl TerminalEngine {
     }
 
     pub fn encode_key(&mut self, input: &KeyInput) -> Result<Vec<u8>, TerminalError> {
-        // These conventional terminal controls must remain raw bytes even when
-        // a TUI enables an enhanced keyboard protocol. This also avoids
-        // platform text fields containing the already-transformed C0 value.
+        // Conventional terminal controls must remain raw bytes even when a TUI
+        // enables an enhanced keyboard protocol. Platform keyboard events may
+        // expose the unmodified printable text (for example, "t" for Ctrl+T),
+        // which would otherwise take precedence and insert that text literally.
         if input.modifiers.control
             && !input.modifiers.shift
             && !input.modifiers.alt
             && !input.modifiers.super_key
+            && let Some(byte) = conventional_control_byte(input.key)
         {
-            match input.key {
-                InputKey::Character('c' | 'C') => return Ok(vec![0x03]),
-                InputKey::Character('d' | 'D') => return Ok(vec![0x04]),
-                _ => {}
-            }
+            return Ok(vec![byte]);
         }
         let mut event = KeyEvent::new()?;
         event
@@ -642,6 +681,22 @@ impl TerminalEngine {
         let mut bytes = Vec::with_capacity(16);
         self.key_encoder.encode_to_vec(&event, &mut bytes)?;
         Ok(bytes)
+    }
+}
+
+fn conventional_control_byte(key: InputKey) -> Option<u8> {
+    match key {
+        InputKey::Space | InputKey::Character('@' | '`') => Some(0x00),
+        InputKey::Character(character @ ('a'..='z' | 'A'..='Z')) => {
+            Some(character.to_ascii_uppercase() as u8 - b'@')
+        }
+        InputKey::Character('[' | '{') => Some(0x1b),
+        InputKey::Character('\\' | '|') => Some(0x1c),
+        InputKey::Character(']' | '}') => Some(0x1d),
+        InputKey::Character('^' | '~') => Some(0x1e),
+        InputKey::Character('_' | '/') => Some(0x1f),
+        InputKey::Character('?') => Some(0x7f),
+        _ => None,
     }
 }
 
@@ -1368,6 +1423,25 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_preserves_and_ends_osc8_hyperlinks() {
+        let mut terminal = TerminalEngine::new(TerminalSize::new(12, 2).unwrap()).unwrap();
+        terminal.feed(b"\x1b]8;;https://example.com/path\x07link\x1b]8;;\x07 plain");
+
+        let snapshot = terminal.snapshot().unwrap();
+        let linked = &snapshot.cells[0][..4];
+        assert!(
+            linked
+                .iter()
+                .all(|cell| { cell.hyperlink.as_deref() == Some("https://example.com/path") })
+        );
+        assert!(Arc::ptr_eq(
+            linked[0].hyperlink.as_ref().unwrap(),
+            linked[1].hyperlink.as_ref().unwrap()
+        ));
+        assert!(snapshot.cells[0][5].hyperlink.is_none());
+    }
+
+    #[test]
     fn synchronized_output_mode_brackets_atomic_screen_updates() {
         let mut terminal = TerminalEngine::new(TerminalSize::new(12, 3).unwrap()).unwrap();
         assert!(!terminal.synchronized_output());
@@ -1429,24 +1503,42 @@ mod tests {
     }
 
     #[test]
-    fn control_keys_ignore_platform_control_text() {
-        let mut terminal = TerminalEngine::new(TerminalSize::new(10, 2).unwrap()).unwrap();
-        // Codex and similar TUIs may enable Kitty keyboard disambiguation.
-        terminal.feed(b"\x1b[>1u");
-        for (key, text, expected) in [
-            (InputKey::Character('c'), "\u{3}", b"\x03".as_slice()),
-            (InputKey::Character('d'), "\u{4}", b"\x04".as_slice()),
-        ] {
-            let input = KeyInput {
-                key,
-                text: Some(text.into()),
-                modifiers: KeyModifiers {
-                    control: true,
-                    ..KeyModifiers::default()
-                },
-                repeat: false,
-            };
-            assert_eq!(terminal.encode_key(&input).unwrap(), expected);
+    fn control_keys_ignore_platform_text_with_enhanced_keyboard_protocol() {
+        for enhanced_keyboard in [false, true] {
+            let mut terminal = TerminalEngine::new(TerminalSize::new(10, 2).unwrap()).unwrap();
+            if enhanced_keyboard {
+                // Codex and similar TUIs enable Kitty keyboard disambiguation.
+                terminal.feed(b"\x1b[>1u");
+            }
+            for (key, text, expected) in [
+                (InputKey::Character('a'), "a", 0x01),
+                (InputKey::Character('c'), "\u{3}", 0x03),
+                (InputKey::Character('d'), "\u{4}", 0x04),
+                (InputKey::Character('t'), "t", 0x14),
+                (InputKey::Character('z'), "z", 0x1a),
+                (InputKey::Character('['), "[", 0x1b),
+                (InputKey::Character('\\'), "\\", 0x1c),
+                (InputKey::Character(']'), "]", 0x1d),
+                (InputKey::Character('^'), "^", 0x1e),
+                (InputKey::Character('_'), "_", 0x1f),
+                (InputKey::Character('?'), "?", 0x7f),
+                (InputKey::Space, " ", 0x00),
+            ] {
+                let input = KeyInput {
+                    key,
+                    text: Some(text.into()),
+                    modifiers: KeyModifiers {
+                        control: true,
+                        ..KeyModifiers::default()
+                    },
+                    repeat: false,
+                };
+                assert_eq!(
+                    terminal.encode_key(&input).unwrap(),
+                    [expected],
+                    "enhanced_keyboard={enhanced_keyboard}, key={key:?}"
+                );
+            }
         }
     }
 

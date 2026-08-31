@@ -207,6 +207,7 @@ fn atomic_write_config(path: &Path, contents: &[u8]) -> Result<(), ProjectTrustE
 #[serde(rename_all = "snake_case")]
 pub enum ApprovalKind {
     CommandExecution,
+    WriteStdin,
     FileChange,
     Permissions,
 }
@@ -233,7 +234,13 @@ pub struct ApprovalRequest {
 impl ApprovalRequest {
     pub fn parse(value: &Value) -> Option<Self> {
         let method = value.get("method")?.as_str()?;
+        let params = value.get("params")?.clone();
         let kind = match method {
+            "item/commandExecution/requestApproval"
+                if params.get("kind").and_then(Value::as_str) == Some("writeStdin") =>
+            {
+                ApprovalKind::WriteStdin
+            }
             "item/commandExecution/requestApproval" => ApprovalKind::CommandExecution,
             "item/fileChange/requestApproval" => ApprovalKind::FileChange,
             "item/permissions/requestApproval" => ApprovalKind::Permissions,
@@ -243,7 +250,6 @@ impl ApprovalRequest {
         if !jsonrpc_id.is_string() && !jsonrpc_id.is_number() {
             return None;
         }
-        let params = value.get("params")?.clone();
         let thread_id = text_field(&params, &["threadId", "thread_id"])?;
         let turn_id = text_field(&params, &["turnId", "turn_id"]);
         let item_id = text_field(&params, &["approvalId", "approval_id", "itemId", "item_id"])
@@ -285,6 +291,16 @@ impl ApprovalRequest {
         let result = match self.kind {
             ApprovalKind::CommandExecution => json!({
                 "decision": command_decision(&self.params, decision)
+            }),
+            ApprovalKind::WriteStdin => json!({
+                "decision": command_decision(
+                    &self.params,
+                    if decision == ApprovalDecision::Always {
+                        ApprovalDecision::Deny
+                    } else {
+                        decision
+                    },
+                )
             }),
             ApprovalKind::FileChange => json!({
                 "decision": file_decision(&self.params, decision)
@@ -1217,6 +1233,11 @@ fn supported_modes(request: &ApprovalRequest) -> Vec<ApprovalDecision> {
                 || command_exact_rule(&request.params).is_some()
             {
                 modes.push(ApprovalDecision::Always);
+            }
+        }
+        ApprovalKind::WriteStdin => {
+            if available(&request.params, "accept") {
+                modes.push(ApprovalDecision::Once);
             }
         }
         ApprovalKind::FileChange => {
@@ -2277,6 +2298,73 @@ mod tests {
             assert_eq!(request.item_id, "approval-a");
             assert_eq!(request.response(ApprovalDecision::Deny)["id"], 91);
         }
+    }
+
+    #[test]
+    fn recognizes_write_stdin_without_changing_legacy_command_requests() {
+        let write_stdin = ApprovalRequest::parse(&json!({
+            "id": "rpc-write",
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "kind": "writeStdin",
+                "threadId": "thread-a",
+                "turnId": "turn-a",
+                "itemId": "item-a",
+                "approvalId": "approval-write",
+                "stdin": "yes\n",
+                "availableDecisions": ["accept", "acceptForSession", "decline"]
+            }
+        }))
+        .unwrap();
+        assert_eq!(write_stdin.kind, ApprovalKind::WriteStdin);
+        assert_eq!(write_stdin.item_id, "approval-write");
+        assert_eq!(
+            supported_modes(&write_stdin),
+            vec![ApprovalDecision::Deny, ApprovalDecision::Once]
+        );
+        assert_eq!(
+            write_stdin.response(ApprovalDecision::Once),
+            json!({"id": "rpc-write", "result": {"decision": "accept"}})
+        );
+        assert_eq!(
+            write_stdin.response(ApprovalDecision::Always),
+            json!({"id": "rpc-write", "result": {"decision": "decline"}})
+        );
+
+        let registration = write_stdin.registration_params(&test_config("ws://localhost".into()));
+        assert_eq!(registration["request"]["kind"], "write_stdin");
+        assert_eq!(registration["request"]["item_id"], "approval-write");
+        assert_eq!(registration["request"]["params"]["stdin"], "yes\n");
+        assert_eq!(registration["decisions"], json!(["deny", "once"]));
+
+        let wire_request = ApprovalRequest::parse(&json!({
+            "id": "rpc-wire-write",
+            "method": "item/commandExecution/requestApproval",
+            "params": {
+                "kind": "writeStdin",
+                "threadId": "thread-a",
+                "turnId": "turn-a",
+                "itemId": "item-a",
+                "approvalId": "approval-wire",
+                "startedAtMs": 42,
+                "availableDecisions": ["accept", "decline"]
+            }
+        }))
+        .unwrap();
+        assert_eq!(wire_request.kind, ApprovalKind::WriteStdin);
+        assert_eq!(wire_request.item_id, "approval-wire");
+        assert_eq!(
+            supported_modes(&wire_request),
+            vec![ApprovalDecision::Deny, ApprovalDecision::Once]
+        );
+
+        let legacy = ApprovalRequest::parse(&json!({
+            "id": "rpc-command",
+            "method": "item/commandExecution/requestApproval",
+            "params": {"threadId": "thread-a", "itemId": "item-a"}
+        }))
+        .unwrap();
+        assert_eq!(legacy.kind, ApprovalKind::CommandExecution);
     }
 
     #[test]

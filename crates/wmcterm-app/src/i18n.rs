@@ -58,11 +58,19 @@ impl Language {
         }
     }
 
-    pub(crate) const fn pinned(self) -> &'static str {
+    pub(crate) const fn open_in_file_manager(self) -> &'static str {
         if self.is_chinese() {
-            "[已固定]"
+            "在文件管理器中打开"
         } else {
-            "[pinned]"
+            "Open in File Manager"
+        }
+    }
+
+    pub(crate) const fn open_in_terminal(self) -> &'static str {
+        if self.is_chinese() {
+            "在终端中打开"
+        } else {
+            "Open in Terminal"
         }
     }
 
@@ -485,7 +493,6 @@ impl Language {
             "workspace.rename" => "重命名工作区",
             "workspace.describe" => "编辑工作区描述",
             "workspace.change_directory" => "更改工作区目录",
-            "workspace.pin" => "固定或取消固定工作区",
             "pane.split_right" => "向右拆分",
             "pane.split_down" => "向下拆分",
             "surface.new" => "新建终端标签",

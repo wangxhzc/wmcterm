@@ -137,7 +137,7 @@ fn print_help() {
          \nUSAGE:\n\
          \x20 wmcterm [gui|PROJECT_DIR]\n\
          \x20 wmcterm dump [--cols N] [--rows N] [--] [COMMAND [ARG...]]\n\
-         \x20 wmcterm workspace list|new|activate|rename|describe|cwd|move|pin|close ...\n\
+         \x20 wmcterm workspace list|new|activate|rename|describe|cwd|move|close ...\n\
          \x20 wmcterm pane split [--pane ID|--surface ID] [--left|--right|--up|--down] [--no-focus] [--command CMD] [--cwd DIR] [--env KEY=VALUE] [--title TITLE]\n\
          \x20 wmcterm pane close ID | close-others [--anchor ID]\n\
          \x20 wmcterm surface new [--pane ID|--surface ID] [--no-focus] [--command CMD] [--cwd DIR] [--env KEY=VALUE] [--title TITLE]\n\
@@ -525,17 +525,7 @@ fn run_cli(scope: String) -> Result<()> {
                     serde_json::json!({"id": id, "offset": offset}),
                 )?
             }
-            Some("pin") => {
-                let id = args.next().context("workspace pin requires ID")?;
-                let pinned = !args.any(|value| value == "--off");
-                rpc(
-                    "workspace.pin",
-                    serde_json::json!({"id": id, "pinned": pinned}),
-                )?
-            }
-            _ => bail!(
-                "usage: wmcterm workspace list|new|activate|rename|describe|cwd|move|pin|close"
-            ),
+            _ => bail!("usage: wmcterm workspace list|new|activate|rename|describe|cwd|move|close"),
         },
         "pane" => match args.next().as_deref() {
             Some("list") => rpc(
@@ -2387,14 +2377,18 @@ mod tests {
         let existing_hook = serde_json::json!({"hooks": [{"type": "command", "command": "old"}]});
         let mut target = serde_json::json!({
             "theme": "dark",
-            "hooks": {"Stop": [existing_hook.clone()]}
+            "hooks": {
+                "Stop": [existing_hook.clone()],
+                "Interrupt": [{"hooks": [{"type": "command", "command": "keep-interrupt"}]}]
+            }
         });
         merge_json_fragment(
             &mut target,
             serde_json::json!({
                 "hooks": {
                     "Stop": [existing_hook, {"hooks": [{"type": "command", "command": "wmcterm"}]}],
-                    "SessionStart": [{"hooks": [{"type": "command", "command": "wmcterm"}]}]
+                    "SessionStart": [{"hooks": [{"type": "command", "command": "wmcterm"}]}],
+                    "Interrupt": [{"hooks": [{"type": "command", "command": "wmcterm"}]}]
                 }
             }),
         );
@@ -2402,6 +2396,7 @@ mod tests {
         assert_eq!(target["theme"], "dark");
         assert_eq!(target["hooks"]["Stop"].as_array().unwrap().len(), 2);
         assert_eq!(target["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
+        assert_eq!(target["hooks"]["Interrupt"].as_array().unwrap().len(), 2);
     }
 
     #[test]
@@ -2473,6 +2468,10 @@ mod tests {
         assert_eq!(removed, 0);
         let installed: Value = serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(installed["theme"], "keep");
+        let plan =
+            wmcterm_agent::hook_install_plan(wmcterm_agent::AgentKind::Codex, "/usr/bin/wmcterm");
+        let fragment: Value = serde_json::from_str(&plan.snippets[0].content).unwrap();
+        assert!(fragment["hooks"]["Interrupt"].is_array());
         assert!(installed["hooks"]["Stop"].is_array());
         #[cfg(unix)]
         {

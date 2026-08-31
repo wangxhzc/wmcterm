@@ -48,7 +48,7 @@ unicode-script = "0.5"
 uuid = { version = "1", features = ["v4", "serde"] }
 wgpu = "30"
 winit = "0.30"
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Memory", "Win32_System_Ole", "Win32_UI_Input_KeyboardAndMouse"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_DataExchange", "Win32_System_Diagnostics_ToolHelp", "Win32_System_Memory", "Win32_System_Ole", "Win32_System_Registry", "Win32_System_Threading", "Win32_UI_Input_KeyboardAndMouse"] }
 
 [package]
 name = "wmcterm"

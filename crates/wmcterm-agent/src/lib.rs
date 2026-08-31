@@ -915,6 +915,16 @@ pub fn normalize_hook_event(
         });
     }
 
+    // Codex Interrupt ends only the active turn. The Codex session and its
+    // terminal process remain alive and can accept another prompt, so this
+    // must not be projected as the legacy session-level Stop event.
+    if matches!(agent, AgentKind::Codex) && event == "interrupt" {
+        return Ok(AgentEvent::TurnComplete {
+            continuing: false,
+            message: optional_nonempty(message),
+        });
+    }
+
     if is_failure(&event, payload) {
         return Ok(AgentEvent::Stop {
             success: false,
@@ -1244,6 +1254,7 @@ pub fn hook_install_plan(agent: AgentKind, wmcterm_binary: impl Into<String>) ->
                     "SessionStart",
                     "UserPromptSubmit",
                     "PermissionRequest",
+                    "Interrupt",
                     "Stop",
                     "SessionEnd",
                 ],
@@ -1980,6 +1991,20 @@ mod tests {
             .unwrap(),
             AgentEvent::Stop { success: true, message: Some(message) } if message == "done"
         ));
+        let interrupted = normalize_hook_json(
+            AgentKind::Codex,
+            None,
+            r#"{"hook_event_name":"Interrupt","session_id":"session-1","turn_id":"turn-2","cwd":"/work/project","model":"gpt-5.3-codex","permission_mode":"on-request","transcript_path":"/tmp/codex.jsonl"}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            interrupted,
+            AgentEvent::TurnComplete {
+                continuing: false,
+                message: None
+            }
+        ));
+        assert_eq!(reduce(&interrupted).state, AgentState::Idle);
         assert!(matches!(
             normalize_hook_json(
                 AgentKind::OpenCode,
@@ -2259,6 +2284,7 @@ mod tests {
         );
         let codex_json: Value = serde_json::from_str(&codex.snippets[0].content).unwrap();
         assert!(codex_json["hooks"]["PermissionRequest"].is_array());
+        assert!(codex_json["hooks"]["Interrupt"].is_array());
         assert!(codex_json["hooks"]["Stop"].is_array());
     }
 

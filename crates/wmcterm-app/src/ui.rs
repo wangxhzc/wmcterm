@@ -619,7 +619,9 @@ pub(crate) fn sidebar_layout(
     requested_scroll: usize,
 ) -> SidebarLayout {
     let rows_top = 88.0;
-    let footer_height = 8.0;
+    // Keep a reliable context-menu target below the final workspace row.
+    // This remains available even when the workspace list needs to scroll.
+    let footer_height = 32.0;
     let available = (height - rows_top - footer_height).max(1.0);
     let mut max_scroll = row_heights.len();
     let mut tail_height = 0.0;
@@ -636,7 +638,7 @@ pub(crate) fn sidebar_layout(
     let mut rows = Vec::new();
     for (index, height) in row_heights.iter().copied().enumerate().skip(scroll) {
         let height = height.max(1.0);
-        if !rows.is_empty() && top + height > rows_top + available {
+        if top + height > rows_top + available {
             break;
         }
         rows.push(SidebarRow {
@@ -661,6 +663,23 @@ pub(crate) fn sidebar_layout(
         scroll,
         max_scroll,
     }
+}
+
+/// Return the visible row position selected by a vertical workspace drag.
+/// A reorder only happens after the pointer crosses a neighbouring row's
+/// midpoint, which keeps the list stable around row boundaries.
+pub(crate) fn workspace_drag_target(rows: &[SidebarRow], source: usize, y: f32) -> usize {
+    let mut target = source.min(rows.len().saturating_sub(1));
+    for (index, row) in rows.iter().enumerate() {
+        let midpoint = row.bounds.y + row.bounds.height / 2.0;
+        if index < source && y < midpoint {
+            return index;
+        }
+        if index > source && y > midpoint {
+            target = index;
+        }
+    }
+    target
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1225,6 +1244,53 @@ mod tests {
                 .rows
                 .windows(2)
                 .all(|rows| { rows[0].bounds.y + rows[0].bounds.height == rows[1].bounds.y })
+        );
+    }
+
+    #[test]
+    fn sidebar_layout_reserves_a_context_menu_target_below_rows() {
+        let height = 400.0;
+        let layout = sidebar_layout(240.0, height, &[64.0; 20], 0);
+        let rows_bottom = layout
+            .rows
+            .last()
+            .map_or(88.0, |row| row.bounds.y + row.bounds.height);
+        assert!(height - rows_bottom >= 32.0);
+        assert!(
+            !layout
+                .rows
+                .iter()
+                .any(|row| row.bounds.contains(20.0, height - 1.0))
+        );
+    }
+
+    #[test]
+    fn workspace_drag_target_uses_row_midpoints() {
+        let layout = sidebar_layout(240.0, 400.0, &[64.0, 82.0, 64.0], 0);
+
+        assert_eq!(workspace_drag_target(&layout.rows, 0, 200.0), 1);
+        assert_eq!(workspace_drag_target(&layout.rows, 0, 280.0), 2);
+        assert_eq!(workspace_drag_target(&layout.rows, 2, 90.0), 0);
+    }
+
+    #[test]
+    fn workspace_drag_target_stays_put_before_crossing_a_midpoint() {
+        let layout = sidebar_layout(240.0, 400.0, &[64.0, 82.0, 64.0], 0);
+
+        assert_eq!(workspace_drag_target(&layout.rows, 1, 125.0), 1);
+        assert_eq!(workspace_drag_target(&layout.rows, 1, 169.0), 1);
+    }
+
+    #[test]
+    fn sidebar_layout_does_not_let_a_row_invade_a_small_footer() {
+        let height = 100.0;
+        let layout = sidebar_layout(240.0, height, &[64.0], 0);
+        assert!(layout.rows.is_empty());
+        assert!(
+            !layout
+                .rows
+                .iter()
+                .any(|row| row.bounds.contains(20.0, height - 1.0))
         );
     }
 
