@@ -2039,6 +2039,17 @@ Plugin Marketplace
 - Codex 0.150.0 `Interrupt` Hook 归一化为当前 turn 完成且不继续，使
   Workspace 从运行中恢复 Idle；该事件不是 SessionEnd，不得结束仍存活的
   Codex surface 或 PTY lifecycle。
+- Codex 0.151.0 `SubagentStart`/`SubagentStop` 使用官方顶层
+  `session_id`、`turn_id`、`agent_id`、`agent_type` 字段，并以
+  `(Surface, session_id, agent_id)` 幂等跟踪。子 Agent Hook 只表示运行活动，
+  不会完成父 Surface；活动集合对父状态施加 Running 覆盖，但 Error 与
+  NeedsInput 仍保持更高优先级。`SubagentStop` 把精确匹配项标记为 Stopped，并按
+  Surface/session 有序保留最近 256 个有界墓碑；活动项不参与容量淘汰，超出界限后
+  最旧墓碑定义了可防护的乱序重放窗口。SessionEnd、PTY 退出或 Surface 关闭清理
+  对应状态；成功路由的新 Codex SessionStart 也会清理该 Surface 上所有旧 session，
+  同时保留新 session 及其他 Surface。升级和普通运行不会自动修改 Codex 配置；只有用户显式执行
+  `wmcterm hook install --agent codex --scope user` 才写入 `~/.codex`，并须在
+  `/hooks` 审核；项目级安装使用 `--scope project`。
 
 ## 33.4 配置、恢复与发布
 
@@ -2239,6 +2250,16 @@ Claude 与 Codex 在 wmcterm 中共用完全相同的 VT title 接收、`Surface
 
 验收条件是：无论 Agent 是否动态更新终端标题，标签都至少保留可识别的
 稳定标题文本；动态状态不会改变或破坏标签的布局与可操作区域。
+
+### 33.9.1 Surface 标签弹性布局与溢出导航
+
+实现状态（2026-09-01）：Surface 标签不再按标题内容生成狭窄且固定的命中区域。
+同一可见页中的标签平均分配可用宽度，单个标签以 80px 为最小舒适宽度、240px
+为扩展上限；长标题保存完整内容，仅在最终文本边界确定后按 Unicode 显示列截断。
+空间不足时，标签栏为 `⋯N` 保留独立的 44px 区域，显示隐藏数量，并通过完整标题
+列表切换任意 Surface。可见标签按固定页分组，组内切换不会改变标签位置；切换到
+其他页时仍保证活动标签可见。新增按钮、溢出按钮、标签和关闭按钮共享无重叠的
+绘制与命中几何。
 
 ## 33.10 已修复缺陷：新启动 Codex 被误标为运行中
 

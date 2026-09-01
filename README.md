@@ -67,6 +67,8 @@ cargo run
 - `Ctrl+,`：在系统编辑器中创建或打开用户配置
 - `Ctrl+Shift+C` / `Ctrl+Shift+V`：复制终端选区/粘贴
 - 单击鼠标：聚焦工作区/窗格，或激活表面标签页
+- 标签页在空间充足时等宽扩展；空间不足时，单击标签栏中的 `⋯N` 可从完整标题列表
+  切换到被隐藏的标签页
 - 单击表面标签页上的 `×`：关闭该标签页；关闭最后一个标签页后，将留下带有可点击
   新建终端入口的空窗格
 - 拖动鼠标：选择终端文本并复制到剪贴板；拖到终端顶部或底部边缘之外时，会自动
@@ -163,6 +165,12 @@ Hook 接收器会继承由 wmcterm 启动的终端所含的 wmcterm 上下文变
 新安装或发生变化的命令 Hook 必须先通过 `/hooks` 审核才能运行。
 Codex 0.150.0 的 `Interrupt` Hook 会在用户中断当前 turn 时立即清除运行中
 状态，但不会把仍在等待下一次输入的 Codex 进程标记为已退出。
+Codex 0.151.0 的 `SubagentStart`/`SubagentStop` Hook 会按 Surface、session 和
+agent ID 跟踪后台子 Agent；只要任一子 Agent 仍活动，Workspace 就保持运行中，
+父 turn 完成不会提前显示为已完成。Stop 会留下每个 session 最近 256 个有界墓碑，
+阻止乱序到达的同键 Start 重新激活。升级和普通运行不会自动修改 Codex 配置；只有用户
+显式执行 `wmcterm hook install --agent codex --scope user` 才会写入 `~/.codex`，
+随后仍需在 Codex `/hooks` 中审核变化。项目级安装使用 `--scope project`。
 
 CLI 也是稳定的 Agent 控制接口。在 wmcterm 终端内启动的命令会继承 `WMCTERM=1`、
 `WMCTERM_WORKSPACE_ID`、`WMCTERM_PANE_ID`、`WMCTERM_SURFACE_ID`、

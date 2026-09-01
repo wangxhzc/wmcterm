@@ -29,7 +29,8 @@ use winit::platform::startup_notify::{
 use winit::window::{CursorIcon, Icon, ResizeDirection, WindowId};
 use wmcterm_agent::{
     AgentEvent, AgentKind, AgentProcessIdentity, ClaudeHookEvent, ClaudeHookKind,
-    reduce as reduce_agent, validate_agent_process_identity,
+    CodexSubagentHookEvent, CodexSubagentHookKind, reduce as reduce_agent,
+    validate_agent_process_identity,
 };
 use wmcterm_config::{
     BellNotificationMode, Config, ConfigReloader, ResolvedKeybindings, Shortcut, ThemeColor,
@@ -291,6 +292,41 @@ struct ClaudeSubagentStatus {
     session_id: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CodexSubagentKey {
+    surface: SurfaceId,
+    session_id: String,
+    agent_id: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CodexSubagentState {
+    Active,
+    Stopped,
+}
+
+#[derive(Debug, Default)]
+struct CodexSubagentTracker {
+    states: HashMap<CodexSubagentKey, CodexSubagentState>,
+    stopped_order: HashMap<(SurfaceId, String), VecDeque<String>>,
+}
+
+const MAX_CODEX_STOPPED_TOMBSTONES_PER_SESSION: usize = 256;
+
+impl CodexSubagentTracker {
+    fn len(&self) -> usize {
+        self.states
+            .values()
+            .filter(|state| **state == CodexSubagentState::Active)
+            .count()
+    }
+
+    #[cfg(test)]
+    fn retained_len(&self) -> usize {
+        self.states.len()
+    }
+}
+
 #[derive(Debug)]
 struct TaggedEvent {
     terminal: TerminalId,
@@ -472,6 +508,13 @@ struct TabContextMenu {
 }
 
 #[derive(Clone, Copy)]
+struct TabOverflowMenu {
+    pane: PaneId,
+    anchor: (f32, f32),
+    scroll_offset: usize,
+}
+
+#[derive(Clone, Copy)]
 struct WorkspaceContextMenu {
     workspace: uuid::Uuid,
     anchor: (f32, f32),
@@ -504,6 +547,7 @@ enum NavigationHover {
     NewWorkspace,
     Tab(PaneId, usize),
     TabClose(PaneId, usize),
+    TabOverflow(PaneId),
     TabNew(PaneId),
     Notification(usize),
     NotificationClose(usize),
@@ -840,6 +884,7 @@ struct WmctermApplication {
     close_confirmation: Option<CloseConfirmation>,
     codex_trust_confirmation: Option<CodexTrustConfirmation>,
     tab_context_menu: Option<TabContextMenu>,
+    tab_overflow_menu: Option<TabOverflowMenu>,
     workspace_context_menu: Option<WorkspaceContextMenu>,
     sidebar_context_menu: Option<SidebarContextMenu>,
     terminal_context_menu: Option<TerminalContextMenu>,
@@ -877,6 +922,7 @@ struct WmctermApplication {
     agent_approval_results: HashMap<String, AgentApprovalAction>,
     agent_approval_result_order: VecDeque<String>,
     claude_subagents: HashMap<String, ClaudeSubagentStatus>,
+    codex_subagents: CodexSubagentTracker,
 }
 
 impl WmctermApplication {
@@ -884,10 +930,33 @@ impl WmctermApplication {
         proxy: EventLoopProxy<UserEvent>,
         config: Config,
         restored: Option<AppState>,
+        commands: HashMap<TerminalId, String>,
+        restored_history: HashMap<TerminalId, String>,
+        restored_window: Option<WindowState>,
+        restored_agent_sessions: HashMap<SurfaceId, AgentSession>,
+    ) -> Result<Self> {
+        Self::new_configured(
+            proxy,
+            config,
+            restored,
+            commands,
+            restored_history,
+            restored_window,
+            restored_agent_sessions,
+            true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_configured(
+        proxy: EventLoopProxy<UserEvent>,
+        config: Config,
+        restored: Option<AppState>,
         mut commands: HashMap<TerminalId, String>,
         restored_history: HashMap<TerminalId, String>,
         restored_window: Option<WindowState>,
         restored_agent_sessions: HashMap<SurfaceId, AgentSession>,
+        enable_ipc: bool,
     ) -> Result<Self> {
         let raw_process_cwd = env::current_dir()?;
         let process_cwd = safe_process_cwd(raw_process_cwd.clone());
@@ -937,7 +1006,7 @@ impl WmctermApplication {
         }
         let pending = Arc::new(Mutex::new(VecDeque::new()));
         let wake_pending = Arc::new(AtomicBool::new(false));
-        let control_socket_path = application_socket_path();
+        let control_socket_path = enable_ipc.then(application_socket_path).flatten();
         let ipc = control_socket_path
             .as_ref()
             .map(|path| {
@@ -1018,6 +1087,7 @@ impl WmctermApplication {
             close_confirmation: None,
             codex_trust_confirmation: None,
             tab_context_menu: None,
+            tab_overflow_menu: None,
             workspace_context_menu: None,
             sidebar_context_menu: None,
             terminal_context_menu: None,
@@ -1056,6 +1126,7 @@ impl WmctermApplication {
             agent_approval_results: HashMap::new(),
             agent_approval_result_order: VecDeque::new(),
             claude_subagents: HashMap::new(),
+            codex_subagents: CodexSubagentTracker::default(),
         };
         for surface in app.state.surfaces.values() {
             let Some(path) = surface.resource.as_deref().map(std::path::Path::new) else {
@@ -1304,6 +1375,51 @@ impl WmctermApplication {
             return Err("target terminal is not running".into());
         }
         Ok(terminal)
+    }
+
+    fn codex_agent_update_route(&self, params: &Value) -> Result<(TerminalId, SurfaceId), String> {
+        let surface = params
+            .get("surface_id")
+            .and_then(Value::as_str)
+            .filter(|surface| !surface.trim().is_empty())
+            .ok_or_else(|| "Codex agent.update requires explicit params.surface_id".to_owned())?
+            .parse::<SurfaceId>()
+            .map_err(|_| "invalid params.surface_id".to_owned())?;
+        if let Some(alias) = optional_uuid_param(params, "surface")?
+            && alias != surface
+        {
+            return Err("params.surface does not match params.surface_id".into());
+        }
+        let terminal = match self
+            .state
+            .surfaces
+            .get(&surface)
+            .ok_or_else(|| "target surface not found".to_owned())?
+            .kind
+        {
+            SurfaceKind::Terminal(terminal) => terminal,
+            _ => return Err("target surface is not a terminal".into()),
+        };
+        if let Some(requested_terminal) = optional_uuid_param(params, "terminal")?
+            && requested_terminal != terminal
+        {
+            return Err("target terminal does not match params.surface_id".into());
+        }
+        let runtime = self
+            .terminals
+            .get(&terminal)
+            .ok_or_else(|| "target terminal is not running".to_owned())?;
+        let lifecycle = params
+            .get("lifecycle_id")
+            .and_then(Value::as_str)
+            .filter(|lifecycle| !lifecycle.trim().is_empty())
+            .ok_or_else(|| {
+                "Codex agent.update requires non-empty params.lifecycle_id".to_owned()
+            })?;
+        if lifecycle != runtime.lifecycle_id {
+            return Err("stale agent event for a previous terminal lifecycle".into());
+        }
+        Ok((terminal, surface))
     }
 
     fn reload_config_if_changed(&mut self) {
@@ -1618,19 +1734,8 @@ impl WmctermApplication {
         {
             self.notify_terminal(terminal, &message);
         }
-        if let Some(index) = self.workspace_for_terminal(terminal)
-            && let Some(workspace) = self.state.workspaces.get_mut(index)
-        {
-            workspace.status = match transition.state {
-                wmcterm_core::AgentState::Running => wmcterm_core::WorkspaceStatus::Running,
-                wmcterm_core::AgentState::WaitingForInput
-                | wmcterm_core::AgentState::WaitingForPermission => {
-                    wmcterm_core::WorkspaceStatus::NeedsInput
-                }
-                wmcterm_core::AgentState::Completed => wmcterm_core::WorkspaceStatus::Completed,
-                wmcterm_core::AgentState::Error => wmcterm_core::WorkspaceStatus::Error,
-                _ => wmcterm_core::WorkspaceStatus::Idle,
-            };
+        if let Some(index) = self.workspace_for_terminal(terminal) {
+            self.sync_workspace_agent_status(index);
         }
         if let Some(surface) = self.surface_for_terminal(terminal) {
             self.sync_surface_agent_request_state(surface);
@@ -1644,35 +1749,7 @@ impl WmctermApplication {
         params: &Value,
         event: &AgentEvent,
     ) -> Result<bool, String> {
-        let surface = self
-            .surface_for_terminal(terminal)
-            .ok_or_else(|| "agent target surface no longer exists".to_owned())?;
-        let runtime_lifecycle = &self
-            .terminals
-            .get(&terminal)
-            .ok_or_else(|| "agent target terminal is not running".to_owned())?
-            .lifecycle_id;
-        let effective_lifecycle = effective_agent_lifecycle(
-            runtime_lifecycle,
-            params.get("lifecycle_id").and_then(Value::as_str),
-        )?;
-        match (
-            params.get("agent_pid").and_then(Value::as_u64),
-            params.get("pid_start_time").and_then(Value::as_u64),
-        ) {
-            (Some(pid), Some(start)) => {
-                let pid = u32::try_from(pid).map_err(|_| "invalid agent pid".to_owned())?;
-                let expected = AgentProcessIdentity::expected(
-                    pid,
-                    start,
-                    surface.to_string(),
-                    effective_lifecycle.clone(),
-                );
-                validate_agent_process_identity(&expected).map_err(|error| error.to_string())?;
-            }
-            (None, None) => {}
-            _ => return Err("incomplete agent process identity".into()),
-        }
+        let (surface, effective_lifecycle) = self.validate_agent_event_route(terminal, params)?;
         let sequence = params.get("sequence").and_then(Value::as_u64);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1729,6 +1806,18 @@ impl WmctermApplication {
                 .map_err(|error| error.to_string())?;
         }
         if matches!(event, AgentEvent::SessionStart { .. }) {
+            if let AgentEvent::SessionStart {
+                agent,
+                session_id: Some(session_id),
+            } = event
+                && agent.eq_ignore_ascii_case("codex")
+            {
+                clear_codex_subagent_sessions_except(
+                    &mut self.codex_subagents,
+                    surface,
+                    session_id,
+                );
+            }
             return Ok(true);
         }
         let generation = session.lifecycle.generation;
@@ -1790,6 +1879,43 @@ impl WmctermApplication {
             self.sync_surface_agent_request_state(surface);
         }
         Ok(applied)
+    }
+
+    fn validate_agent_event_route(
+        &self,
+        terminal: TerminalId,
+        params: &Value,
+    ) -> Result<(SurfaceId, String), String> {
+        let surface = self
+            .surface_for_terminal(terminal)
+            .ok_or_else(|| "agent target surface no longer exists".to_owned())?;
+        let runtime_lifecycle = &self
+            .terminals
+            .get(&terminal)
+            .ok_or_else(|| "agent target terminal is not running".to_owned())?
+            .lifecycle_id;
+        let effective_lifecycle = effective_agent_lifecycle(
+            runtime_lifecycle,
+            params.get("lifecycle_id").and_then(Value::as_str),
+        )?;
+        match (
+            params.get("agent_pid").and_then(Value::as_u64),
+            params.get("pid_start_time").and_then(Value::as_u64),
+        ) {
+            (Some(pid), Some(start)) => {
+                let pid = u32::try_from(pid).map_err(|_| "invalid agent pid".to_owned())?;
+                let expected = AgentProcessIdentity::expected(
+                    pid,
+                    start,
+                    surface.to_string(),
+                    effective_lifecycle.clone(),
+                );
+                validate_agent_process_identity(&expected).map_err(|error| error.to_string())?;
+            }
+            (None, None) => {}
+            _ => return Err("incomplete agent process identity".into()),
+        }
+        Ok((surface, effective_lifecycle))
     }
 
     fn resolve_agent_session_request(&mut self, request_id: &str) -> Result<(), String> {
@@ -1878,6 +2004,63 @@ impl WmctermApplication {
         Ok(())
     }
 
+    fn validate_codex_session(
+        &self,
+        terminal: TerminalId,
+        session_id: &str,
+    ) -> Result<SurfaceId, String> {
+        let (_, _, surface) = terminal_context_ids(&self.state, terminal)
+            .ok_or_else(|| "Codex hook terminal context not found".to_owned())?;
+        let metadata = self
+            .state
+            .surfaces
+            .get(&surface)
+            .and_then(|surface| surface.agent.as_ref())
+            .ok_or_else(|| "Codex hook surface has no Agent session".to_owned())?;
+        if !metadata.name.eq_ignore_ascii_case("codex") {
+            return Err("Codex hook cannot update a non-Codex surface".into());
+        }
+        if metadata.session_id.as_deref() != Some(session_id) {
+            return Err("Codex hook session does not match its surface".into());
+        }
+        Ok(surface)
+    }
+
+    fn record_codex_subagent_hook(
+        &mut self,
+        terminal: TerminalId,
+        hook: &CodexSubagentHookEvent,
+    ) -> Result<wmcterm_core::AgentState, String> {
+        hook.validate().map_err(|error| error.to_string())?;
+        let surface = self.validate_codex_session(terminal, &hook.session_id)?;
+        apply_codex_subagent_status(&mut self.codex_subagents, surface, hook);
+        let parent = self
+            .state
+            .surfaces
+            .get(&surface)
+            .and_then(|surface| surface.agent.as_ref())
+            .map(|agent| agent.state)
+            .unwrap_or(wmcterm_core::AgentState::Idle);
+        let active = codex_subagent_count(&self.codex_subagents, surface, &hook.session_id) > 0;
+        if let Some(workspace) = self.workspace_for_surface(surface) {
+            self.sync_workspace_agent_status(workspace);
+        }
+        Ok(effective_codex_agent_state(parent, active))
+    }
+
+    fn end_codex_subagent_session(
+        &mut self,
+        terminal: TerminalId,
+        session_id: &str,
+    ) -> Result<(), String> {
+        let surface = self.validate_codex_session(terminal, session_id)?;
+        clear_codex_subagent_session(&mut self.codex_subagents, surface, session_id);
+        if let Some(workspace) = self.workspace_for_surface(surface) {
+            self.sync_workspace_agent_status(workspace);
+        }
+        Ok(())
+    }
+
     fn expire_agent_requests(&mut self) -> bool {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1907,6 +2090,10 @@ impl WmctermApplication {
         let Some(surface) = self.surface_for_terminal(terminal) else {
             return;
         };
+        clear_codex_subagent_surface(&mut self.codex_subagents, surface);
+        if let Some(workspace) = self.workspace_for_surface(surface) {
+            self.sync_workspace_agent_status(workspace);
+        }
         let Some(session) = self.agent_sessions.get(&surface) else {
             return;
         };
@@ -2201,12 +2388,14 @@ impl WmctermApplication {
             }
             return;
         }
-        if self.tab_context_menu.is_some()
+        if self.tab_overflow_menu.is_some()
+            || self.tab_context_menu.is_some()
             || self.workspace_context_menu.is_some()
             || self.sidebar_context_menu.is_some()
             || self.terminal_context_menu.is_some()
             || self.notification_context_menu.is_some()
         {
+            self.tab_overflow_menu = None;
             self.tab_context_menu = None;
             self.workspace_context_menu = None;
             self.sidebar_context_menu = None;
@@ -3302,9 +3491,24 @@ impl WmctermApplication {
                 .iter()
                 .filter_map(|id| self.state.panes.get(id))
                 .flat_map(|pane| pane.surfaces.iter())
-                .filter_map(|surface| self.state.surfaces.get(surface))
-                .filter_map(|surface| surface.agent.as_ref())
-                .map(|agent| agent.state),
+                .filter_map(|surface_id| {
+                    self.state
+                        .surfaces
+                        .get(surface_id)
+                        .and_then(|surface| surface.agent.as_ref())
+                        .map(|agent| (*surface_id, agent))
+                })
+                .map(|(surface, agent)| {
+                    let active_codex_subagent =
+                        agent.session_id.as_deref().is_some_and(|session_id| {
+                            self.codex_subagents.states.iter().any(|(subagent, state)| {
+                                *state == CodexSubagentState::Active
+                                    && subagent.session_id == session_id
+                                    && subagent.surface == surface
+                            })
+                        });
+                    effective_codex_agent_state(agent.state, active_codex_subagent)
+                }),
         )
     }
 
@@ -3824,26 +4028,6 @@ impl WmctermApplication {
         let Some(pane) = self.state.panes.get(&pane) else {
             return Vec::new();
         };
-        let cell_width = self.terminal_font_size.min(12.0) * 0.6;
-        let widths: Vec<_> = pane
-            .surfaces
-            .iter()
-            .enumerate()
-            .map(|(index, surface)| {
-                self.state
-                    .surfaces
-                    .get(surface)
-                    .map(|surface| {
-                        ui::surface_tab_width_at(
-                            &surface.title,
-                            index,
-                            cell_width,
-                            surface.agent.is_some(),
-                        )
-                    })
-                    .unwrap_or(64.0)
-            })
-            .collect();
         ui::surface_tabs_layout(
             ui::Bounds {
                 x: rect.x,
@@ -3851,7 +4035,7 @@ impl WmctermApplication {
                 width: rect.width,
                 height: rect.height,
             },
-            &widths,
+            pane.surfaces.len(),
             pane.active_surface,
         )
     }
@@ -3863,6 +4047,60 @@ impl WmctermApplication {
             width: 28.0_f32.min(rect.width),
             height: 25.0,
         }
+    }
+
+    fn surface_tab_overflow_bounds(&self, pane: PaneId, rect: Rect) -> Option<ui::Bounds> {
+        let total = self.state.panes.get(&pane)?.surfaces.len();
+        let visible = self.surface_tabs_layout(pane, rect).len();
+        ui::surface_tab_overflow_bounds(
+            ui::Bounds {
+                x: rect.x,
+                y: rect.y,
+                width: rect.width,
+                height: rect.height,
+            },
+            visible,
+            total,
+        )
+    }
+
+    fn tab_overflow_lines(&self, pane: PaneId) -> Vec<String> {
+        let Some(pane) = self.state.panes.get(&pane) else {
+            return Vec::new();
+        };
+        pane.surfaces
+            .iter()
+            .enumerate()
+            .map(|(index, surface_id)| {
+                let selected = index == pane.active_surface;
+                let title = self
+                    .state
+                    .surfaces
+                    .get(surface_id)
+                    .map(|surface| ui::surface_tab_title(&surface.title, surface.agent.is_some()))
+                    .unwrap_or_default();
+                format!(
+                    "{}{}  {title}",
+                    if selected { "✓ " } else { "  " },
+                    index + 1
+                )
+            })
+            .collect()
+    }
+
+    fn tab_overflow_layout(
+        &self,
+        menu: TabOverflowMenu,
+        lines: &[String],
+    ) -> ui::TabOverflowMenuLayout {
+        ui::tab_overflow_menu_layout(
+            menu.anchor.0,
+            menu.anchor.1,
+            self.window_size.width as f32,
+            self.window_size.height as f32,
+            lines,
+            menu.scroll_offset,
+        )
     }
 
     fn scroll_sidebar(&mut self, direction: isize) {
@@ -4526,6 +4764,7 @@ impl WmctermApplication {
                 self.agent_sessions.remove(&surface);
                 self.claude_subagents
                     .retain(|_, subagent| subagent.surface != surface);
+                clear_codex_subagent_surface(&mut self.codex_subagents, surface);
             }
             for terminal in terminal_ids {
                 self.terminals.remove(&terminal);
@@ -4833,6 +5072,7 @@ impl WmctermApplication {
         self.agent_sessions.remove(&surface_id);
         self.claude_subagents
             .retain(|_, subagent| subagent.surface != surface_id);
+        clear_codex_subagent_surface(&mut self.codex_subagents, surface_id);
         if let Some(surface) = self.state.surfaces.remove(&surface_id)
             && let SurfaceKind::Terminal(terminal) = surface.kind
         {
@@ -4910,6 +5150,7 @@ impl WmctermApplication {
         self.agent_sessions.remove(&surface_id);
         self.claude_subagents
             .retain(|_, subagent| subagent.surface != surface_id);
+        clear_codex_subagent_surface(&mut self.codex_subagents, surface_id);
         if let Some(surface) = self.state.surfaces.remove(&surface_id)
             && let SurfaceKind::Terminal(terminal) = surface.kind
         {
@@ -5093,6 +5334,7 @@ impl WmctermApplication {
                     self.agent_sessions.remove(&surface_id);
                     self.claude_subagents
                         .retain(|_, subagent| subagent.surface != surface_id);
+                    clear_codex_subagent_surface(&mut self.codex_subagents, surface_id);
                     if let Some(surface) = self.state.surfaces.remove(&surface_id)
                         && let SurfaceKind::Terminal(terminal) = surface.kind
                     {
@@ -5257,6 +5499,31 @@ impl WmctermApplication {
                 .state
                 .execute(AppCommand::Pane(PaneCommand::Focus { id: pane }));
             if y < rect.y + 25.0 {
+                if let Some(overflow) = self.surface_tab_overflow_bounds(pane, rect)
+                    && overflow.contains(x, y)
+                {
+                    self.tab_overflow_menu = Some(TabOverflowMenu {
+                        pane,
+                        anchor: (overflow.x, overflow.y + overflow.height),
+                        scroll_offset: self
+                            .state
+                            .panes
+                            .get(&pane)
+                            .map(|pane| {
+                                ui::tab_overflow_initial_offset(
+                                    pane.surfaces.len(),
+                                    ui::tab_overflow_menu_capacity(
+                                        self.window_size.height as f32,
+                                        pane.surfaces.len(),
+                                    ),
+                                    pane.active_surface,
+                                )
+                            })
+                            .unwrap_or(0),
+                    });
+                    self.rebuild_scene();
+                    return true;
+                }
                 if self.surface_new_tab_bounds(rect).contains(x, y) {
                     self.new_surface_command(None);
                     return true;
@@ -6214,6 +6481,30 @@ impl WmctermApplication {
             self.rebuild_scene();
             return true;
         }
+        if let Some(menu) = self.tab_overflow_menu {
+            let lines = self.tab_overflow_lines(menu.pane);
+            let layout = self.tab_overflow_layout(menu, &lines);
+            let index = ui::menu_row_at(
+                layout.panel,
+                x,
+                y,
+                ui::TAB_OVERFLOW_ROW_HEIGHT,
+                layout.visible.len(),
+            )
+            .and_then(|row| layout.surface_index(row));
+            if let Some(index) = index {
+                if let Some(pane) = self.state.panes.get_mut(&menu.pane) {
+                    pane.active_surface = index;
+                }
+                self.tab_overflow_menu = None;
+                self.resize_terminals();
+                self.rebuild_scene();
+            } else {
+                self.tab_overflow_menu = None;
+                self.rebuild_scene();
+            }
+            return true;
+        }
         if let Some(menu) = self.notification_context_menu {
             let bounds = ui::popup_menu(
                 menu.anchor.0,
@@ -6500,6 +6791,19 @@ impl WmctermApplication {
             let (cancel, confirm) = self.confirmation_buttons();
             return confirmation_hover(cancel, confirm, x, y);
         }
+        if let Some(menu) = self.tab_overflow_menu {
+            let lines = self.tab_overflow_lines(menu.pane);
+            let layout = self.tab_overflow_layout(menu, &lines);
+            let row = ui::menu_row_at(
+                layout.panel,
+                x,
+                y,
+                ui::TAB_OVERFLOW_ROW_HEIGHT,
+                layout.visible.len(),
+            )?;
+            let index = layout.surface_index(row)?;
+            return Some(NavigationHover::ContextAction(index));
+        }
         if let Some(menu) = self.notification_context_menu {
             let panel = ui::popup_menu(
                 menu.anchor.0,
@@ -6653,6 +6957,12 @@ impl WmctermApplication {
         for (pane, rect) in self.pane_rects() {
             if y < rect.y || y >= rect.y + 25.0 || x < rect.x || x >= rect.x + rect.width {
                 continue;
+            }
+            if self
+                .surface_tab_overflow_bounds(pane, rect)
+                .is_some_and(|overflow| overflow.contains(x, y))
+            {
+                return Some(NavigationHover::TabOverflow(pane));
             }
             if self.surface_new_tab_bounds(rect).contains(x, y) {
                 return Some(NavigationHover::TabNew(pane));
@@ -6904,7 +7214,8 @@ impl WmctermApplication {
         if self.close_confirmation.is_some() || self.codex_trust_confirmation.is_some() {
             return true;
         }
-        if self.tab_context_menu.is_some()
+        if self.tab_overflow_menu.is_some()
+            || self.tab_context_menu.is_some()
             || self.workspace_context_menu.is_some()
             || self.sidebar_context_menu.is_some()
             || self.terminal_context_menu.is_some()
@@ -8143,6 +8454,34 @@ impl WmctermApplication {
                 font_size: 16.0,
                 line_height: 20.0,
             });
+            if let Some(overflow) = self.surface_tab_overflow_bounds(pane_id, rect) {
+                let hidden = self
+                    .state
+                    .panes
+                    .get(&pane_id)
+                    .map(|pane| pane.surfaces.len().saturating_sub(tab_layout.len()))
+                    .unwrap_or(0);
+                let hovered = self.navigation_hover == Some(NavigationHover::TabOverflow(pane_id));
+                rectangles.push(RectBlock {
+                    left: overflow.x + 2.0,
+                    top: overflow.y + 2.0,
+                    width: overflow.width - 4.0,
+                    height: overflow.height - 4.0,
+                    color: if hovered { theme_hover } else { theme_mantle },
+                });
+                let label = format!("⋯{hidden}");
+                blocks.push(TextBlock {
+                    text: label.clone(),
+                    spans: vec![],
+                    left: ui::centered_text_left(overflow, &label, 12.0),
+                    top: overflow.y + 4.0,
+                    width: overflow.width,
+                    height: overflow.height - 4.0,
+                    color: if hovered { theme_text } else { theme_subtext },
+                    font_size: 12.0,
+                    line_height: 18.0,
+                });
+            }
             let Some(surface) = surface else {
                 let button = empty_pane_button(rect);
                 let hovered = self.navigation_hover == Some(NavigationHover::EmptyPaneNew(pane_id));
@@ -9834,6 +10173,37 @@ impl WmctermApplication {
                 line_height: 19.0,
             });
         }
+        if let Some(menu) = self.tab_overflow_menu
+            && let Some(pane) = self.state.panes.get(&menu.pane)
+        {
+            let lines = self.tab_overflow_lines(menu.pane);
+            let layout = self.tab_overflow_layout(menu, &lines);
+            let panel = layout.panel;
+            overlay_rectangles.extend(context_menu_frame(panel, theme_surface, theme_border));
+            for (row, index) in layout.visible.clone().enumerate() {
+                let selected = index == pane.active_surface;
+                if self.navigation_hover == Some(NavigationHover::ContextAction(index)) {
+                    overlay_rectangles.push(RectBlock {
+                        left: panel.x + 3.0,
+                        top: panel.y + row as f32 * ui::TAB_OVERFLOW_ROW_HEIGHT + 2.0,
+                        width: panel.width - 6.0,
+                        height: 26.0,
+                        color: theme_hover,
+                    });
+                }
+                overlay_blocks.push(TextBlock {
+                    text: layout.line(&lines, index),
+                    spans: vec![],
+                    left: panel.x + 14.0,
+                    top: panel.y + row as f32 * ui::TAB_OVERFLOW_ROW_HEIGHT + 5.0,
+                    width: panel.width - 28.0,
+                    height: 25.0,
+                    color: if selected { theme_blue } else { theme_text },
+                    font_size: 15.0,
+                    line_height: 21.0,
+                });
+            }
+        }
         if let Some(menu) = self.notification_context_menu {
             let panel = ui::popup_menu(
                 menu.anchor.0,
@@ -10988,19 +11358,64 @@ impl WmctermApplication {
                     .map(serde_json::from_value::<ClaudeHookEvent>)
                     .transpose()
                     .map_err(|error| error.to_string())?;
+                let codex_hook = request
+                    .params
+                    .get("codex_hook")
+                    .cloned()
+                    .map(serde_json::from_value::<CodexSubagentHookEvent>)
+                    .transpose()
+                    .map_err(|error| error.to_string())?;
+                let codex_session_end = request
+                    .params
+                    .get("codex_session_end")
+                    .map(|value| {
+                        value
+                            .as_str()
+                            .filter(|session| !session.trim().is_empty())
+                            .map(str::to_owned)
+                            .ok_or_else(|| "invalid codex_session_end".to_owned())
+                    })
+                    .transpose()?;
                 serde_json::from_value::<AgentEvent>(request.params.clone())
                     .map_err(|e| e.to_string())
                     .and_then(|event| {
-                    let terminal = self.terminal_for_params(&request.params)?;
+                    let terminal = if codex_hook.is_some() || codex_session_end.is_some() {
+                        let (terminal, _) = self.codex_agent_update_route(&request.params)?;
+                        self.validate_agent_event_route(terminal, &request.params)?;
+                        terminal
+                    } else {
+                        self.terminal_for_params(&request.params)?
+                    };
+                    if let Some(hook) = codex_hook.as_ref() {
+                        let state = self.record_codex_subagent_hook(terminal, hook)?;
+                        self.rebuild_scene();
+                        return Ok(json!({
+                            "state": state,
+                            "codex_subagents": self.codex_subagents.len()
+                        }));
+                    }
+                    if let Some(session_id) = codex_session_end.as_deref() {
+                        self.validate_codex_session(terminal, session_id)?;
+                    }
                     if !self.record_agent_event(terminal, &request.params, &event)? {
+                        if let Some(session_id) = codex_session_end.as_deref() {
+                            self.end_codex_subagent_session(terminal, session_id)?;
+                        }
                         return Ok(json!({"ignored": true}));
                     }
                     let state = self.apply_agent_event(terminal, event);
                     if let Some(hook) = claude_hook.as_ref() {
                         self.record_claude_hook(terminal, hook)?;
                     }
+                    if let Some(session_id) = codex_session_end.as_deref() {
+                        self.end_codex_subagent_session(terminal, session_id)?;
+                    }
                     self.rebuild_scene();
-                    Ok(json!({"state": state, "claude_subagents": self.claude_subagents.len()}))
+                    Ok(json!({
+                        "state": state,
+                        "claude_subagents": self.claude_subagents.len(),
+                        "codex_subagents": self.codex_subagents.len()
+                    }))
                 })
             }
             "pane.focus" => request
@@ -11333,6 +11748,29 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                         cell_height,
                     ),
                 };
+                if let Some(menu) = self.tab_overflow_menu {
+                    let menu_lines = self.tab_overflow_lines(menu.pane);
+                    let layout = self.tab_overflow_layout(menu, &menu_lines);
+                    if layout
+                        .panel
+                        .contains(self.cursor_position.0, self.cursor_position.1)
+                    {
+                        if lines != 0 {
+                            let capacity = layout.visible.len();
+                            if let Some(open_menu) = &mut self.tab_overflow_menu {
+                                open_menu.scroll_offset = ui::tab_overflow_scroll_offset(
+                                    menu_lines.len(),
+                                    capacity,
+                                    open_menu.scroll_offset,
+                                    lines,
+                                );
+                            }
+                            self.navigation_hover = self.navigation_hover_at_cursor();
+                            self.rebuild_scene();
+                        }
+                        return;
+                    }
+                }
                 if self.agent_request_detail.is_some() {
                     if lines != 0 {
                         self.scroll_agent_request_detail(lines);
@@ -13830,6 +14268,115 @@ fn apply_claude_subagent_status(
     }
 }
 
+fn apply_codex_subagent_status(
+    statuses: &mut CodexSubagentTracker,
+    surface: SurfaceId,
+    hook: &CodexSubagentHookEvent,
+) {
+    let key = CodexSubagentKey {
+        surface,
+        session_id: hook.session_id.clone(),
+        agent_id: hook.agent_id.clone(),
+    };
+    match hook.kind {
+        CodexSubagentHookKind::Start => {
+            // A recent Stop wins over a delayed Start for the same stable key. Stopped entries
+            // are bounded per session below, so an event older than that replay horizon can be
+            // accepted again after its tombstone is evicted. Active entries are never evicted.
+            statuses
+                .states
+                .entry(key)
+                .or_insert(CodexSubagentState::Active);
+        }
+        CodexSubagentHookKind::Stop => {
+            statuses.states.insert(key, CodexSubagentState::Stopped);
+            let session = (surface, hook.session_id.clone());
+            let stopped = statuses.stopped_order.entry(session).or_default();
+            stopped.retain(|agent_id| agent_id != &hook.agent_id);
+            stopped.push_back(hook.agent_id.clone());
+            while stopped.len() > MAX_CODEX_STOPPED_TOMBSTONES_PER_SESSION {
+                let Some(agent_id) = stopped.pop_front() else {
+                    break;
+                };
+                let expired = CodexSubagentKey {
+                    surface,
+                    session_id: hook.session_id.clone(),
+                    agent_id,
+                };
+                if statuses.states.get(&expired) == Some(&CodexSubagentState::Stopped) {
+                    statuses.states.remove(&expired);
+                }
+            }
+        }
+    }
+}
+
+fn clear_codex_subagent_session(
+    statuses: &mut CodexSubagentTracker,
+    surface: SurfaceId,
+    session_id: &str,
+) {
+    statuses
+        .states
+        .retain(|subagent, _| subagent.surface != surface || subagent.session_id != session_id);
+    statuses
+        .stopped_order
+        .remove(&(surface, session_id.to_owned()));
+}
+
+fn clear_codex_subagent_sessions_except(
+    statuses: &mut CodexSubagentTracker,
+    surface: SurfaceId,
+    current_session_id: &str,
+) {
+    statuses.states.retain(|subagent, _| {
+        subagent.surface != surface || subagent.session_id == current_session_id
+    });
+    statuses
+        .stopped_order
+        .retain(|(stopped_surface, session_id), _| {
+            *stopped_surface != surface || session_id == current_session_id
+        });
+}
+
+fn clear_codex_subagent_surface(statuses: &mut CodexSubagentTracker, surface: SurfaceId) {
+    statuses
+        .states
+        .retain(|subagent, _| subagent.surface != surface);
+    statuses
+        .stopped_order
+        .retain(|(stopped_surface, _), _| *stopped_surface != surface);
+}
+
+fn codex_subagent_count(
+    statuses: &CodexSubagentTracker,
+    surface: SurfaceId,
+    session_id: &str,
+) -> usize {
+    statuses
+        .states
+        .iter()
+        .filter(|(subagent, state)| {
+            **state == CodexSubagentState::Active
+                && subagent.surface == surface
+                && subagent.session_id == session_id
+        })
+        .count()
+}
+
+fn effective_codex_agent_state(
+    parent: wmcterm_core::AgentState,
+    has_active_subagent: bool,
+) -> wmcterm_core::AgentState {
+    if has_active_subagent
+        && agent_state_priority(parent) < agent_state_priority(wmcterm_core::AgentState::Running)
+    {
+        wmcterm_core::AgentState::Running
+    } else {
+        parent
+    }
+}
+
 fn agent_approval_mode(action: AgentApprovalAction) -> &'static str {
     match action {
         AgentApprovalAction::Deny => "deny",
@@ -15155,6 +15702,243 @@ mod tests {
     }
 
     #[test]
+    fn codex_subagents_keep_parent_running_until_the_last_matching_stop() {
+        let surface = SurfaceId::new_v4();
+        let hook = |kind: &str, agent: &str| {
+            wmcterm_agent::normalize_codex_subagent_hook_event(
+                Some(kind),
+                &json!({
+                    "hook_event_name": kind,
+                    "session_id": "session-one",
+                    "turn_id": "turn-one",
+                    "agent_id": agent,
+                    "agent_type": "worker"
+                }),
+            )
+            .unwrap()
+        };
+        let mut statuses = CodexSubagentTracker::default();
+        apply_codex_subagent_status(&mut statuses, surface, &hook("SubagentStart", "one"));
+        apply_codex_subagent_status(&mut statuses, surface, &hook("SubagentStart", "two"));
+        assert_eq!(codex_subagent_count(&statuses, surface, "session-one"), 2);
+        assert_eq!(
+            effective_codex_agent_state(AgentState::Completed, true),
+            AgentState::Running
+        );
+
+        apply_codex_subagent_status(&mut statuses, surface, &hook("SubagentStop", "one"));
+        assert_eq!(codex_subagent_count(&statuses, surface, "session-one"), 1);
+        assert_eq!(
+            effective_codex_agent_state(AgentState::Completed, true),
+            AgentState::Running
+        );
+
+        apply_codex_subagent_status(&mut statuses, surface, &hook("SubagentStop", "two"));
+        assert_eq!(codex_subagent_count(&statuses, surface, "session-one"), 0);
+        assert_eq!(
+            effective_codex_agent_state(AgentState::Completed, false),
+            AgentState::Completed
+        );
+    }
+
+    #[test]
+    fn codex_subagent_stop_is_idempotent_and_scoped_by_surface_and_session() {
+        let surface = SurfaceId::new_v4();
+        let other_surface = SurfaceId::new_v4();
+        let hook = |kind: &str, session: &str| {
+            wmcterm_agent::normalize_codex_subagent_hook_event(
+                Some(kind),
+                &json!({
+                    "hook_event_name": kind,
+                    "session_id": session,
+                    "turn_id": "turn-one",
+                    "agent_id": "shared-agent",
+                    "agent_type": "worker"
+                }),
+            )
+            .unwrap()
+        };
+        let mut statuses = CodexSubagentTracker::default();
+        apply_codex_subagent_status(
+            &mut statuses,
+            surface,
+            &hook("SubagentStart", "session-one"),
+        );
+        apply_codex_subagent_status(
+            &mut statuses,
+            surface,
+            &hook("SubagentStart", "session-two"),
+        );
+        apply_codex_subagent_status(
+            &mut statuses,
+            other_surface,
+            &hook("SubagentStart", "session-one"),
+        );
+        assert_eq!(statuses.len(), 3);
+
+        apply_codex_subagent_status(
+            &mut statuses,
+            surface,
+            &hook("SubagentStop", "unknown-session"),
+        );
+        apply_codex_subagent_status(&mut statuses, surface, &hook("SubagentStop", "session-one"));
+        apply_codex_subagent_status(&mut statuses, surface, &hook("SubagentStop", "session-one"));
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(codex_subagent_count(&statuses, surface, "session-two"), 1);
+        assert_eq!(
+            codex_subagent_count(&statuses, other_surface, "session-one"),
+            1
+        );
+    }
+
+    #[test]
+    fn codex_subagent_stop_tombstone_rejects_a_late_start_for_the_same_key() {
+        let surface = SurfaceId::new_v4();
+        let hook = |kind: &str, session: &str| {
+            wmcterm_agent::normalize_codex_subagent_hook_event(
+                Some(kind),
+                &json!({
+                    "hook_event_name": kind,
+                    "session_id": session,
+                    "turn_id": "turn-one",
+                    "agent_id": "agent-one",
+                    "agent_type": "worker"
+                }),
+            )
+            .unwrap()
+        };
+        let mut statuses = CodexSubagentTracker::default();
+
+        apply_codex_subagent_status(&mut statuses, surface, &hook("SubagentStop", "session-one"));
+        apply_codex_subagent_status(
+            &mut statuses,
+            surface,
+            &hook("SubagentStart", "session-one"),
+        );
+        assert_eq!(codex_subagent_count(&statuses, surface, "session-one"), 0);
+
+        apply_codex_subagent_status(
+            &mut statuses,
+            surface,
+            &hook("SubagentStart", "session-two"),
+        );
+        assert_eq!(codex_subagent_count(&statuses, surface, "session-two"), 1);
+        assert_eq!(statuses.retained_len(), 2);
+
+        clear_codex_subagent_session(&mut statuses, surface, "session-one");
+        assert_eq!(statuses.retained_len(), 1);
+        clear_codex_subagent_surface(&mut statuses, surface);
+        assert_eq!(statuses.retained_len(), 0);
+        assert!(statuses.stopped_order.is_empty());
+    }
+
+    #[test]
+    fn codex_subagent_tombstones_are_bounded_per_session_without_evicting_active_agents() {
+        let surface = SurfaceId::new_v4();
+        let hook = |kind: &str, agent: &str| {
+            wmcterm_agent::normalize_codex_subagent_hook_event(
+                Some(kind),
+                &json!({
+                    "hook_event_name": kind,
+                    "session_id": "long-session",
+                    "turn_id": "turn-one",
+                    "agent_id": agent,
+                    "agent_type": "worker"
+                }),
+            )
+            .unwrap()
+        };
+        let mut statuses = CodexSubagentTracker::default();
+        apply_codex_subagent_status(
+            &mut statuses,
+            surface,
+            &hook("SubagentStart", "active-agent"),
+        );
+        for index in 0..=MAX_CODEX_STOPPED_TOMBSTONES_PER_SESSION {
+            apply_codex_subagent_status(
+                &mut statuses,
+                surface,
+                &hook("SubagentStop", &format!("stopped-{index}")),
+            );
+        }
+
+        assert_eq!(
+            statuses.retained_len(),
+            MAX_CODEX_STOPPED_TOMBSTONES_PER_SESSION + 1
+        );
+        assert_eq!(codex_subagent_count(&statuses, surface, "long-session"), 1);
+
+        apply_codex_subagent_status(
+            &mut statuses,
+            surface,
+            &hook(
+                "SubagentStart",
+                &format!("stopped-{MAX_CODEX_STOPPED_TOMBSTONES_PER_SESSION}"),
+            ),
+        );
+        assert_eq!(
+            codex_subagent_count(&statuses, surface, "long-session"),
+            1,
+            "a recent stopped key must remain fail-closed"
+        );
+
+        apply_codex_subagent_status(&mut statuses, surface, &hook("SubagentStart", "stopped-0"));
+        assert_eq!(
+            codex_subagent_count(&statuses, surface, "long-session"),
+            2,
+            "the bounded replay horizon permits the oldest evicted key"
+        );
+    }
+
+    #[test]
+    fn codex_subagent_cleanup_is_scoped_to_session_or_surface() {
+        let surface = SurfaceId::new_v4();
+        let other_surface = SurfaceId::new_v4();
+        let start = |session: &str, agent: &str| {
+            wmcterm_agent::normalize_codex_subagent_hook_event(
+                Some("SubagentStart"),
+                &json!({
+                    "hook_event_name": "SubagentStart",
+                    "session_id": session,
+                    "turn_id": "turn-one",
+                    "agent_id": agent,
+                    "agent_type": "worker"
+                }),
+            )
+            .unwrap()
+        };
+        let mut statuses = CodexSubagentTracker::default();
+        apply_codex_subagent_status(&mut statuses, surface, &start("one", "a"));
+        apply_codex_subagent_status(&mut statuses, surface, &start("two", "b"));
+        apply_codex_subagent_status(&mut statuses, other_surface, &start("one", "c"));
+
+        clear_codex_subagent_session(&mut statuses, surface, "one");
+        assert_eq!(statuses.len(), 2);
+        assert_eq!(codex_subagent_count(&statuses, surface, "two"), 1);
+        assert_eq!(codex_subagent_count(&statuses, other_surface, "one"), 1);
+
+        clear_codex_subagent_surface(&mut statuses, surface);
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(codex_subagent_count(&statuses, other_surface, "one"), 1);
+    }
+
+    #[test]
+    fn codex_activity_does_not_override_needs_input_or_error() {
+        assert_eq!(
+            effective_codex_agent_state(AgentState::WaitingForInput, true),
+            AgentState::WaitingForInput
+        );
+        assert_eq!(
+            effective_codex_agent_state(AgentState::WaitingForPermission, true),
+            AgentState::WaitingForPermission
+        );
+        assert_eq!(
+            effective_codex_agent_state(AgentState::Error, true),
+            AgentState::Error
+        );
+    }
+
+    #[test]
     fn physical_letters_recover_control_keys_from_linux_input() {
         assert_eq!(
             physical_ascii_character(PhysicalKey::Code(KeyCode::KeyC)),
@@ -16210,6 +16994,255 @@ mod tests {
         );
         assert!(explicit_terminal_target(&Value::Null).is_err());
         assert!(explicit_terminal_target(&json!({"surface": "not-a-uuid"})).is_err());
+    }
+
+    #[test]
+    fn codex_agent_update_rpc_is_strict_and_new_session_reclaims_old_subagents() {
+        let mut builder = EventLoop::<UserEvent>::with_user_event();
+        #[cfg(target_os = "linux")]
+        {
+            use winit::platform::x11::EventLoopBuilderExtX11;
+            builder.with_any_thread(true);
+        }
+        #[cfg(windows)]
+        {
+            use winit::platform::windows::EventLoopBuilderExtWindows;
+            builder.with_any_thread(true);
+        }
+        let event_loop = builder.build().unwrap();
+        let state = AppState::new("rpc-test", env::current_dir().unwrap());
+        let surface = *state.surfaces.keys().next().unwrap();
+        let terminal = match state.surfaces[&surface].kind {
+            SurfaceKind::Terminal(terminal) => terminal,
+            _ => panic!("test state must start with a terminal"),
+        };
+        let mut commands = HashMap::new();
+        commands.insert(terminal, "exit".into());
+        let mut app = WmctermApplication::new_configured(
+            event_loop.create_proxy(),
+            Config::default(),
+            Some(state),
+            commands,
+            HashMap::new(),
+            None,
+            HashMap::new(),
+            false,
+        )
+        .unwrap();
+        let lifecycle = app.terminals[&terminal].lifecycle_id.clone();
+        app.state.surfaces.get_mut(&surface).unwrap().agent = Some(wmcterm_core::AgentMetadata {
+            name: "codex".into(),
+            state: AgentState::Running,
+            session_id: Some("session-one".into()),
+        });
+        let hook = wmcterm_agent::normalize_codex_subagent_hook_event(
+            Some("SubagentStart"),
+            &json!({
+                "hook_event_name": "SubagentStart",
+                "session_id": "session-one",
+                "turn_id": "turn-one",
+                "agent_id": "agent-one",
+                "agent_type": "worker"
+            }),
+        )
+        .unwrap();
+        let base = || {
+            let mut params = serde_json::to_value(hook.to_agent_event()).unwrap();
+            let object = params.as_object_mut().unwrap();
+            object.insert("terminal".into(), terminal.to_string().into());
+            object.insert("surface".into(), surface.to_string().into());
+            object.insert("surface_id".into(), surface.to_string().into());
+            object.insert("lifecycle_id".into(), lifecycle.clone().into());
+            object.insert("codex_hook".into(), serde_json::to_value(&hook).unwrap());
+            params
+        };
+        let call = |app: &mut WmctermApplication, params| {
+            app.handle_rpc(Request {
+                id: uuid::Uuid::new_v4().to_string(),
+                method: "agent.update".into(),
+                params,
+            })
+        };
+        let error = |response: Response| response.error.unwrap().message;
+
+        let mut missing_surface = base();
+        missing_surface.as_object_mut().unwrap().remove("surface");
+        missing_surface
+            .as_object_mut()
+            .unwrap()
+            .remove("surface_id");
+        assert!(error(call(&mut app, missing_surface)).contains("surface"));
+
+        let mut missing_lifecycle = base();
+        missing_lifecycle
+            .as_object_mut()
+            .unwrap()
+            .remove("lifecycle_id");
+        assert!(error(call(&mut app, missing_lifecycle)).contains("lifecycle"));
+
+        let mut wrong_surface = base();
+        wrong_surface
+            .as_object_mut()
+            .unwrap()
+            .insert("surface_id".into(), SurfaceId::new_v4().to_string().into());
+        assert!(error(call(&mut app, wrong_surface)).contains("surface"));
+
+        let mut wrong_lifecycle = base();
+        wrong_lifecycle
+            .as_object_mut()
+            .unwrap()
+            .insert("lifecycle_id".into(), "stale".into());
+        assert!(error(call(&mut app, wrong_lifecycle)).contains("lifecycle"));
+
+        app.state.surfaces.get_mut(&surface).unwrap().agent = Some(wmcterm_core::AgentMetadata {
+            name: "claude".into(),
+            state: AgentState::Running,
+            session_id: Some("session-one".into()),
+        });
+        assert!(error(call(&mut app, base())).contains("non-Codex"));
+
+        app.state.surfaces.get_mut(&surface).unwrap().agent = Some(wmcterm_core::AgentMetadata {
+            name: "codex".into(),
+            state: AgentState::Running,
+            session_id: Some("other-session".into()),
+        });
+        assert!(error(call(&mut app, base())).contains("session"));
+
+        app.state.surfaces.get_mut(&surface).unwrap().agent = Some(wmcterm_core::AgentMetadata {
+            name: "codex".into(),
+            state: AgentState::Running,
+            session_id: Some("session-one".into()),
+        });
+        for field in ["turn_id", "agent_id", "agent_type", "session_id"] {
+            let mut params = base();
+            params["codex_hook"][field] = " \t ".into();
+            let response = call(&mut app, params);
+            let message = response
+                .error
+                .unwrap_or_else(|| panic!("blank Codex hook {field} was accepted"))
+                .message;
+            assert!(message.contains(field), "unexpected error: {message}");
+        }
+        let accepted = call(&mut app, base());
+        assert!(accepted.error.is_none(), "{:?}", accepted.error);
+        assert_eq!(accepted.result.unwrap()["codex_subagents"], 1);
+
+        let session_end = |session_id: &str| {
+            let mut params = serde_json::to_value(AgentEvent::Stop {
+                success: true,
+                message: None,
+            })
+            .unwrap();
+            let object = params.as_object_mut().unwrap();
+            object.insert("terminal".into(), terminal.to_string().into());
+            object.insert("surface".into(), surface.to_string().into());
+            object.insert("surface_id".into(), surface.to_string().into());
+            object.insert("lifecycle_id".into(), lifecycle.clone().into());
+            object.insert("codex_session_end".into(), session_id.into());
+            params
+        };
+        let mut session_end_without_surface = session_end("session-one");
+        session_end_without_surface
+            .as_object_mut()
+            .unwrap()
+            .remove("surface_id");
+        assert!(error(call(&mut app, session_end_without_surface)).contains("surface"));
+        let mut session_end_without_lifecycle = session_end("session-one");
+        session_end_without_lifecycle
+            .as_object_mut()
+            .unwrap()
+            .remove("lifecycle_id");
+        assert!(error(call(&mut app, session_end_without_lifecycle)).contains("lifecycle"));
+
+        let tracked_hook = |kind: &str, session_id: &str, agent_id: &str| {
+            wmcterm_agent::normalize_codex_subagent_hook_event(
+                Some(kind),
+                &json!({
+                    "hook_event_name": kind,
+                    "session_id": session_id,
+                    "turn_id": "turn-two",
+                    "agent_id": agent_id,
+                    "agent_type": "worker"
+                }),
+            )
+            .unwrap()
+        };
+        apply_codex_subagent_status(
+            &mut app.codex_subagents,
+            surface,
+            &tracked_hook("SubagentStop", "session-one", "old-stopped"),
+        );
+        apply_codex_subagent_status(
+            &mut app.codex_subagents,
+            surface,
+            &tracked_hook("SubagentStart", "session-two", "new-active"),
+        );
+        let other_surface = SurfaceId::new_v4();
+        apply_codex_subagent_status(
+            &mut app.codex_subagents,
+            other_surface,
+            &tracked_hook("SubagentStart", "session-one", "other-active"),
+        );
+        apply_codex_subagent_status(
+            &mut app.codex_subagents,
+            other_surface,
+            &tracked_hook("SubagentStop", "session-one", "other-stopped"),
+        );
+
+        let mut new_session = serde_json::to_value(AgentEvent::SessionStart {
+            agent: "codex".into(),
+            session_id: Some("session-two".into()),
+        })
+        .unwrap();
+        let object = new_session.as_object_mut().unwrap();
+        object.insert("terminal".into(), terminal.to_string().into());
+        object.insert("surface".into(), surface.to_string().into());
+        object.insert("surface_id".into(), surface.to_string().into());
+        object.insert("lifecycle_id".into(), lifecycle.clone().into());
+        let accepted_start = call(&mut app, new_session);
+        assert!(accepted_start.error.is_none(), "{:?}", accepted_start.error);
+        assert!(
+            !app.codex_subagents.states.keys().any(|subagent| {
+                subagent.surface == surface && subagent.session_id == "session-one"
+            }),
+            "a routed new Codex SessionStart must clear the old session without SessionEnd"
+        );
+        assert!(
+            !app.codex_subagents
+                .stopped_order
+                .contains_key(&(surface, "session-one".into()))
+        );
+        assert_eq!(
+            codex_subagent_count(&app.codex_subagents, surface, "session-two"),
+            1,
+            "the new session must not clear its own status"
+        );
+        assert_eq!(
+            codex_subagent_count(&app.codex_subagents, other_surface, "session-one"),
+            1,
+            "new SessionStart must not clear another surface"
+        );
+        assert!(app.codex_subagents.states.iter().any(|(subagent, state)| {
+            subagent.surface == other_surface
+                && subagent.agent_id == "other-stopped"
+                && *state == CodexSubagentState::Stopped
+        }));
+        assert!(
+            app.codex_subagents
+                .stopped_order
+                .contains_key(&(other_surface, "session-one".into()))
+        );
+
+        let accepted_end = call(&mut app, session_end("session-two"));
+        assert!(accepted_end.error.is_none(), "{:?}", accepted_end.error);
+        assert_eq!(
+            codex_subagent_count(&app.codex_subagents, surface, "session-two"),
+            0
+        );
+        assert_eq!(
+            codex_subagent_count(&app.codex_subagents, other_surface, "session-one"),
+            1
+        );
     }
 
     #[test]

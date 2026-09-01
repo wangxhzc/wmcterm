@@ -52,6 +52,13 @@ from the currently focused UI item: the user may be viewing another workspace.
   once, but must never be converted into a persistent or session-wide grant.
 - A Codex `Interrupt` hook ends the active turn without ending the live Codex
   session. Do not close its pane, surface, or PTY in response to that event.
+- Codex `SubagentStart` and `SubagentStop` hooks keep the parent workspace
+  running while any subagent remains active. Stops retain a bounded per-session
+  tombstone so a recent out-of-order start cannot reactivate the same agent.
+  Normal execution and upgrades do not change Codex configuration. Only an
+  explicit `wmcterm hook install --agent codex --scope user` writes under
+  `~/.codex`; use `--scope project` for project configuration, and have the user
+  review installed changes in Codex `/hooks`.
 
 ## Launch Claude safely
 

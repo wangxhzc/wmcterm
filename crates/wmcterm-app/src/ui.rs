@@ -380,6 +380,89 @@ pub(crate) fn menu_row_at(
     fixed_row_at(y, menu.y, row_height, rows)
 }
 
+pub(crate) const TAB_OVERFLOW_ROW_HEIGHT: f32 = 30.0;
+const TAB_OVERFLOW_COLUMN_WIDTH: f32 = 9.0;
+const TAB_OVERFLOW_HORIZONTAL_PADDING: f32 = 28.0;
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TabOverflowMenuLayout {
+    pub(crate) panel: Bounds,
+    pub(crate) visible: Range<usize>,
+    pub(crate) text_columns: usize,
+}
+
+impl TabOverflowMenuLayout {
+    pub(crate) fn surface_index(&self, visible_row: usize) -> Option<usize> {
+        (visible_row < self.visible.len()).then_some(self.visible.start + visible_row)
+    }
+
+    pub(crate) fn line(&self, lines: &[String], surface_index: usize) -> String {
+        lines
+            .get(surface_index)
+            .map(|line| truncate_display_width(line, self.text_columns))
+            .unwrap_or_default()
+    }
+}
+
+pub(crate) fn tab_overflow_menu_capacity(window_height: f32, count: usize) -> usize {
+    let available_height = (window_height - 16.0).max(1.0);
+    ((available_height / TAB_OVERFLOW_ROW_HEIGHT).floor() as usize)
+        .max(1)
+        .min(count)
+}
+
+pub(crate) fn tab_overflow_initial_offset(count: usize, capacity: usize, active: usize) -> usize {
+    if count == 0 || capacity == 0 || active < capacity {
+        0
+    } else {
+        active.min(count - 1) + 1 - capacity.min(count)
+    }
+}
+
+pub(crate) fn tab_overflow_scroll_offset(
+    count: usize,
+    capacity: usize,
+    offset: usize,
+    delta: isize,
+) -> usize {
+    let max_offset = count.saturating_sub(capacity.min(count));
+    offset.saturating_add_signed(delta).min(max_offset)
+}
+
+pub(crate) fn tab_overflow_menu_layout(
+    anchor_x: f32,
+    anchor_y: f32,
+    window_width: f32,
+    window_height: f32,
+    lines: &[String],
+    offset: usize,
+) -> TabOverflowMenuLayout {
+    let capacity = tab_overflow_menu_capacity(window_height, lines.len());
+    let visible = scrolled_range(lines.len(), offset, capacity);
+    let preferred_width = lines
+        .iter()
+        .map(|line| UnicodeWidthStr::width(line.as_str()) as f32 * TAB_OVERFLOW_COLUMN_WIDTH)
+        .fold(120.0, f32::max)
+        + TAB_OVERFLOW_HORIZONTAL_PADDING;
+    let panel = popup_menu(
+        anchor_x,
+        anchor_y,
+        window_width,
+        window_height,
+        preferred_width,
+        TAB_OVERFLOW_ROW_HEIGHT,
+        visible.len(),
+    );
+    let text_columns = ((panel.width - TAB_OVERFLOW_HORIZONTAL_PADDING).max(0.0)
+        / TAB_OVERFLOW_COLUMN_WIDTH)
+        .floor() as usize;
+    TabOverflowMenuLayout {
+        panel,
+        visible,
+        text_columns,
+    }
+}
+
 pub(crate) fn truncate(text: &str, max_chars: usize) -> String {
     if text.chars().count() <= max_chars {
         return text.to_owned();
@@ -505,11 +588,10 @@ fn surface_tab_label(title: &str, index: usize, agent: bool) -> String {
 /// do not resize the tab or displace the stable title.
 pub(crate) fn surface_tab_title(title: &str, agent: bool) -> String {
     let (spinner, stable) = split_agent_spinner(title);
-    let stable = truncate_display_width(stable, 14);
     if agent || spinner.is_some() {
         format!("{} {}", spinner.unwrap_or(' '), stable)
     } else {
-        stable
+        stable.to_owned()
     }
 }
 
@@ -552,7 +634,8 @@ const SURFACE_TAB_NUMBER_CLOSE_GAP: f32 = 4.0;
 const SURFACE_TAB_NUMBER_SLACK: f32 = 4.0;
 const SURFACE_TAB_MAX_CLOSE_WIDTH: f32 = 24.0;
 
-pub(crate) fn surface_tab_width_at(title: &str, index: usize, cell_width: f32, agent: bool) -> f32 {
+#[cfg(test)]
+fn surface_tab_width_at(title: &str, index: usize, cell_width: f32, agent: bool) -> f32 {
     let title_columns = display_width(&surface_tab_title(title, agent)) as f32;
     let number_columns = display_width(&(index + 1).to_string()) as f32;
     (SURFACE_TAB_LEFT_INSET
@@ -689,41 +772,54 @@ pub(crate) struct SurfaceTab {
     pub close: Option<Bounds>,
 }
 
-/// Fit a contiguous window of tabs in the pane header while always retaining
-/// the active tab. Tabs before the active one are discarded first as space
-/// becomes constrained. Every surface has a close target so a pane can remain
-/// intentionally empty.
-pub(crate) fn surface_tabs_layout(pane: Bounds, widths: &[f32], active: usize) -> Vec<SurfaceTab> {
-    if widths.is_empty() || pane.width <= 32.0 {
+pub(crate) const SURFACE_TAB_OVERFLOW_WIDTH: f32 = 44.0;
+
+pub(crate) fn surface_tab_overflow_bounds(
+    pane: Bounds,
+    visible_tabs: usize,
+    total_tabs: usize,
+) -> Option<Bounds> {
+    if total_tabs <= visible_tabs {
+        return None;
+    }
+    let width = SURFACE_TAB_OVERFLOW_WIDTH.min((pane.width - 28.0).max(1.0));
+    Some(Bounds {
+        x: (pane.x + pane.width - 28.0 - width).max(pane.x),
+        y: pane.y,
+        width,
+        height: 25.0,
+    })
+}
+
+/// Give visible tabs equal, comfortable widths while retaining the active tab.
+/// Constrained panes show a stable page of tabs and reserve an overflow target;
+/// every visible surface keeps a close target so a pane may remain empty.
+pub(crate) fn surface_tabs_layout(
+    pane: Bounds,
+    tab_count: usize,
+    active: usize,
+) -> Vec<SurfaceTab> {
+    if tab_count == 0 || pane.width <= 32.0 {
         return Vec::new();
     }
-    let active = active.min(widths.len() - 1);
+    let active = active.min(tab_count - 1);
     let left = pane.x;
-    let available = (pane.width - 28.0).max(1.0);
-    let effective = |index: usize| widths[index].min(available);
-    let mut start = active;
-    let mut used = effective(active);
-    while start > 0 {
-        let candidate = effective(start - 1);
-        if used + candidate > available {
-            break;
-        }
-        start -= 1;
-        used += candidate;
-    }
-    let mut end = active + 1;
-    while end < widths.len() {
-        let candidate = effective(end);
-        if used + candidate > available {
-            break;
-        }
-        used += candidate;
-        end += 1;
-    }
+    let full_available = (pane.width - 28.0).max(1.0);
+    let unconstrained_count = (full_available / 80.0).floor().max(1.0) as usize;
+    let overflow_width = if tab_count > unconstrained_count {
+        SURFACE_TAB_OVERFLOW_WIDTH.min(full_available)
+    } else {
+        0.0
+    };
+    let available = (full_available - overflow_width).max(1.0);
+    let minimum_width = 80.0_f32.min(available);
+    let visible_count = ((available / minimum_width).floor() as usize).clamp(1, tab_count);
+    let start = active / visible_count * visible_count;
+    let end = (start + visible_count).min(tab_count);
+    let width = (available / (end - start) as f32).min(240.0);
     let mut x = left;
     (start..end)
         .map(|index| {
-            let width = effective(index);
             let bounds = Bounds {
                 x,
                 y: pane.y,
@@ -731,7 +827,9 @@ pub(crate) fn surface_tabs_layout(pane: Bounds, widths: &[f32], active: usize) -
                 height: 25.0,
             };
             x += width;
-            let close_width = (width * 0.22).clamp(16.0, 24.0).min(width);
+            let close_width = (width * 0.22)
+                .clamp(16.0, SURFACE_TAB_MAX_CLOSE_WIDTH)
+                .min(width);
             SurfaceTab {
                 index,
                 bounds,
@@ -908,6 +1006,65 @@ mod tests {
             Some(2)
         );
         assert_eq!(menu_row_at(menu, menu.x - 1.0, menu.y + 5.0, 30.0, 3), None);
+    }
+
+    #[test]
+    fn tab_overflow_menu_keeps_long_titles_when_the_window_has_room() {
+        let lines =
+            vec!["  1  a-long-latin-title-with-more-than-twenty-eight-columns 中文标题".into()];
+        let layout = tab_overflow_menu_layout(20.0, 30.0, 1000.0, 600.0, &lines, 0);
+        assert_eq!(layout.visible, 0..1);
+        assert_eq!(layout.line(&lines, 0), lines[0]);
+        assert!(layout.panel.width > 240.0);
+    }
+
+    #[test]
+    fn tab_overflow_menu_truncates_unicode_to_the_final_row_bounds() {
+        let lines = vec!["✓ 1  很长很长的中文标题-and-a-long-latin-tail".into()];
+        let layout = tab_overflow_menu_layout(20.0, 30.0, 150.0, 200.0, &lines, 0);
+        let rendered = layout.line(&lines, 0);
+        assert!(UnicodeWidthStr::width(rendered.as_str()) <= layout.text_columns);
+        assert!(rendered.ends_with('…'));
+        assert!(layout.panel.x + layout.panel.width <= 150.0);
+    }
+
+    #[test]
+    fn tab_overflow_menu_scrolls_to_and_hits_the_last_surface() {
+        let lines = (0..20)
+            .map(|index| format!("  {}  surface", index + 1))
+            .collect::<Vec<_>>();
+        let layout = tab_overflow_menu_layout(20.0, 30.0, 500.0, 130.0, &lines, usize::MAX);
+        assert_eq!(layout.visible.end, 20);
+        let row = menu_row_at(
+            layout.panel,
+            layout.panel.x + 4.0,
+            layout.panel.y + (layout.visible.len() - 1) as f32 * TAB_OVERFLOW_ROW_HEIGHT + 5.0,
+            TAB_OVERFLOW_ROW_HEIGHT,
+            layout.visible.len(),
+        )
+        .unwrap();
+        assert_eq!(layout.surface_index(row), Some(19));
+    }
+
+    #[test]
+    fn tab_overflow_menu_range_maps_draw_hover_and_click_indices_consistently() {
+        let lines = (0..12)
+            .map(|index| format!("  {}  surface", index + 1))
+            .collect::<Vec<_>>();
+        let layout = tab_overflow_menu_layout(20.0, 30.0, 500.0, 130.0, &lines, 4);
+        let drawn = layout.visible.clone().collect::<Vec<_>>();
+        let hovered = (0..layout.visible.len())
+            .map(|row| layout.surface_index(row).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(drawn, hovered);
+    }
+
+    #[test]
+    fn tab_overflow_scroll_offset_clamps_and_can_reveal_active_surface() {
+        assert_eq!(tab_overflow_scroll_offset(20, 3, 0, -99), 0);
+        assert_eq!(tab_overflow_scroll_offset(20, 3, 0, 99), 17);
+        assert_eq!(tab_overflow_initial_offset(20, 3, 19), 17);
+        assert_eq!(tab_overflow_initial_offset(20, 3, 1), 0);
     }
 
     #[test]
@@ -1096,7 +1253,7 @@ mod tests {
     fn agent_spinner_uses_a_stable_slot_without_hiding_the_title() {
         assert_eq!(
             surface_tab_title("⠋ compiling wmcterm workspace", true),
-            "⠋ compiling wmc…"
+            "⠋ compiling wmcterm workspace"
         );
         assert_eq!(surface_tab_title("⠙ 中文终端标题", true), "⠙ 中文终端标题");
         assert_eq!(surface_tab_title("wmcterm", true), "  wmcterm");
@@ -1151,7 +1308,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_hit_width_tracks_truncation_and_font_size() {
+    fn tab_label_geometry_tracks_full_titles_wide_characters_and_font_size() {
         let long = surface_tab_width_at(
             "a title that is much longer than the visible tab",
             0,
@@ -1159,7 +1316,7 @@ mod tests {
             false,
         );
         let equally_visible = surface_tab_width_at("a title that …", 0, 8.0, false);
-        assert_eq!(long, equally_visible);
+        assert!(long > equally_visible);
         assert_eq!(surface_tab_label("terminal", 0, false), "terminal 1");
         assert_eq!(surface_tab_width_at("tab", 0, 8.0, false), 75.0);
         assert_eq!(
@@ -1189,6 +1346,10 @@ mod tests {
                 8.0,
             )),
             6
+        );
+        assert_eq!(
+            surface_tab_visible_title("terminal workspace", false, 24.0 * 8.0, 8.0),
+            "terminal workspace"
         );
     }
 
@@ -1303,7 +1464,7 @@ mod tests {
             height: 300.0,
         };
         for active in 0..8 {
-            let tabs = surface_tabs_layout(pane, &[80.0; 8], active);
+            let tabs = surface_tabs_layout(pane, 8, active);
             assert!(tabs.iter().any(|tab| tab.index == active));
             assert!(
                 tabs.windows(2)
@@ -1319,6 +1480,73 @@ mod tests {
     }
 
     #[test]
+    fn surface_tabs_share_spare_width_up_to_a_comfortable_maximum() {
+        let tabs = surface_tabs_layout(
+            Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 500.0,
+                height: 300.0,
+            },
+            2,
+            0,
+        );
+
+        assert_eq!(tabs.len(), 2);
+        assert_eq!(tabs[0].bounds.width, 236.0);
+        assert_eq!(tabs[1].bounds.width, 236.0);
+    }
+
+    #[test]
+    fn hidden_surface_tabs_reserve_a_visible_overflow_target() {
+        let tabs = surface_tabs_layout(
+            Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 250.0,
+                height: 300.0,
+            },
+            8,
+            4,
+        );
+
+        let tabs_right = tabs.last().unwrap().bounds.x + tabs.last().unwrap().bounds.width;
+        let overflow = surface_tab_overflow_bounds(
+            Bounds {
+                x: 0.0,
+                y: 0.0,
+                width: 250.0,
+                height: 300.0,
+            },
+            tabs.len(),
+            8,
+        )
+        .unwrap();
+        assert_eq!(overflow.x, 178.0);
+        assert_eq!(overflow.width, 44.0);
+        assert!(tabs_right <= overflow.x);
+        assert!(tabs.iter().any(|tab| tab.index == 4));
+    }
+
+    #[test]
+    fn switching_within_a_visible_tab_page_keeps_positions_stable() {
+        let pane = Bounds {
+            x: 0.0,
+            y: 0.0,
+            width: 250.0,
+            height: 300.0,
+        };
+        let before = surface_tabs_layout(pane, 8, 2);
+        let after = surface_tabs_layout(pane, 8, 3);
+
+        assert_eq!(before, after);
+        assert_eq!(
+            before.iter().map(|tab| tab.index).collect::<Vec<_>>(),
+            [2, 3]
+        );
+    }
+
+    #[test]
     fn final_surface_can_be_closed_to_leave_an_empty_pane() {
         let tabs = surface_tabs_layout(
             Bounds {
@@ -1327,7 +1555,7 @@ mod tests {
                 width: 300.0,
                 height: 200.0,
             },
-            &[100.0],
+            1,
             0,
         );
         assert_eq!(tabs.len(), 1);

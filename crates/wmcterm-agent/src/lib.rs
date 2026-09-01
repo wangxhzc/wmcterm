@@ -461,6 +461,118 @@ pub enum AgentEvent {
     },
 }
 
+/// Codex subagent lifecycle data from the native 0.151 hook protocol.
+///
+/// These identities are intentionally read only from top-level native fields.
+/// A nested or incomplete payload must not be routed to another terminal's
+/// parent session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexSubagentHookEvent {
+    pub kind: CodexSubagentHookKind,
+    pub session_id: String,
+    pub turn_id: String,
+    pub agent_id: String,
+    pub agent_type: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_transcript_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_assistant_message: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CodexSubagentHookKind {
+    Start,
+    Stop,
+}
+
+impl CodexSubagentHookEvent {
+    pub fn validate(&self) -> Result<(), NormalizeHookError> {
+        let event = match self.kind {
+            CodexSubagentHookKind::Start => "SubagentStart",
+            CodexSubagentHookKind::Stop => "SubagentStop",
+        };
+        for (field, value) in [
+            ("session_id", self.session_id.as_str()),
+            ("turn_id", self.turn_id.as_str()),
+            ("agent_id", self.agent_id.as_str()),
+            ("agent_type", self.agent_type.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(NormalizeHookError::MissingIdentity {
+                    agent: AgentKind::Codex,
+                    event: event.to_owned(),
+                    field,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    pub fn route_key(&self) -> (&str, &str) {
+        (&self.session_id, &self.agent_id)
+    }
+
+    /// Compatibility projection for lifecycle consumers that do not track
+    /// subagents. Both events are activity; neither completes the parent turn.
+    pub fn to_agent_event(&self) -> AgentEvent {
+        let action = match self.kind {
+            CodexSubagentHookKind::Start => "started",
+            CodexSubagentHookKind::Stop => "stopped",
+        };
+        AgentEvent::ToolUse {
+            tool: format!("Codex subagent {action}: {}", self.agent_type),
+        }
+    }
+}
+
+/// Strictly normalize Codex 0.151 `SubagentStart` and `SubagentStop` payloads.
+pub fn normalize_codex_subagent_hook_event(
+    event_name: Option<&str>,
+    payload: &Value,
+) -> Result<CodexSubagentHookEvent, NormalizeHookError> {
+    if !payload.is_object() {
+        return Err(NormalizeHookError::InvalidPayload);
+    }
+    let payload_event = direct_string(payload, "hook_event_name");
+    if let (Some(argument), Some(payload_event)) = (event_name, payload_event.as_deref())
+        && argument != payload_event
+    {
+        return Err(NormalizeHookError::EventNameMismatch {
+            agent: AgentKind::Codex,
+            argument: argument.to_owned(),
+            payload: payload_event.to_owned(),
+        });
+    }
+    let raw_event = event_name
+        .map(str::to_owned)
+        .or(payload_event)
+        .ok_or(NormalizeHookError::MissingEventName)?;
+    let kind = match raw_event.as_str() {
+        "SubagentStart" => CodexSubagentHookKind::Start,
+        "SubagentStop" => CodexSubagentHookKind::Stop,
+        _ => {
+            return Err(NormalizeHookError::UnsupportedEvent {
+                agent: AgentKind::Codex,
+                event: raw_event,
+            });
+        }
+    };
+    let event = CodexSubagentHookEvent {
+        kind,
+        session_id: required_hook_string(payload, "session_id", AgentKind::Codex, &raw_event)?,
+        turn_id: required_hook_string(payload, "turn_id", AgentKind::Codex, &raw_event)?,
+        agent_id: required_hook_string(payload, "agent_id", AgentKind::Codex, &raw_event)?,
+        agent_type: required_hook_string(payload, "agent_type", AgentKind::Codex, &raw_event)?,
+        agent_transcript_path: direct_string(payload, "agent_transcript_path")
+            .and_then(optional_nonempty),
+        last_assistant_message: direct_string(payload, "last_assistant_message")
+            .and_then(optional_nonempty),
+    };
+    event.validate()?;
+    Ok(event)
+}
+
 /// Claude Code lifecycle information that cannot be represented by the legacy
 /// surface-level [`AgentEvent`] state machine.
 ///
@@ -826,6 +938,12 @@ pub enum NormalizeHookError {
     InvalidPayload,
     #[error("hook payload does not contain an event name")]
     MissingEventName,
+    #[error("{agent} hook event argument {argument} does not match payload event {payload}")]
+    EventNameMismatch {
+        agent: AgentKind,
+        argument: String,
+        payload: String,
+    },
     #[error("unsupported {agent} hook event: {event}")]
     UnsupportedEvent { agent: AgentKind, event: String },
     #[error("{agent} hook event {event} is missing routing field {field}")]
@@ -867,6 +985,13 @@ pub fn normalize_hook_event(
         && let Ok(event) = normalize_claude_hook_event(Some(&raw_event), payload)
     {
         return Ok(event.to_agent_event());
+    }
+
+    if matches!(agent, AgentKind::Codex)
+        && matches!(raw_event.as_str(), "SubagentStart" | "SubagentStop")
+    {
+        return normalize_codex_subagent_hook_event(Some(&raw_event), payload)
+            .map(|event| event.to_agent_event());
     }
 
     // Even a legacy adapter must not complete the root session when one of its
@@ -1255,6 +1380,8 @@ pub fn hook_install_plan(agent: AgentKind, wmcterm_binary: impl Into<String>) ->
                     "UserPromptSubmit",
                     "PermissionRequest",
                     "Interrupt",
+                    "SubagentStart",
+                    "SubagentStop",
                     "Stop",
                     "SessionEnd",
                 ],
@@ -2035,6 +2162,162 @@ mod tests {
     }
 
     #[test]
+    fn normalizes_codex_subagent_hooks_with_stable_routing_identity() {
+        let start = normalize_codex_subagent_hook_event(
+            None,
+            &serde_json::json!({
+                "session_id": "session-1",
+                "turn_id": "turn-7",
+                "hook_event_name": "SubagentStart",
+                "agent_id": "agent-42",
+                "agent_type": "explorer",
+                "cwd": "/work/project",
+                "model": "gpt-5.3-codex",
+                "permission_mode": "default",
+                "transcript_path": "/tmp/parent.jsonl"
+            }),
+        )
+        .unwrap();
+        assert_eq!(start.kind, CodexSubagentHookKind::Start);
+        assert_eq!(start.session_id, "session-1");
+        assert_eq!(start.turn_id, "turn-7");
+        assert_eq!(start.agent_id, "agent-42");
+        assert_eq!(start.agent_type, "explorer");
+        assert_eq!(start.route_key(), ("session-1", "agent-42"));
+        assert!(matches!(
+            start.to_agent_event(),
+            AgentEvent::ToolUse { tool } if tool == "Codex subagent started: explorer"
+        ));
+
+        let stop = normalize_codex_subagent_hook_event(
+            Some("SubagentStop"),
+            &serde_json::json!({
+                "session_id": "session-1",
+                "turn_id": "turn-7",
+                "hook_event_name": "SubagentStop",
+                "agent_id": "agent-42",
+                "agent_type": "explorer",
+                "agent_transcript_path": "/tmp/agent-42.jsonl",
+                "last_assistant_message": "Inspection complete"
+            }),
+        )
+        .unwrap();
+        assert_eq!(stop.kind, CodexSubagentHookKind::Stop);
+        assert_eq!(
+            stop.agent_transcript_path.as_deref(),
+            Some("/tmp/agent-42.jsonl")
+        );
+        assert_eq!(
+            stop.last_assistant_message.as_deref(),
+            Some("Inspection complete")
+        );
+        assert!(matches!(stop.to_agent_event(), AgentEvent::ToolUse { .. }));
+        assert_eq!(reduce(&stop.to_agent_event()).state, AgentState::Running);
+    }
+
+    #[test]
+    fn codex_subagent_hooks_require_top_level_0151_identity_fields() {
+        let nested = serde_json::json!({
+            "hook_event_name": "SubagentStart",
+            "payload": {
+                "session_id": "nested",
+                "turn_id": "nested-turn",
+                "agent_id": "nested-agent",
+                "agent_type": "worker"
+            }
+        });
+        assert!(matches!(
+            normalize_codex_subagent_hook_event(None, &nested),
+            Err(NormalizeHookError::MissingIdentity {
+                field: "session_id",
+                ..
+            })
+        ));
+        for field in ["turn_id", "agent_id", "agent_type"] {
+            let mut payload = serde_json::json!({
+                "session_id": "session-1",
+                "turn_id": "turn-7",
+                "hook_event_name": "SubagentStop",
+                "agent_id": "agent-42",
+                "agent_type": "explorer"
+            });
+            payload.as_object_mut().unwrap().remove(field);
+            assert!(matches!(
+                normalize_codex_subagent_hook_event(None, &payload),
+                Err(NormalizeHookError::MissingIdentity {
+                    field: missing,
+                    ..
+                }) if missing == field
+            ));
+        }
+    }
+
+    #[test]
+    fn codex_subagent_hook_rejects_explicit_and_payload_event_mismatches() {
+        let payload = |hook_event_name: &str| {
+            serde_json::json!({
+                "session_id": "session-1",
+                "turn_id": "turn-7",
+                "hook_event_name": hook_event_name,
+                "agent_id": "agent-42",
+                "agent_type": "explorer"
+            })
+        };
+        assert!(matches!(
+            normalize_codex_subagent_hook_event(
+                Some("SubagentStart"),
+                &payload("SubagentStop")
+            ),
+            Err(NormalizeHookError::EventNameMismatch {
+                argument,
+                payload,
+                ..
+            }) if argument == "SubagentStart" && payload == "SubagentStop"
+        ));
+        assert!(matches!(
+            normalize_codex_subagent_hook_event(
+                Some("SubagentStop"),
+                &payload("SubagentStart")
+            ),
+            Err(NormalizeHookError::EventNameMismatch {
+                argument,
+                payload,
+                ..
+            }) if argument == "SubagentStop" && payload == "SubagentStart"
+        ));
+    }
+
+    #[test]
+    fn codex_subagent_structured_validation_rejects_blank_routing_identity() {
+        let valid = CodexSubagentHookEvent {
+            kind: CodexSubagentHookKind::Start,
+            session_id: "session-1".into(),
+            turn_id: "turn-7".into(),
+            agent_id: "agent-42".into(),
+            agent_type: "explorer".into(),
+            agent_transcript_path: None,
+            last_assistant_message: None,
+        };
+        for field in ["session_id", "turn_id", "agent_id", "agent_type"] {
+            let mut event = valid.clone();
+            match field {
+                "session_id" => event.session_id = " \t ".into(),
+                "turn_id" => event.turn_id = " \t ".into(),
+                "agent_id" => event.agent_id = " \t ".into(),
+                "agent_type" => event.agent_type = " \t ".into(),
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                event.validate(),
+                Err(NormalizeHookError::MissingIdentity {
+                    field: missing,
+                    ..
+                }) if missing == field
+            ));
+        }
+    }
+
+    #[test]
     fn normalizes_gemini_notifications_and_generic_agent_events() {
         assert!(matches!(
             normalize_hook_json(
@@ -2285,6 +2568,8 @@ mod tests {
         let codex_json: Value = serde_json::from_str(&codex.snippets[0].content).unwrap();
         assert!(codex_json["hooks"]["PermissionRequest"].is_array());
         assert!(codex_json["hooks"]["Interrupt"].is_array());
+        assert!(codex_json["hooks"]["SubagentStart"].is_array());
+        assert!(codex_json["hooks"]["SubagentStop"].is_array());
         assert!(codex_json["hooks"]["Stop"].is_array());
     }
 

@@ -1585,13 +1585,15 @@ fn run_hook(mut args: impl Iterator<Item = String>) -> Result<()> {
             let claude_hook = (agent == AgentKind::Claude)
                 .then(|| normalize_claude_hook_event(event.as_deref(), &payload).ok())
                 .flatten();
+            let codex_hook = codex_hook_context(agent, event.as_deref(), &payload);
             // Non-blocking lifecycle hooks acknowledge Claude before the
             // bounded telemetry delivery. PermissionRequest is handled above
             // because Claude must receive the user's actual decision.
             acknowledge_hook();
-            let normalized = match claude_hook.as_ref() {
-                Some(hook) => hook.to_agent_event(),
-                None => match normalize_hook_event(agent, event.as_deref(), &payload) {
+            let normalized = match (claude_hook.as_ref(), codex_hook.subagent.as_ref()) {
+                (Some(hook), _) => hook.to_agent_event(),
+                (_, Some(hook)) => hook.to_agent_event(),
+                (None, None) => match normalize_hook_event(agent, event.as_deref(), &payload) {
                     Ok(event) => event,
                     Err(_) => return Ok(()),
                 },
@@ -1628,7 +1630,7 @@ fn run_hook(mut args: impl Iterator<Item = String>) -> Result<()> {
             // A missing surface means this hook ran outside wmcterm. Never
             // guess the active surface, because that could update another agent.
             if envelope.surface_id.is_some() {
-                deliver_hook_bounded(envelope, claude_hook);
+                deliver_hook_bounded(envelope, claude_hook, codex_hook);
             }
         }
         "install" => {
@@ -1661,6 +1663,38 @@ fn run_hook(mut args: impl Iterator<Item = String>) -> Result<()> {
         _ => bail!("usage: wmcterm hook receive|plan|install --agent KIND"),
     }
     Ok(())
+}
+
+#[derive(Debug, Default)]
+struct CodexHookContext {
+    subagent: Option<wmcterm_agent::CodexSubagentHookEvent>,
+    session_end: Option<String>,
+}
+
+fn codex_hook_context(
+    agent: wmcterm_agent::AgentKind,
+    event: Option<&str>,
+    payload: &Value,
+) -> CodexHookContext {
+    if agent != wmcterm_agent::AgentKind::Codex {
+        return CodexHookContext::default();
+    }
+    let event = event.or_else(|| payload.get("hook_event_name").and_then(Value::as_str));
+    match event {
+        Some("SubagentStart" | "SubagentStop") => CodexHookContext {
+            subagent: wmcterm_agent::normalize_codex_subagent_hook_event(event, payload).ok(),
+            session_end: None,
+        },
+        Some("SessionEnd") => CodexHookContext {
+            subagent: None,
+            session_end: payload
+                .get("session_id")
+                .and_then(Value::as_str)
+                .filter(|session| !session.trim().is_empty())
+                .map(str::to_owned),
+        },
+        _ => CodexHookContext::default(),
+    }
 }
 
 const HOOK_DELIVERY_BUDGET: Duration = Duration::from_millis(75);
@@ -1727,6 +1761,7 @@ where
 fn deliver_hook_bounded(
     envelope: wmcterm_agent::AgentEventEnvelope,
     claude_hook: Option<wmcterm_agent::ClaudeHookEvent>,
+    codex_hook: CodexHookContext,
 ) {
     let Ok(mut params) = envelope.to_legacy_rpc_params() else {
         return;
@@ -1735,6 +1770,16 @@ fn deliver_hook_bounded(
         && let Ok(hook) = serde_json::to_value(hook)
     {
         object.insert("claude_hook".into(), hook);
+    }
+    if let Some(object) = params.as_object_mut() {
+        if let Some(hook) = codex_hook.subagent
+            && let Ok(hook) = serde_json::to_value(hook)
+        {
+            object.insert("codex_hook".into(), hook);
+        }
+        if let Some(session_id) = codex_hook.session_end {
+            object.insert("codex_session_end".into(), session_id.into());
+        }
     }
     let Ok(path) = control_socket_path() else {
         return;
@@ -2436,6 +2481,48 @@ mod tests {
                 .any(|entry| entry == &serde_json::json!({"hooks": [], "disabled": true}))
         );
         assert_eq!(document["theme"], "dark");
+    }
+
+    #[test]
+    fn codex_hook_context_routes_subagents_and_session_end_without_focus() {
+        let subagent = codex_hook_context(
+            AgentKind::Codex,
+            Some("SubagentStart"),
+            &serde_json::json!({
+                "hook_event_name": "SubagentStart",
+                "session_id": "session-one",
+                "turn_id": "turn-one",
+                "agent_id": "agent-one",
+                "agent_type": "worker"
+            }),
+        );
+        assert_eq!(subagent.subagent.unwrap().agent_id, "agent-one");
+        assert_eq!(subagent.session_end, None);
+
+        let ended = codex_hook_context(
+            AgentKind::Codex,
+            Some("SessionEnd"),
+            &serde_json::json!({
+                "hook_event_name": "SessionEnd",
+                "session_id": "session-one"
+            }),
+        );
+        assert!(ended.subagent.is_none());
+        assert_eq!(ended.session_end.as_deref(), Some("session-one"));
+
+        let claude = codex_hook_context(
+            AgentKind::Claude,
+            Some("SubagentStart"),
+            &serde_json::json!({
+                "hook_event_name": "SubagentStart",
+                "session_id": "session-one",
+                "turn_id": "turn-one",
+                "agent_id": "agent-one",
+                "agent_type": "worker"
+            }),
+        );
+        assert!(claude.subagent.is_none());
+        assert!(claude.session_end.is_none());
     }
 
     #[test]
