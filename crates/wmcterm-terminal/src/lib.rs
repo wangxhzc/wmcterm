@@ -839,6 +839,7 @@ pub enum SessionCommand {
     CopySelection {
         start: SelectionPoint,
         end: SelectionPoint,
+        target: ClipboardTarget,
     },
     Mouse(MouseInput),
     Resize {
@@ -868,7 +869,10 @@ pub enum SessionEvent {
     ChildProcesses(Vec<String>),
     Agent(AgentEvent),
     Notification(String),
-    ClipboardText(String),
+    ClipboardText {
+        text: String,
+        target: ClipboardTarget,
+    },
     SearchResult(SearchResult),
     Exited(String),
     Warning(String),
@@ -880,6 +884,12 @@ pub struct SearchResult {
     pub query: String,
     pub current: usize,
     pub total: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClipboardTarget {
+    Clipboard,
+    Primary,
 }
 
 pub struct TerminalSession {
@@ -1282,23 +1292,25 @@ fn run_terminal_actor(
             }
             Incoming::Command(SessionCommand::CopyAll) => match engine.select_all_text() {
                 Ok(text) => {
-                    let _ = events.send(SessionEvent::ClipboardText(text));
+                    let _ = events.send(SessionEvent::ClipboardText {
+                        text,
+                        target: ClipboardTarget::Clipboard,
+                    });
                 }
                 Err(error) => {
                     let _ = events.send(SessionEvent::Warning(format!("copy all: {error}")));
                 }
             },
-            Incoming::Command(SessionCommand::CopySelection { start, end }) => {
-                match engine.selection_text(start, end) {
-                    Ok(text) => {
-                        let _ = events.send(SessionEvent::ClipboardText(text));
-                    }
-                    Err(error) => {
-                        let _ =
-                            events.send(SessionEvent::Warning(format!("copy selection: {error}")));
-                    }
+            Incoming::Command(SessionCommand::CopySelection { start, end, target }) => match engine
+                .selection_text(start, end)
+            {
+                Ok(text) => {
+                    let _ = events.send(SessionEvent::ClipboardText { text, target });
                 }
-            }
+                Err(error) => {
+                    let _ = events.send(SessionEvent::Warning(format!("copy selection: {error}")));
+                }
+            },
             Incoming::Command(SessionCommand::Mouse(input)) => match engine.encode_mouse(input) {
                 Ok(bytes) if !bytes.is_empty() => {
                     let _ = pty.send(PtyCommand::Input(bytes));

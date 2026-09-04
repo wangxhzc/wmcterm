@@ -58,9 +58,9 @@ use wmcterm_surface::{
     SurfaceBackend,
 };
 use wmcterm_terminal::{
-    CellSnapshot, InputKey, KeyInput, KeyModifiers, MouseActionInput, MouseButtonInput, MouseInput,
-    Rgb, ScreenSnapshot, SearchResult, SelectionPoint, SessionCommand, SessionEvent,
-    TerminalSession, TerminalSize, TerminalTheme,
+    CellSnapshot, ClipboardTarget, InputKey, KeyInput, KeyModifiers, MouseActionInput,
+    MouseButtonInput, MouseInput, Rgb, ScreenSnapshot, SearchResult, SelectionPoint,
+    SessionCommand, SessionEvent, TerminalSession, TerminalSize, TerminalTheme,
 };
 
 const TERMINAL_TERM: &str = "xterm-256color";
@@ -201,8 +201,15 @@ fn wide_cell_end(row: &[CellSnapshot], column: usize) -> usize {
         .min(row.len().saturating_sub(1))
 }
 
-fn wide_glyph_center_offset(text: &str, cell_width: f32) -> f32 {
-    terminal_text_cell_width(text).saturating_sub(1) as f32 * cell_width * 0.5
+fn wide_glyph_optical_offset(text: &str, cell_width: f32, font_size: f32) -> (f32, f32) {
+    let cells = terminal_text_cell_width(text);
+    if cells <= 1 {
+        return (0.0, 0.0);
+    }
+    let centered = (cells as f32 * cell_width - font_size).max(0.0) * 0.5;
+    // CJK fallback glyphs have asymmetric visible side/top bearings even though
+    // their em box is centered. Scale the correction with the configured size.
+    ((centered - font_size * 0.05).max(0.0), font_size * 0.025)
 }
 
 fn windows_paths_equal(left: &Path, right: &Path) -> bool {
@@ -1554,8 +1561,8 @@ impl WmctermApplication {
                     changed = true;
                 }
                 SessionEvent::Notification(message) => { self.notify_terminal(terminal_id, &message); changed = true; }
-                SessionEvent::ClipboardText(text) => {
-                    if let Err(error) = self.set_clipboard_text(text) {
+                SessionEvent::ClipboardText { text, target } => {
+                    if let Err(error) = self.set_clipboard_text(text, target) {
                         tracing::warn!(%error, "copying terminal text to the clipboard failed");
                     }
                 }
@@ -2865,7 +2872,7 @@ impl WmctermApplication {
                 .selection
                 .is_some_and(|selection| selection.start != selection.end)
         {
-            self.copy_selection_to_clipboard();
+            self.copy_selection(ClipboardTarget::Clipboard);
             return;
         }
         if self.config.ui.legacy_shortcuts {
@@ -2956,7 +2963,7 @@ impl WmctermApplication {
                         return;
                     }
                     Some('c') => {
-                        if !self.copy_selection_to_clipboard()
+                        if !self.copy_selection(ClipboardTarget::Clipboard)
                             && let Some(terminal) = self.active_terminal_id()
                         {
                             self.copy_all_to_clipboard(terminal);
@@ -2964,7 +2971,7 @@ impl WmctermApplication {
                         return;
                     }
                     Some('v') => {
-                        self.paste_clipboard();
+                        self.paste_clipboard(ClipboardTarget::Clipboard);
                         return;
                     }
                     _ => {}
@@ -5984,7 +5991,7 @@ impl WmctermApplication {
         }
         match action {
             TerminalContextAction::Copy => {
-                self.copy_selection_to_clipboard();
+                self.copy_selection(ClipboardTarget::Clipboard);
             }
             TerminalContextAction::Paste => {
                 if let Some(text) = self
@@ -7621,7 +7628,7 @@ impl WmctermApplication {
             self.rebuild_scene();
             return;
         }
-        self.copy_selection_to_clipboard();
+        self.copy_selection(ClipboardTarget::Primary);
         // A high-frequency drag may have coalesced its final motion event.
         // Always paint the authoritative endpoint once on release.
         self.rebuild_scene();
@@ -7657,7 +7664,7 @@ impl WmctermApplication {
         ))
     }
 
-    fn copy_selection_to_clipboard(&mut self) -> bool {
+    fn copy_selection(&mut self, target: ClipboardTarget) -> bool {
         let Some(selection) = self
             .selection
             .filter(|selection| selection.start != selection.end)
@@ -7674,6 +7681,7 @@ impl WmctermApplication {
         let send_result = runtime.session.send(SessionCommand::CopySelection {
             start: point(selection.start),
             end: point(selection.end),
+            target,
         });
         if send_result.is_ok() {
             return true;
@@ -7682,7 +7690,7 @@ impl WmctermApplication {
         else {
             return false;
         };
-        self.set_clipboard_text(text).is_ok()
+        self.set_clipboard_text(text, target).is_ok()
     }
 
     fn copy_all_to_clipboard(&mut self, terminal: TerminalId) -> bool {
@@ -7693,25 +7701,25 @@ impl WmctermApplication {
             return true;
         }
         let text = runtime.snapshot.to_plain_text();
-        self.set_clipboard_text(text).is_ok()
+        self.set_clipboard_text(text, ClipboardTarget::Clipboard)
+            .is_ok()
     }
 
-    fn set_clipboard_text(&mut self, text: String) -> Result<(), String> {
+    fn set_clipboard_text(&mut self, text: String, target: ClipboardTarget) -> Result<(), String> {
         #[cfg(windows)]
         {
+            let _ = target;
             return set_windows_clipboard_text(&text).map_err(|error| error.to_string());
         }
         #[cfg(not(windows))]
         {
             if let Some(clipboard) = &mut self.clipboard
-                && clipboard.set_text(text.clone()).is_ok()
+                && set_arboard_text(clipboard, text.clone(), target).is_ok()
             {
                 return Ok(());
             }
             let mut clipboard = arboard::Clipboard::new().map_err(|error| error.to_string())?;
-            clipboard
-                .set_text(text)
-                .map_err(|error| error.to_string())?;
+            set_arboard_text(&mut clipboard, text, target)?;
             self.clipboard = Some(clipboard);
             Ok(())
         }
@@ -7898,11 +7906,11 @@ impl WmctermApplication {
         }
     }
 
-    fn paste_clipboard(&mut self) {
+    fn paste_clipboard(&mut self, target: ClipboardTarget) {
         let Some(text) = self
             .clipboard
             .as_mut()
-            .and_then(|clipboard| clipboard.get_text().ok())
+            .and_then(|clipboard| get_arboard_text(clipboard, target).ok())
         else {
             return;
         };
@@ -8703,6 +8711,12 @@ impl WmctermApplication {
                                         255,
                                     ]);
                                 if needs_grid_positioned_glyph(cell.text.as_str()) {
+                                    let (wide_left_offset, wide_top_offset) =
+                                        wide_glyph_optical_offset(
+                                            cell.text.as_str(),
+                                            cell_width,
+                                            self.terminal_font_size,
+                                        );
                                     terminal_wide_glyphs.push(TextBlock {
                                         text: String::new(),
                                         spans: vec![TextSpan {
@@ -8719,11 +8733,11 @@ impl WmctermApplication {
                                         left: rect.x
                                             + 8.0
                                             + col as f32 * cell_width
-                                            + wide_glyph_center_offset(
-                                                cell.text.as_str(),
-                                                cell_width,
-                                            ),
-                                        top: rect.y + 25.0 + row as f32 * cell_height,
+                                            + wide_left_offset,
+                                        top: rect.y
+                                            + 25.0
+                                            + row as f32 * cell_height
+                                            + wide_top_offset,
                                         width: terminal_text_cell_width(cell.text.as_str()) as f32
                                             * cell_width,
                                         height: cell_height,
@@ -11706,30 +11720,35 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                     || self.open_sidebar_context_menu()
                     || self.open_tab_context_menu()
                     || self.pointer_over_overlay()
-                    || (!self.modifiers.shift_key() && self.open_terminal_context_menu())
                 {
                     return;
                 }
-                // Right-click paste and terminal mouse reporting are terminal-content
-                // actions. Do not let unhandled application chrome or document
-                // surfaces fall through to the active terminal.
                 let Some((_, terminal)) = self.terminal_at_cursor() else {
                     return;
                 };
+                let mouse_tracking = self
+                    .terminals
+                    .get(&terminal)
+                    .is_some_and(|runtime| runtime.snapshot.mouse_tracking);
+                if terminal_right_click_opens_context_menu(
+                    self.modifiers.shift_key(),
+                    mouse_tracking,
+                ) {
+                    self.open_terminal_context_menu();
+                    return;
+                }
                 self.focus_at_cursor();
                 if self.mark_terminal_notifications_read(terminal) {
                     self.rebuild_scene();
                 }
-                if self.modifiers.shift_key()
-                    || !self
-                        .send_terminal_mouse(MouseActionInput::Press, Some(MouseButtonInput::Right))
+                if self.send_terminal_mouse(MouseActionInput::Press, Some(MouseButtonInput::Right))
                 {
-                    self.paste_clipboard();
-                } else {
                     self.send_terminal_mouse(
                         MouseActionInput::Release,
                         Some(MouseButtonInput::Right),
                     );
+                } else {
+                    self.open_terminal_context_menu();
                 }
             }
             WindowEvent::MouseInput {
@@ -11746,7 +11765,7 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                     return;
                 }
                 if !self.focus_at_cursor() && self.terminal_at_cursor().is_some() {
-                    self.paste_clipboard();
+                    self.paste_clipboard(ClipboardTarget::Primary);
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -11957,12 +11976,70 @@ fn terminal_mouse_geometry(
     scale_factor: f64,
 ) -> (f32, f32, u32, u32) {
     let scale_factor = scale_factor.max(f64::EPSILON);
+    let physical_cell_width = (cell_width as f64 * scale_factor).round().max(1.0) as u32;
+    let physical_cell_height = (cell_height as f64 * scale_factor).round().max(1.0) as u32;
     (
-        x * scale_factor as f32,
-        y * scale_factor as f32,
-        (cell_width as f64 * scale_factor).round().max(1.0) as u32,
-        (cell_height as f64 * scale_factor).round().max(1.0) as u32,
+        x / cell_width.max(f32::EPSILON) * physical_cell_width as f32,
+        y / cell_height.max(f32::EPSILON) * physical_cell_height as f32,
+        physical_cell_width,
+        physical_cell_height,
     )
+}
+
+const fn terminal_right_click_opens_context_menu(shift: bool, mouse_tracking: bool) -> bool {
+    shift || !mouse_tracking
+}
+
+#[cfg(target_os = "linux")]
+fn set_arboard_text(
+    clipboard: &mut arboard::Clipboard,
+    text: String,
+    target: ClipboardTarget,
+) -> Result<(), String> {
+    use arboard::{LinuxClipboardKind, SetExtLinux};
+    let target = match target {
+        ClipboardTarget::Clipboard => LinuxClipboardKind::Clipboard,
+        ClipboardTarget::Primary => LinuxClipboardKind::Primary,
+    };
+    clipboard
+        .set()
+        .clipboard(target)
+        .text(text)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(all(not(target_os = "linux"), not(windows)))]
+fn set_arboard_text(
+    clipboard: &mut arboard::Clipboard,
+    text: String,
+    _target: ClipboardTarget,
+) -> Result<(), String> {
+    clipboard.set_text(text).map_err(|error| error.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn get_arboard_text(
+    clipboard: &mut arboard::Clipboard,
+    target: ClipboardTarget,
+) -> Result<String, String> {
+    use arboard::{GetExtLinux, LinuxClipboardKind};
+    let target = match target {
+        ClipboardTarget::Clipboard => LinuxClipboardKind::Clipboard,
+        ClipboardTarget::Primary => LinuxClipboardKind::Primary,
+    };
+    clipboard
+        .get()
+        .clipboard(target)
+        .text()
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn get_arboard_text(
+    clipboard: &mut arboard::Clipboard,
+    _target: ClipboardTarget,
+) -> Result<String, String> {
+    clipboard.get_text().map_err(|error| error.to_string())
 }
 
 fn application_socket_path() -> Option<std::path::PathBuf> {
@@ -15062,8 +15139,10 @@ mod tests {
         assert!(!needs_grid_positioned_glyph("│"));
         assert!(!needs_grid_positioned_glyph("●"));
         assert!(needs_grid_positioned_glyph("汉"));
-        assert_eq!(wide_glyph_center_offset("a", 9.6), 0.0);
-        assert!((wide_glyph_center_offset("汉", 9.6) - 4.8).abs() < 0.001);
+        assert_eq!(wide_glyph_optical_offset("a", 9.6, 16.0), (0.0, 0.0));
+        let (left, top) = wide_glyph_optical_offset("汉", 9.6, 16.0);
+        assert!((left - 0.8).abs() < 0.001);
+        assert!((top - 0.4).abs() < 0.001);
 
         let row = vec![
             selection_cell("汉"),
@@ -16357,6 +16436,18 @@ mod tests {
         assert_eq!(cell_height, 28);
         assert!((x / cell_width as f32 - 10.0).abs() < f32::EPSILON);
         assert!((y / cell_height as f32 - 10.0).abs() < f32::EPSILON);
+        let (x, y, cell_width, cell_height) = terminal_mouse_geometry(84.0, 196.0, 8.4, 19.6, 1.0);
+        assert_eq!((x, y, cell_width, cell_height), (80.0, 200.0, 8, 20));
+        assert_eq!(x / cell_width as f32, 10.0);
+        assert_eq!(y / cell_height as f32, 10.0);
+    }
+
+    #[test]
+    fn terminal_right_click_respects_application_mouse_tracking() {
+        assert!(terminal_right_click_opens_context_menu(false, false));
+        assert!(!terminal_right_click_opens_context_menu(false, true));
+        assert!(terminal_right_click_opens_context_menu(true, false));
+        assert!(terminal_right_click_opens_context_menu(true, true));
     }
 
     #[test]
