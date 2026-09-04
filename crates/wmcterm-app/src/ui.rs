@@ -588,6 +588,7 @@ fn surface_tab_label(title: &str, index: usize, agent: bool) -> String {
 /// do not resize the tab or displace the stable title.
 pub(crate) fn surface_tab_title(title: &str, agent: bool) -> String {
     let (spinner, stable) = split_agent_spinner(title);
+    let stable = stable.trim_end_matches(char::is_whitespace);
     if agent || spinner.is_some() {
         format!("{} {}", spinner.unwrap_or(' '), stable)
     } else {
@@ -1350,6 +1351,26 @@ mod tests {
         assert_eq!(
             surface_tab_visible_title("terminal workspace", false, 24.0 * 8.0, 8.0),
             "terminal workspace"
+        );
+    }
+
+    #[test]
+    fn tab_titles_discard_trailing_terminal_padding() {
+        assert_eq!(
+            surface_tab_title("Claude Code        ", false),
+            "Claude Code"
+        );
+        assert_eq!(
+            surface_tab_title("⠙ fixing tests\t \n", true),
+            "⠙ fixing tests"
+        );
+        assert_eq!(
+            surface_tab_title("Claude Code        ", true),
+            "  Claude Code"
+        );
+        assert_eq!(
+            surface_tab_visible_title("Claude Code        ", false, 8.0 * 8.0, 8.0),
+            "Claude …"
         );
     }
 

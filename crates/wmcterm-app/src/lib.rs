@@ -175,7 +175,7 @@ fn terminal_text_cell_width(text: &str) -> usize {
 }
 
 fn needs_grid_positioned_glyph(text: &str) -> bool {
-    !text.is_empty() && !text.is_ascii()
+    UnicodeWidthStr::width(text) > 1
 }
 
 fn wide_cell_lead(row: &[CellSnapshot], column: usize) -> usize {
@@ -201,8 +201,8 @@ fn wide_cell_end(row: &[CellSnapshot], column: usize) -> usize {
         .min(row.len().saturating_sub(1))
 }
 
-fn wide_glyph_center_offset(text: &str, cell_width: f32, font_size: f32) -> f32 {
-    (terminal_text_cell_width(text) as f32 * cell_width - font_size).max(0.0) * 0.5
+fn wide_glyph_center_offset(text: &str, cell_width: f32) -> f32 {
+    terminal_text_cell_width(text).saturating_sub(1) as f32 * cell_width * 0.5
 }
 
 fn windows_paths_equal(left: &Path, right: &Path) -> bool {
@@ -7749,13 +7749,20 @@ impl WmctermApplication {
         if !runtime.snapshot.mouse_tracking {
             return false;
         }
+        let (mouse_x, mouse_y, cell_width, cell_height) = terminal_mouse_geometry(
+            (x - rect.x - 8.0).max(0.0),
+            (y - rect.y - 25.0).max(0.0),
+            self.cell_width(),
+            self.cell_height(),
+            self.scale_factor,
+        );
         let _ = runtime.session.send(SessionCommand::Mouse(MouseInput {
             action,
             button,
-            x: (x - rect.x - 8.0).max(0.0),
-            y: (y - rect.y - 25.0).max(0.0),
-            cell_width: self.cell_width().round() as u32,
-            cell_height: self.cell_height().round() as u32,
+            x: mouse_x,
+            y: mouse_y,
+            cell_width,
+            cell_height,
             modifiers: KeyModifiers {
                 shift: self.modifiers.shift_key(),
                 alt: self.modifiers.alt_key(),
@@ -7823,13 +7830,20 @@ impl WmctermApplication {
         let (x, y) = self.cursor_position;
         let local_x = (x - rect.x - 8.0).clamp(0.0, (rect.width - 9.0).max(0.0));
         let local_y = (y - rect.y - 25.0).clamp(0.0, (rect.height - 26.0).max(0.0));
+        let (mouse_x, mouse_y, cell_width, cell_height) = terminal_mouse_geometry(
+            local_x,
+            local_y,
+            self.cell_width(),
+            self.cell_height(),
+            self.scale_factor,
+        );
         let _ = runtime.session.send(SessionCommand::Mouse(MouseInput {
             action,
             button,
-            x: local_x,
-            y: local_y,
-            cell_width: self.cell_width().round() as u32,
-            cell_height: self.cell_height().round() as u32,
+            x: mouse_x,
+            y: mouse_y,
+            cell_width,
+            cell_height,
             modifiers: KeyModifiers {
                 shift: self.modifiers.shift_key(),
                 alt: self.modifiers.alt_key(),
@@ -8708,10 +8722,10 @@ impl WmctermApplication {
                                             + wide_glyph_center_offset(
                                                 cell.text.as_str(),
                                                 cell_width,
-                                                self.terminal_font_size,
                                             ),
                                         top: rect.y + 25.0 + row as f32 * cell_height,
-                                        width: cell_width * 2.0,
+                                        width: terminal_text_cell_width(cell.text.as_str()) as f32
+                                            * cell_width,
                                         height: cell_height,
                                         color: theme_text,
                                         font_size: self.terminal_font_size,
@@ -11935,6 +11949,22 @@ fn logical_window_size(size: PhysicalSize<u32>, scale_factor: f64) -> PhysicalSi
     )
 }
 
+fn terminal_mouse_geometry(
+    x: f32,
+    y: f32,
+    cell_width: f32,
+    cell_height: f32,
+    scale_factor: f64,
+) -> (f32, f32, u32, u32) {
+    let scale_factor = scale_factor.max(f64::EPSILON);
+    (
+        x * scale_factor as f32,
+        y * scale_factor as f32,
+        (cell_width as f64 * scale_factor).round().max(1.0) as u32,
+        (cell_height as f64 * scale_factor).round().max(1.0) as u32,
+    )
+}
+
 fn application_socket_path() -> Option<std::path::PathBuf> {
     let path = default_socket_path()?;
     #[cfg(windows)]
@@ -15029,8 +15059,11 @@ mod tests {
     fn wide_terminal_glyphs_are_centered_and_use_a_wide_cursor() {
         assert_eq!(terminal_text_cell_width("a"), 1);
         assert_eq!(terminal_text_cell_width("汉"), 2);
-        assert_eq!(wide_glyph_center_offset("a", 9.6, 16.0), 0.0);
-        assert!((wide_glyph_center_offset("汉", 9.6, 16.0) - 1.6).abs() < 0.001);
+        assert!(!needs_grid_positioned_glyph("│"));
+        assert!(!needs_grid_positioned_glyph("●"));
+        assert!(needs_grid_positioned_glyph("汉"));
+        assert_eq!(wide_glyph_center_offset("a", 9.6), 0.0);
+        assert!((wide_glyph_center_offset("汉", 9.6) - 4.8).abs() < 0.001);
 
         let row = vec![
             selection_cell("汉"),
@@ -15041,7 +15074,7 @@ mod tests {
         assert_eq!(wide_cell_lead(&row, 1), 0);
         assert_eq!(wide_cell_end(&row, 0), 1);
         assert_eq!(wide_cell_end(&row, 2), 2);
-        assert!(needs_grid_positioned_glyph("❯"));
+        assert!(!needs_grid_positioned_glyph("❯"));
         assert!(needs_grid_positioned_glyph("汉"));
         assert!(!needs_grid_positioned_glyph(">"));
         assert!(!needs_grid_positioned_glyph("a"));
@@ -16313,6 +16346,17 @@ mod tests {
             logical_window_size(PhysicalSize::new(1500, 975), 1.5),
             PhysicalSize::new(1000, 650)
         );
+    }
+
+    #[test]
+    fn terminal_mouse_geometry_uses_physical_pixels_at_fractional_scale() {
+        let (x, y, cell_width, cell_height) = terminal_mouse_geometry(96.0, 224.0, 9.6, 22.4, 1.25);
+        assert!((x - 120.0).abs() < f32::EPSILON);
+        assert!((y - 280.0).abs() < f32::EPSILON);
+        assert_eq!(cell_width, 12);
+        assert_eq!(cell_height, 28);
+        assert!((x / cell_width as f32 - 10.0).abs() < f32::EPSILON);
+        assert!((y / cell_height as f32 - 10.0).abs() < f32::EPSILON);
     }
 
     #[test]
