@@ -13806,12 +13806,11 @@ fn set_split_ratio(node: &mut PaneNode, path: &[bool], ratio: f32) {
 
 fn terminal_workspace_area(window_width: f32, window_height: f32, sidebar_width: f32) -> Rect {
     const TITLEBAR_HEIGHT: f32 = 40.0;
-    const HORIZONTAL_MARGIN: f32 = 12.0;
     const BOTTOM_MARGIN: f32 = 4.0;
     Rect {
-        x: sidebar_width + HORIZONTAL_MARGIN,
+        x: sidebar_width,
         y: TITLEBAR_HEIGHT,
-        width: (window_width - sidebar_width - HORIZONTAL_MARGIN * 2.0).max(1.0),
+        width: (window_width - sidebar_width).max(1.0),
         height: (window_height - TITLEBAR_HEIGHT - BOTTOM_MARGIN).max(1.0),
     }
 }
@@ -16256,9 +16255,9 @@ mod tests {
     #[test]
     fn terminal_workspace_uses_the_removed_footer_space() {
         let area = terminal_workspace_area(1000.0, 650.0, 240.0);
-        assert_eq!(area.x, 252.0);
+        assert_eq!(area.x, 240.0);
         assert_eq!(area.y, 40.0);
-        assert_eq!(area.width, 736.0);
+        assert_eq!(area.width, 760.0);
         assert_eq!(area.height, 606.0);
         assert_eq!(area.y + area.height, 646.0);
     }
