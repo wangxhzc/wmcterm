@@ -39,6 +39,8 @@ cargo run
 
 ## 快捷键
 
+终端中的 `Ctrl+C` 默认传给前台程序（包括 Codex），鼠标选区不会拦截它；复制选区使用 `Ctrl+Shift+C`。
+
 - `Ctrl+Shift+D`：向右拆分
 - `Ctrl+Shift+E`：向下拆分
 - `Ctrl+Shift+T`：新建终端表面标签页
@@ -94,6 +96,9 @@ cargo run
 突发期间，回复字节和待处理回复批次均有上限，因此显示不受信任的二进制数据时，不会
 积累无限输入积压并在 shell 提示符返回后注入。输出流静默 250 ms 后，回复预算会自动恢复。
 
+侧边栏工作区列表超出可见范围时显示滚动条，支持滚轮、拖动滑块和点击轨道定位；
+滚动条独占右侧留白，不覆盖文字，也不占用侧边栏宽度调整边界。
+轨道延伸到侧边栏底部；用于右键新建工作区的 32px 留白位于列表末尾，随列表滚动。
 侧边栏中的 `+ New Workspace` 条目可以点击。相同命令也可从命令面板使用。
 允许关闭最后一个工作区；空应用视图会保留一个可点击的新建工作区入口。
 工作区条目支持按住整行拖动排序；移动超过少量阈值后才进入拖动状态，拖动时会显示
@@ -216,6 +221,10 @@ Workspace cwd 显式传给私有 app-server 的远程 TUI。Codex 0.149.1 会话
 不会创建第二个可操作请求。手动启动的非托管 Codex 没有审批回复通道，因此其
 `PermissionRequest` Hook 只更新等待状态并发送普通通知；用户仍需回到 Codex TUI
 完成原生审批，通知中心不会显示无法生效的允许/拒绝按钮。
+前台进程识别会把手动 `codex --approve-for-me` 标记为“自动审查”，把手动
+`codex --dangerously-bypass-approvals-and-sandbox` 标记为“危险全权限”；运行模式
+与空闲、运行中、等待和完成等 turn 状态相互独立。工作区侧栏显示其中最敏感的模式，
+`UserPromptSubmit` Hook 则确认包括粘贴、RPC 输入和自动续跑在内的运行状态。
 如果根 Codex TUI 先回答同一个 app-server 请求，wmcterm 会消费 Codex 的
 `serverRequest/resolved` 确认或精确匹配的 item lifecycle 事件，并且只关闭对应的
 通知卡片；终端按键和无关 item 活动绝不会清除审批。
@@ -225,7 +234,7 @@ Codex 0.150.0 把向已运行命令发送输入表示为同一 app-server method
 展示它们；该请求不会生成持久或会话级授权。
 显式指定的审批或沙箱选项仍然优先。托管启动器拒绝 Codex/Claude 的 bypass 参数、
 `danger-full-access` 沙箱和 CLI `--mode full-access`。命令面板另有明确标为“完全访问…”
-的人工入口；选择后还必须输入 `FULL ACCESS`，且只影响新启动的 Agent 会话，不写入
+的人工入口；选择后必须在危险说明弹窗中明确确认，且只影响新启动的 Agent 会话，不写入
 配置。该会话关闭审批和沙箱，应仅在已有外部隔离边界时使用。
 
 可操作的 Agent 请求使用有界请求/回复通道，而不是普通通知。使用
@@ -302,10 +311,18 @@ command = "cargo test"
 
 工作区布局、表面、终端命令和受支持的 Agent 会话 ID 会从平台数据目录恢复。可见的
 回滚历史会保留；PTY 进程内存绝不会被序列化，命令以及 Claude/Codex/OpenCode 的
-resume 标识符会被重新启动。`codex-teams` 子分区保存的私有 loopback
+resume 标识符会按启动来源恢复。由 wmcterm Agent 入口启动并已取得 session ID 的
+会话始终使用 provider 的 resume 命令恢复，不会重新执行原始启动命令；Shell 中手动
+启动的 Agent 仅在 wmcterm 关闭时生命周期仍在运行且前台进程仍是该 Agent 才恢复；
+已经退出回到 Shell、明确结束或失败的手动 Agent 重开后回到普通终端。
+仍在运行的手动 Agent 恢复时保留交互式 Shell 语义：resume 作为 Shell 子命令运行，
+退出 Agent 后回到 Shell，Surface、滚动历史和终端会话不会随 Agent 一同退出。
+`codex-teams` 子分区保存的私有 loopback
 app-server 地址只在当前进程内有效；重启后这些子分区会稳定降级为独立的
 `codex resume` 会话，不会重放已经失效的 `--remote` 地址。Claude Code 的
 session ID 和恢复命令不依赖此类临时 endpoint，保持原有恢复行为。
+上述自动生成的恢复命令不继承自动审批或完全访问参数，工作区 Agent 标签也同步
+恢复为普通交互模式；手动进程后续被检测到的审批模式会更新标签，不覆盖任务状态或会话 ID。
 
 可使用 `wmcterm config init`、`config show`、`config validate` 或
 `config import-ghostty [PATH]`。UI 每秒重新加载一次有效的配置变更。支持主题颜色、
@@ -403,3 +420,7 @@ scripts/runtime-control-smoke.sh
 生成的截图写入 `target/ui-smoke-en.png` 和 `target/ui-smoke-zh-CN.png`。运行时控制
 smoke test 会通过 winit 向 shell 发送真实的键盘空格事件，通过本地 IPC socket 创建
 窗格，并验证子终端是否收到 wmcterm 控制环境变量。
+
+Codex 自动会话恢复在保存和加载时检查当前 `CODEX_HOME`（默认 `~/.codex`）
+的会话记录。仅取得会话 ID、尚未落盘的空会话不会生成自动恢复命令；恢复为普通
+Shell，并清除对应的旧 Agent 状态，保留工作区布局和终端历史。

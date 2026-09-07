@@ -59,6 +59,17 @@ from the currently focused UI item: the user may be viewing another workspace.
   explicit `wmcterm hook install --agent codex --scope user` writes under
   `~/.codex`; use `--scope project` for project configuration, and have the user
   review installed changes in Codex `/hooks`.
+- Manually launched Codex processes share the same turn-state tracking. wmcterm
+  reports `--approve-for-me` as auto-review and
+  `--dangerously-bypass-approvals-and-sandbox` as dangerous full access without
+  treating either permission mode as evidence that a turn is running.
+- Session restore keeps wmcterm-launched Agents resumable even after their PTY
+  exits. A manually launched Agent is resumable only while its lifecycle is
+  still running and it remains the terminal's foreground process when wmcterm
+  closes; an explicit manual exit must reopen as a normal terminal instead of
+  reconnecting the old session. A restored manual Agent runs under an
+  interactive shell so exiting the Agent returns to the prompt without closing
+  the terminal surface or losing its restored scrollback.
 
 ## Launch Claude safely
 
@@ -155,3 +166,22 @@ for results, errors, permission requests, or input that needs attention.
 Inspect actionable requests with `wmcterm agent-request list`. Reply with
 `wmcterm agent-request reply ID --approve`, `--deny`, `--choice ID`, or
 `--text TEXT`; cancel a stale request with `wmcterm agent-request cancel ID`.
+
+In the terminal UI, Ctrl+C is forwarded to the foreground process even when text
+is selected. Use Ctrl+Shift+C to copy the selection.
+
+The workspace sidebar shows a scrollbar only when its filtered list overflows.
+Drag its thumb or click its track to scroll; the rail is separate from workspace
+rows and the sidebar resize edge. Mouse-wheel scrolling remains available.
+
+The sidebar scrollbar track extends to the bottom. The 32px blank context-menu
+area follows the last workspace as part of the scrollable list.
+
+Generated Agent resume commands do not retain unattended/full-access launch flags.
+Restored sidebar metadata uses interactive mode until current process detection
+provides a different mode; this applies to managed and manually launched sessions.
+
+A Codex session ID alone is not sufficient for automatic resume. On save/load,
+wmcterm checks for a nonempty matching rollout in the current Codex home; absent
+records restore a shell and clear stale Agent metadata while preserving terminal
+history and layout. Explicit launch commands are preserved.

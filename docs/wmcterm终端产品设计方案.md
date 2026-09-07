@@ -1991,7 +1991,7 @@ Plugin Marketplace
 - Agent 运行策略与单条审批分层：`interactive` 维持按需审批；`unattended` 使用
   Codex `--approve-for-me`（自身启用 `workspace-write`）或 Claude `--permission-mode auto`，
   允许原生低风险自动判断但保留隔离；`full-access` 关闭审批和沙箱，只能从命令面板
-  的显式动作启动，并要求再次输入 `FULL ACCESS`。完全访问只作用于新 Agent 进程，
+  的显式动作启动，并要求在危险说明弹窗中再次确认。完全访问只作用于新 Agent 进程，
   不可持久化为配置，也不接受 CLI/Agent 自动化传入危险参数。
 - GUI 为含 `.codex` 目录的 Workspace 启动无人值守 Codex 前，按规范化的精确项目根
   检查用户级 Codex 信任配置。未信任时由人工选择取消、不信任并继续，或信任并启动；
@@ -2312,3 +2312,63 @@ cmux 依赖 Swift/AppKit 事件、`NSView`/`CAMetalLayer` 生命周期和
 GhosttyKit 的 surface/renderer；wmcterm 需要在 Linux、macOS 和 Windows 上共用
 Rust actor、winit 事件循环、wgpu surface 和 glyphon 缓存。因此只借鉴上述时序、
 坐标和失效原则，不引入 AppKit/CAMetalLayer/GhosttyKit 适配层。
+
+## 33.13 手动 Codex 的运行模式与 turn 状态解耦
+
+实现状态（2026-09-01）：前台进程识别在保持 Agent 种类判断的同时记录运行模式。
+手动 `--approve-for-me`/`--full-auto` 归类为自动审查，手动
+`--dangerously-bypass-approvals-and-sandbox`/`--yolo` 归类为危险全权限，未显式指定
+则为交互模式。该字段随 Surface Agent 元数据持久化并通过状态接口输出；旧会话缺少
+字段时安全回退为交互模式。工作区中存在多个 Agent 时，侧栏显示最敏感的运行模式。
+
+运行模式只描述权限和沙箱策略，不参与 turn 状态转换。进程出现或 `SessionStart`
+仍为 `Idle`；GUI 提交可乐观进入 `Running`，Codex `UserPromptSubmit`、工具和活动 Hook
+用于确认运行，`Stop`/`Interrupt` 和真实 PTY 退出分别结束 turn 或生命周期。托管启动器
+仍拒绝危险 bypass 参数；识别手动全权限进程不会产生任何授权能力。
+
+## 33.14 Agent 恢复按启动来源和退出状态决策
+
+实现状态（2026-09-01）：会话持久化区分 wmcterm Agent 入口启动和 Shell 手动启动。
+前者在取得 provider session ID 后始终保存 resume 信息，并在重开时直接执行 Codex、
+Claude 或 OpenCode 的 resume 命令，不再重放原始启动命令。后者只有在 wmcterm 关闭时
+生命周期仍为 `Running` 且终端前台进程仍被识别为同一种 Agent 才保存 resume；已经
+退出回到 Shell、收到 `SessionEnd`、PTY 退出或失败状态的手动 Agent 不再自动连接旧
+会话，Surface 恢复为普通终端。
+
+仍在运行的手动 Agent 恢复时不能把 provider resume 命令作为 PTY 根进程，否则用户
+退出 Agent 会同时结束终端并丢失可见历史。恢复器使用带来源标记的 Shell 子命令执行
+resume，并在其结束后回到交互式 Shell；该标记同时防止下一次持久化把手动恢复误判为
+wmcterm 托管启动。Linux/macOS 使用 `exec` 回到用户 Shell，Windows 分别适配
+PowerShell、cmd 和兼容 Shell。
+
+启动来源通过 AgentSession 中捕获的初始终端命令与已识别 Agent 类型精确匹配，不能只
+依据 Surface 当前标题、UI 焦点或残留 session ID 推断。这样，显式以 `bash` 等命令
+创建的终端后来手动运行 Codex，也仍遵循手动 Agent 的状态判断规则。
+
+终端键盘路由默认将 `Ctrl+C` 交给前台 PTY，即使存在鼠标选区也不拦截为复制，
+以保证 Codex 等前台程序能够接收中断。复制选区使用 `Ctrl+Shift+C`。
+
+侧边栏溢出时显示独立滚动轨道：行内容右侧预留 18px，轨道位于宽度边界内
+8–16px，避开边界两侧 5px 的宽度调整命中区。轨道从工作区列表顶部开始，
+保留顶部搜索/新建控件；底部 32px 空白属于列表末尾，滚动到底时位于最后一个
+工作区下方，轨道延伸到侧边栏底部。布局统一提供行、轨道和滑块矩形，
+供绘制、悬停和点击使用；拖动与点击定位沿用工作区行索引滚动语义，筛选或
+窗口增大使内容不再溢出时隐藏轨道，失焦或释放鼠标终止拖动。
+
+侧边栏边界普通线为 1px，悬停和拖动时以该像素为中心、左右各扩 1px，形成
+3px 高亮。统一在窗格背景之后、浮层之前绘制，并从标题栏下方连续延伸到底部，
+避免一侧被终端背景盖住而在底部露出短线；不再叠加额外拖动光晕。通用列表滑块
+高度不得超过轨道高度；空间不足以容纳轨道内边距时不绘制滚动条。
+
+恢复 Agent 时，生成的普通 resume 命令与 Surface AgentMetadata.run_mode 必须
+保持一致：在构造 UI 和接收 Hook 前，将对应 Surface 的旧自动审批/完全访问模式
+重置为 Interactive。命令面板托管启动、手动 Shell 包装恢复、旧直接恢复以及失效
+remote 子会话降级均适用；按原样重放的显式启动命令不由此规则改写。手动 Agent
+前台检测可以独立更新同一 provider 的 run_mode，保留 Hook 维护的状态和会话 ID。
+
+Codex 的会话 ID 不代表 rollout 已持久化。会话保存和加载阶段检查当前 Codex
+用户目录的 sessions/archived_sessions 中匹配线程 UUID 的非空 rollout 文件，
+不在渲染循环或终端 actor 内进行目录扫描。缺失记录的生成式恢复回退为 Shell，
+同时移除对应 Surface AgentMetadata 与旧 AgentSession；按原样重放的显式命令
+不被此检查改写。前台 Agent 消失后，在重新计算状态前清除旧会话和子 Agent 状态，
+避免把已结束的 Running/Waiting 状态投射回工作区。

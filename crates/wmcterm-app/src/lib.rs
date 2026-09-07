@@ -443,7 +443,6 @@ enum PromptKind {
     ChangeWorkspaceDirectory,
     FindDirectory,
     FilterLogs,
-    ConfirmFullAccess(ManagedAgent),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -494,6 +493,7 @@ enum CloseTarget {
     Surfaces(Vec<SurfaceId>),
     Workspace(uuid::Uuid),
     Application,
+    FullAccess(ManagedAgent),
 }
 
 struct CloseConfirmation {
@@ -552,6 +552,9 @@ enum NavigationHover {
     ConfirmationContinue,
     Workspace(usize),
     NewWorkspace,
+    SidebarScrollbar,
+    SidebarResize,
+    PaneDivider(usize),
     Tab(PaneId, usize),
     TabClose(PaneId, usize),
     TabOverflow(PaneId),
@@ -641,10 +644,6 @@ const TAB_CONTEXT_ACTIONS: [TabContextAction; 3] = [
     TabContextAction::CloseOthers,
     TabContextAction::NewSurface,
 ];
-const TAB_CONTEXT_WIDTH: f32 = 240.0;
-const WORKSPACE_CONTEXT_WIDTH: f32 = 250.0;
-const SIDEBAR_CONTEXT_WIDTH: f32 = 210.0;
-const TERMINAL_CONTEXT_WIDTH: f32 = 220.0;
 const TERMINAL_CONTEXT_ACTIONS: [TerminalContextAction; 4] = [
     TerminalContextAction::Copy,
     TerminalContextAction::Paste,
@@ -656,7 +655,6 @@ const NOTIFICATION_CONTEXT_ACTIONS: [NotificationContextAction; 3] = [
     NotificationContextAction::ToggleRead,
     NotificationContextAction::Clear,
 ];
-const NOTIFICATION_CONTEXT_WIDTH: f32 = 210.0;
 
 const WORKSPACE_CONTEXT_ACTIONS: [WorkspaceContextAction; 7] = [
     WorkspaceContextAction::NewSurface,
@@ -706,9 +704,12 @@ fn clear_recoverable_terminal_notice(
 pub fn run() -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     let config = wmcterm_config::load_or_default().context("loading wmcterm configuration")?;
-    let restored = state_path()
+    let mut restored = state_path()
         .filter(|path| path.exists())
         .and_then(|path| load_session(&path).ok());
+    if let Some(session) = &mut restored {
+        discard_unavailable_codex_resumes(session);
+    }
     let restored_commands = restored
         .as_ref()
         .map(|session| {
@@ -749,7 +750,10 @@ pub fn run() -> Result<()> {
                 .collect()
         })
         .unwrap_or_default();
-    let restored_state = restored.map(|session| session.app);
+    let restored_state = restored.map(|mut session| {
+        reconcile_restored_agent_modes(&mut session.app, &session.terminals);
+        session.app
+    });
     let mut app = WmctermApplication::new(
         event_loop.create_proxy(),
         config,
@@ -764,32 +768,183 @@ pub fn run() -> Result<()> {
         let terminals = app
             .terminals
             .iter()
-            .map(|(terminal_id, runtime)| TerminalResume {
-                terminal_id: *terminal_id,
-                cwd: app
-                    .cwd_for_terminal(*terminal_id)
-                    .unwrap_or_else(|| env::current_dir().unwrap_or_default()),
-                command: app.commands.get(terminal_id).cloned(),
-                agent: resume_info(&app.state, *terminal_id),
-                scrollback: runtime.session.export_history(),
+            .map(|(terminal_id, runtime)| {
+                let resume = resume_info(
+                    &app.state,
+                    &app.agent_sessions,
+                    &app.foreground_agents,
+                    *terminal_id,
+                );
+                TerminalResume {
+                    terminal_id: *terminal_id,
+                    cwd: app
+                        .cwd_for_terminal(*terminal_id)
+                        .unwrap_or_else(|| env::current_dir().unwrap_or_default()),
+                    command: match resume.as_ref() {
+                        Some(resume) if resume.managed => None,
+                        Some(resume) => Some(manual_agent_resume_command(&resume.agent.command())),
+                        None => app
+                            .commands
+                            .get(terminal_id)
+                            .filter(|command| !command.contains(MANUAL_AGENT_RESUME_MARKER))
+                            .cloned(),
+                    },
+                    agent: resume.map(|resume| resume.agent),
+                    scrollback: runtime.session.export_history(),
+                }
             })
             .collect();
-        save_session(
-            &path,
-            &Session {
-                version: SESSION_VERSION,
-                app: app.state.clone(),
-                terminals,
-                agent_sessions: app.agent_sessions.into_values().collect(),
-                window: Some(WindowState {
-                    width: app.window_size.width.max(600),
-                    height: app.window_size.height.max(360),
-                }),
-            },
-        )
-        .context("saving wmcterm session")?;
+        let mut session = Session {
+            version: SESSION_VERSION,
+            app: app.state.clone(),
+            terminals,
+            agent_sessions: app.agent_sessions.into_values().collect(),
+            window: Some(WindowState {
+                width: app.window_size.width.max(600),
+                height: app.window_size.height.max(360),
+            }),
+        };
+        discard_unavailable_codex_resumes(&mut session);
+        save_session(&path, &session).context("saving wmcterm session")?;
     }
     Ok(())
+}
+
+// Called only at save/load, never in terminal actors or the render loop.
+fn codex_rollout_exists(home: &std::path::Path, session_id: &str) -> bool {
+    if uuid::Uuid::parse_str(session_id).is_err() {
+        return false;
+    }
+    let suffix = format!("-{session_id}.jsonl");
+    let mut directories = vec![
+        (home.join("sessions"), 0),
+        (home.join("archived_sessions"), 0),
+    ];
+    while let Some((directory, depth)) = directories.pop() {
+        let Ok(entries) = std::fs::read_dir(directory) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else {
+                continue;
+            };
+            if kind.is_dir() && depth < 3 {
+                directories.push((entry.path(), depth + 1));
+            } else if kind.is_file() {
+                let name = entry.file_name();
+                let name = name.to_string_lossy();
+                if name.starts_with("rollout-")
+                    && name.ends_with(&suffix)
+                    && entry.metadata().is_ok_and(|metadata| metadata.len() > 0)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn discard_unavailable_codex_resumes(session: &mut Session) {
+    let home = wmcterm_codex::user_config_path()
+        .and_then(|path| path.parent().map(std::path::Path::to_owned));
+    discard_codex_resumes_without_record(session, |id| {
+        home.as_ref()
+            .is_some_and(|home| codex_rollout_exists(home, id))
+    });
+}
+
+fn discard_codex_resumes_without_record(session: &mut Session, exists: impl Fn(&str) -> bool) {
+    let mut cleared = HashSet::new();
+    for terminal in &mut session.terminals {
+        let discard = match &terminal.agent {
+            Some(agent @ AgentResumeInfo::Codex { session_id }) => {
+                let generated = terminal.command.as_ref().is_none_or(|command| {
+                    command == &agent.command()
+                        || is_manual_agent_resume_command(command)
+                        || is_stale_codex_teams_child_command(command, session_id)
+                });
+                generated && !exists(session_id)
+            }
+            None if terminal.command.is_none() => session.app.surfaces.values().any(|surface| {
+                matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal.terminal_id)
+                    && surface
+                        .agent
+                        .as_ref()
+                        .is_some_and(|agent| agent.name.eq_ignore_ascii_case("codex"))
+            }),
+            _ => false,
+        };
+        if !discard {
+            continue;
+        }
+        terminal.command = None;
+        terminal.agent = None;
+        for surface in session.app.surfaces.values_mut().filter(|surface| {
+            matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal.terminal_id)
+        }) {
+            surface.agent = None;
+            surface.attention = AttentionState::None;
+            cleared.insert(surface.id);
+        }
+    }
+    session
+        .agent_sessions
+        .retain(|agent| !cleared.contains(&agent.surface_id));
+    for workspace in &mut session.app.workspaces {
+        let mut panes = Vec::new();
+        workspace.root.leaves(&mut panes);
+        let surfaces: Vec<_> = panes
+            .iter()
+            .filter_map(|id| session.app.panes.get(id))
+            .flat_map(|pane| &pane.surfaces)
+            .filter_map(|id| session.app.surfaces.get(id))
+            .collect();
+        if surfaces.iter().any(|surface| cleared.contains(&surface.id))
+            && surfaces
+                .iter()
+                .all(|surface| surface.agent.is_none() && surface.attention == AttentionState::None)
+        {
+            workspace.status = wmcterm_core::WorkspaceStatus::Idle;
+        }
+    }
+}
+
+fn reconcile_restored_agent_modes(state: &mut AppState, terminals: &[TerminalResume]) {
+    for terminal in terminals {
+        let Some(agent) = &terminal.agent else {
+            continue;
+        };
+        let Some(command) = restored_terminal_command(terminal) else {
+            continue;
+        };
+        // These generated resume commands intentionally omit elevated modes.
+        // Preserve metadata for explicit launch commands that are replayed as-is.
+        if command != agent.command() && !is_manual_agent_resume_command(&command) {
+            continue;
+        }
+        for surface in state.surfaces.values_mut().filter(|surface| {
+            matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal.terminal_id)
+        }) {
+            if let Some(metadata) = &mut surface.agent {
+                metadata.run_mode = AgentRunMode::Interactive;
+            }
+        }
+    }
+}
+
+fn sync_detected_agent_mode(
+    metadata: &mut wmcterm_core::AgentMetadata,
+    agent: AgentKind,
+    run_mode: AgentRunMode,
+) -> bool {
+    if AgentKind::from_process_command(&metadata.name) != Some(agent)
+        || metadata.run_mode == run_mode
+    {
+        return false;
+    }
+    metadata.run_mode = run_mode;
+    true
 }
 
 fn restored_terminal_command(terminal: &TerminalResume) -> Option<String> {
@@ -798,6 +953,9 @@ fn restored_terminal_command(terminal: &TerminalResume) -> Option<String> {
             if is_stale_codex_teams_child_command(command, session_id) =>
         {
             Some(agent.command())
+        }
+        (Some(command), Some(agent)) if *command == agent.command() => {
+            Some(manual_agent_resume_command(command))
         }
         (Some(command), _) => Some(command.clone()),
         (None, Some(agent)) => Some(agent.command()),
@@ -878,6 +1036,7 @@ struct WmctermApplication {
     selection_autoscroll_last: Option<std::time::Instant>,
     split_drag: Option<SplitDrag>,
     sidebar_drag: bool,
+    sidebar_scrollbar_drag: Option<f32>,
     workspace_drag: Option<WorkspaceDrag>,
     scrollbar_drag: Option<ScrollbarDrag>,
     mouse_pressed: bool,
@@ -911,7 +1070,7 @@ struct WmctermApplication {
     metadata_refresh_in_flight: bool,
     terminal_notices: HashMap<TerminalId, TerminalNotice>,
     terminal_processes: HashMap<TerminalId, Vec<String>>,
-    foreground_agents: HashMap<TerminalId, AgentKind>,
+    foreground_agents: HashMap<TerminalId, (AgentKind, AgentRunMode)>,
     automatic_agent_status: HashSet<TerminalId>,
     foreground_agent_input: HashMap<TerminalId, String>,
     scene_dirty: bool,
@@ -1081,6 +1240,7 @@ impl WmctermApplication {
             selection_autoscroll_last: None,
             split_drag: None,
             sidebar_drag: false,
+            sidebar_scrollbar_drag: None,
             workspace_drag: None,
             scrollbar_drag: None,
             mouse_pressed: false,
@@ -1505,6 +1665,7 @@ impl WmctermApplication {
                 SessionEvent::Exited(status) => {
                     tracing::info!(terminal=%tagged.terminal, %status, "terminal exited");
                     self.close_agent_session_for_terminal(terminal_id, status.clone());
+                    self.clear_manual_agent_resume_after_terminal_exit(terminal_id);
                     self.report_terminal_notice(terminal_id, TerminalNotice::Exited(status));
                     changed = true;
                 }
@@ -1708,7 +1869,13 @@ impl WmctermApplication {
         event: AgentEvent,
     ) -> wmcterm_core::AgentState {
         self.automatic_agent_status.remove(&terminal);
-        let transition = reduce_agent(&event);
+        let run_mode = self
+            .surface_for_terminal(terminal)
+            .and_then(|surface| self.state.surfaces.get(&surface))
+            .and_then(|surface| surface.agent.as_ref())
+            .map(|agent| agent.run_mode)
+            .unwrap_or_default();
+        let transition = agent_transition_for_run_mode(&event, run_mode);
         let suppress_notification = non_actionable_agent_exit(&event);
         let announced = match &event {
             AgentEvent::SessionStart { agent, session_id } => {
@@ -1722,6 +1889,11 @@ impl WmctermApplication {
             .values_mut()
             .find(|surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal))
         {
+            let run_mode = surface
+                .agent
+                .as_ref()
+                .map(|agent| agent.run_mode)
+                .unwrap_or_default();
             let (name, session_id) = announced.unwrap_or_else(|| {
                 surface
                     .agent
@@ -1733,6 +1905,7 @@ impl WmctermApplication {
                 name,
                 state: transition.state,
                 session_id,
+                run_mode,
             });
             surface.attention = transition.attention;
         }
@@ -1831,7 +2004,14 @@ impl WmctermApplication {
         let suffix = sequence
             .map(|value| value.to_string())
             .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let kind = agent_session_event_kind(event, &suffix)
+        let run_mode = self
+            .state
+            .surfaces
+            .get(&surface)
+            .and_then(|surface| surface.agent.as_ref())
+            .map(|agent| agent.run_mode)
+            .unwrap_or_default();
+        let kind = agent_session_event_kind(event, &suffix, run_mode)
             .ok_or_else(|| "session start must be handled before event mapping".to_owned())?;
         let event = AgentSessionEvent {
             event_id: format!("{effective_lifecycle}:{suffix}"),
@@ -2149,17 +2329,44 @@ impl WmctermApplication {
         self.sync_surface_agent_request_state(surface);
     }
 
+    fn clear_manual_agent_resume_after_terminal_exit(&mut self, terminal: TerminalId) {
+        if !self
+            .commands
+            .get(&terminal)
+            .is_some_and(|command| is_manual_agent_resume_command(command))
+        {
+            return;
+        }
+        self.commands.remove(&terminal);
+        self.foreground_agents.remove(&terminal);
+        self.foreground_agent_input.remove(&terminal);
+        self.automatic_agent_status.remove(&terminal);
+        let Some(surface) = self.surface_for_terminal(terminal) else {
+            return;
+        };
+        self.agent_sessions.remove(&surface);
+        clear_codex_subagent_surface(&mut self.codex_subagents, surface);
+        if let Some(surface) = self.state.surfaces.get_mut(&surface) {
+            surface.agent = None;
+            surface.attention = AttentionState::None;
+        }
+        if let Some(workspace) = self.workspace_for_surface(surface) {
+            self.sync_workspace_agent_status(workspace);
+        }
+    }
+
     fn update_foreground_agent(&mut self, terminal: TerminalId, commands: &[String]) -> bool {
-        let detected = commands
-            .iter()
-            .find_map(|command| AgentKind::from_process_command(command));
+        let detected = commands.iter().find_map(|command| {
+            AgentKind::from_process_command(command)
+                .map(|agent| (agent, agent.run_mode_from_process_command(command)))
+        });
         let previous = self.foreground_agents.get(&terminal).copied();
         if previous == detected {
             return false;
         }
         match detected {
-            Some(agent) => {
-                self.foreground_agents.insert(terminal, agent);
+            Some((agent, run_mode)) => {
+                self.foreground_agents.insert(terminal, (agent, run_mode));
                 self.foreground_agent_input.remove(&terminal);
                 let should_update = self.automatic_agent_status.contains(&terminal)
                     || self
@@ -2171,13 +2378,24 @@ impl WmctermApplication {
                         })
                         .is_none_or(|surface| surface.agent.is_none());
                 if !should_update {
-                    return false;
+                    // Hook/session state owns the task status, but a manually
+                    // launched process still owns its current approval mode.
+                    if agent_launch_is_managed(
+                        self.commands.get(&terminal).map(String::as_str),
+                        agent.as_str(),
+                    ) {
+                        return false;
+                    }
+                    return self.state.surfaces.values_mut().find(|surface| {
+                        matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal)
+                    }).and_then(|surface| surface.agent.as_mut())
+                        .is_some_and(|metadata| sync_detected_agent_mode(metadata, agent, run_mode));
                 }
                 self.automatic_agent_status.insert(terminal);
                 if let Some(surface) = self.state.surfaces.values_mut().find(
                     |surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal),
                 ) {
-                    surface.agent = Some(detected_foreground_agent_metadata(agent));
+                    surface.agent = Some(detected_foreground_agent_metadata(agent, run_mode));
                     surface.attention = AttentionState::None;
                 }
                 if let Some(index) = self.workspace_for_terminal(terminal)
@@ -2193,9 +2411,7 @@ impl WmctermApplication {
             None => {
                 self.foreground_agents.remove(&terminal);
                 self.foreground_agent_input.remove(&terminal);
-                if !self.automatic_agent_status.remove(&terminal) {
-                    return false;
-                }
+                self.automatic_agent_status.remove(&terminal);
                 if let Some(surface) = self.state.surfaces.values_mut().find(
                     |surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal),
                 ) {
@@ -2208,6 +2424,8 @@ impl WmctermApplication {
                     workspace.status = wmcterm_core::WorkspaceStatus::Idle;
                 }
                 if let Some(surface) = self.surface_for_terminal(terminal) {
+                    self.agent_sessions.remove(&surface);
+                    clear_codex_subagent_surface(&mut self.codex_subagents, surface);
                     self.sync_surface_agent_request_state(surface);
                 }
                 true
@@ -2216,7 +2434,7 @@ impl WmctermApplication {
     }
 
     fn mark_foreground_agent_running(&mut self, terminal: TerminalId) {
-        let Some(agent) = self.foreground_agents.get(&terminal).copied() else {
+        let Some((agent, run_mode)) = self.foreground_agents.get(&terminal).copied() else {
             return;
         };
         self.automatic_agent_status.insert(terminal);
@@ -2234,6 +2452,7 @@ impl WmctermApplication {
                 name: agent.as_str().to_owned(),
                 state: wmcterm_core::AgentState::Running,
                 session_id,
+                run_mode,
             });
             surface.attention = AttentionState::None;
         }
@@ -2249,7 +2468,7 @@ impl WmctermApplication {
     }
 
     fn mark_foreground_agent_idle(&mut self, terminal: TerminalId) {
-        let Some(agent) = self.foreground_agents.get(&terminal).copied() else {
+        let Some((agent, run_mode)) = self.foreground_agents.get(&terminal).copied() else {
             return;
         };
         self.automatic_agent_status.insert(terminal);
@@ -2267,6 +2486,7 @@ impl WmctermApplication {
                 name: agent.as_str().to_owned(),
                 state: wmcterm_core::AgentState::Idle,
                 session_id,
+                run_mode,
             });
             surface.attention = AttentionState::None;
         }
@@ -2862,17 +3082,6 @@ impl WmctermApplication {
             && let Some(action) = self.keybindings.action_for(&shortcut).map(str::to_owned)
         {
             self.execute_action(&action);
-            return;
-        }
-        if self.modifiers.control_key()
-            && !self.modifiers.alt_key()
-            && !self.modifiers.super_key()
-            && event.physical_key == PhysicalKey::Code(KeyCode::KeyC)
-            && self
-                .selection
-                .is_some_and(|selection| selection.start != selection.end)
-        {
-            self.copy_selection(ClipboardTarget::Clipboard);
             return;
         }
         if self.config.ui.legacy_shortcuts {
@@ -3533,6 +3742,27 @@ impl WmctermApplication {
             .count()
     }
 
+    fn workspace_agent_run_mode(&self, workspace_index: usize) -> AgentRunMode {
+        let Some(workspace) = self.state.workspaces.get(workspace_index) else {
+            return AgentRunMode::Interactive;
+        };
+        let mut pane_ids = Vec::new();
+        workspace.root.leaves(&mut pane_ids);
+        pane_ids
+            .iter()
+            .filter_map(|id| self.state.panes.get(id))
+            .flat_map(|pane| pane.surfaces.iter())
+            .filter_map(|surface| self.state.surfaces.get(surface))
+            .filter_map(|surface| surface.agent.as_ref())
+            .map(|agent| agent.run_mode)
+            .max_by_key(|mode| match mode {
+                AgentRunMode::Interactive => 0,
+                AgentRunMode::Unattended => 1,
+                AgentRunMode::FullAccess => 2,
+            })
+            .unwrap_or_default()
+    }
+
     fn agent_state_text(&self, priority: u8) -> &'static str {
         match priority {
             5 => self.language.error(),
@@ -4035,6 +4265,22 @@ impl WmctermApplication {
         let Some(pane) = self.state.panes.get(&pane) else {
             return Vec::new();
         };
+        let tab_font_size = self.terminal_font_size.min(12.0);
+        let preferred_widths: Vec<_> = pane
+            .surfaces
+            .iter()
+            .enumerate()
+            .map(|(index, surface)| {
+                self.state.surfaces.get(surface).map_or(64.0, |surface| {
+                    ui::surface_tab_width_at(
+                        &surface.title,
+                        index,
+                        tab_font_size * 0.6,
+                        surface.agent.is_some(),
+                    )
+                })
+            })
+            .collect();
         ui::surface_tabs_layout(
             ui::Bounds {
                 x: rect.x,
@@ -4042,7 +4288,7 @@ impl WmctermApplication {
                 width: rect.width,
                 height: rect.height,
             },
-            pane.surfaces.len(),
+            &preferred_widths,
             pane.active_surface,
         )
     }
@@ -4108,6 +4354,62 @@ impl WmctermApplication {
             lines,
             menu.scroll_offset,
         )
+    }
+
+    fn sidebar_scrollbar_at_cursor(&self) -> Option<(ui::Bounds, ui::Bounds)> {
+        if !self.sidebar_visible || self.pointer_over_overlay() {
+            return None;
+        }
+        self.sidebar_layout()
+            .scrollbar
+            .filter(|(track, _)| track.contains(self.cursor_position.0, self.cursor_position.1))
+    }
+
+    fn begin_sidebar_scrollbar_action(&mut self) -> bool {
+        let Some((track, thumb)) = self.sidebar_scrollbar_at_cursor() else {
+            return false;
+        };
+        let pointer_y = self.cursor_position.1;
+        // Clicking the rail centers the thumb, then permits a continuous drag.
+        let grab_y = if thumb.contains(self.cursor_position.0, pointer_y) {
+            pointer_y - thumb.y
+        } else {
+            thumb.height / 2.0
+        };
+        self.sidebar_scroll = scrollbar_scroll_for_pointer(
+            track,
+            thumb,
+            self.sidebar_layout().max_scroll,
+            pointer_y,
+            grab_y,
+        );
+        self.sidebar_scrollbar_drag = Some(grab_y);
+        self.rebuild_scene();
+        true
+    }
+
+    fn update_sidebar_scrollbar_drag(&mut self) -> bool {
+        let Some(grab_y) = self.sidebar_scrollbar_drag else {
+            return false;
+        };
+        let layout = self.sidebar_layout();
+        if self.sidebar_visible
+            && !self.pointer_over_overlay()
+            && let Some((track, thumb)) = layout.scrollbar
+        {
+            self.sidebar_scroll = scrollbar_scroll_for_pointer(
+                track,
+                thumb,
+                layout.max_scroll,
+                self.cursor_position.1,
+                grab_y,
+            );
+            self.rebuild_scene();
+        } else {
+            self.sidebar_scrollbar_drag = None;
+            self.mouse_pressed = false;
+        }
+        true
     }
 
     fn scroll_sidebar(&mut self, direction: isize) {
@@ -4375,7 +4677,6 @@ impl WmctermApplication {
             PromptKind::ChangeWorkspaceDirectory => workspace.cwd.display().to_string(),
             PromptKind::FindDirectory => String::new(),
             PromptKind::FilterLogs => String::new(),
-            PromptKind::ConfirmFullAccess(_) => String::new(),
         };
         self.prompt = Some(TextPrompt {
             kind,
@@ -4408,10 +4709,11 @@ impl WmctermApplication {
         if self.state.active_workspace().is_none() {
             return;
         }
-        self.prompt = Some(TextPrompt {
-            kind: PromptKind::ConfirmFullAccess(agent),
-            editor: TextEditor::default(),
-            error: None,
+        self.prompt = None;
+        self.close_confirmation = Some(CloseConfirmation {
+            target: CloseTarget::FullAccess(agent),
+            title: self.language.full_access_confirmation_title(agent.name()),
+            message: self.language.full_access_confirmation_message().into(),
         });
         self.rebuild_scene();
     }
@@ -4481,18 +4783,6 @@ impl WmctermApplication {
             return;
         };
         let input = prompt.editor.text().trim().to_owned();
-        if let PromptKind::ConfirmFullAccess(agent) = prompt.kind {
-            if input != "FULL ACCESS" {
-                self.prompt = Some(TextPrompt {
-                    error: Some(self.language.full_access_confirmation_error().into()),
-                    ..prompt
-                });
-                self.rebuild_scene();
-                return;
-            }
-            self.new_surface_command(Some(agent.full_access_command().into()));
-            return;
-        }
         let changes_directory = matches!(prompt.kind, PromptKind::ChangeWorkspaceDirectory);
         if matches!(prompt.kind, PromptKind::RenameWorkspace) && input.is_empty() {
             self.prompt = Some(TextPrompt {
@@ -4557,7 +4847,6 @@ impl WmctermApplication {
                 self.rebuild_scene();
                 return;
             }
-            PromptKind::ConfirmFullAccess(_) => unreachable!("handled before workspace command"),
         };
         let _ = self.state.execute(command);
         if changes_directory {
@@ -4644,6 +4933,9 @@ impl WmctermApplication {
                 self.remove_workspace_by_id(workspace);
             }
             CloseTarget::Application => self.quit_requested = true,
+            CloseTarget::FullAccess(agent) => {
+                self.new_surface_command(Some(agent.full_access_command().into()));
+            }
         }
         self.update_navigation_hover();
         self.update_cursor_icon();
@@ -6161,6 +6453,9 @@ impl WmctermApplication {
             self.sidebar_drag = true;
             return;
         }
+        if self.begin_sidebar_scrollbar_action() {
+            return;
+        }
         if self.begin_scrollbar_action() {
             return;
         }
@@ -6518,7 +6813,7 @@ impl WmctermApplication {
                 menu.anchor.1,
                 self.window_size.width as f32,
                 self.window_size.height as f32,
-                NOTIFICATION_CONTEXT_WIDTH,
+                ui::context_menu_width(&self.language.notification_context_labels(false)),
                 30.0,
                 NOTIFICATION_CONTEXT_ACTIONS.len(),
             );
@@ -6543,7 +6838,7 @@ impl WmctermApplication {
                 menu.anchor.1,
                 self.window_size.width as f32,
                 self.window_size.height as f32,
-                TERMINAL_CONTEXT_WIDTH,
+                ui::context_menu_width(&self.language.terminal_context_labels()),
                 30.0,
                 TERMINAL_CONTEXT_ACTIONS.len(),
             );
@@ -6563,7 +6858,7 @@ impl WmctermApplication {
                 menu.anchor.1,
                 self.window_size.width as f32,
                 self.window_size.height as f32,
-                TAB_CONTEXT_WIDTH,
+                ui::context_menu_width(&self.language.tab_context_labels()),
                 30.0,
                 TAB_CONTEXT_ACTIONS.len(),
             );
@@ -6583,7 +6878,7 @@ impl WmctermApplication {
                 menu.anchor.1,
                 self.window_size.width as f32,
                 self.window_size.height as f32,
-                WORKSPACE_CONTEXT_WIDTH,
+                ui::context_menu_width(&self.language.workspace_context_labels()),
                 30.0,
                 WORKSPACE_CONTEXT_ACTIONS.len(),
             );
@@ -6603,7 +6898,7 @@ impl WmctermApplication {
                 menu.anchor.1,
                 self.window_size.width as f32,
                 self.window_size.height as f32,
-                SIDEBAR_CONTEXT_WIDTH,
+                ui::context_menu_width(&[self.language.new_workspace()]),
                 30.0,
                 1,
             );
@@ -6648,7 +6943,7 @@ impl WmctermApplication {
             let panel = self.command_palette_panel(actions.len());
             let command = self.titlebar_command_bounds();
             if command.contains(x, y) {
-                let prefix = format!("{}  > ", self.language.command_palette());
+                let prefix = format!("{} > ", self.language.command_palette());
                 let query_left = command.x + 12.0 + ui::display_width(&prefix) as f32 * 14.0 * 0.6;
                 let character_width = 14.0 * 0.6;
                 let viewport = self.palette_query.viewport(editor_columns(
@@ -6817,7 +7112,7 @@ impl WmctermApplication {
                 menu.anchor.1,
                 self.window_size.width as f32,
                 self.window_size.height as f32,
-                NOTIFICATION_CONTEXT_WIDTH,
+                ui::context_menu_width(&self.language.notification_context_labels(false)),
                 30.0,
                 NOTIFICATION_CONTEXT_ACTIONS.len(),
             );
@@ -6830,7 +7125,7 @@ impl WmctermApplication {
                 menu.anchor.1,
                 self.window_size.width as f32,
                 self.window_size.height as f32,
-                TERMINAL_CONTEXT_WIDTH,
+                ui::context_menu_width(&self.language.terminal_context_labels()),
                 30.0,
                 TERMINAL_CONTEXT_ACTIONS.len(),
             );
@@ -6848,7 +7143,7 @@ impl WmctermApplication {
                 menu.anchor.1,
                 self.window_size.width as f32,
                 self.window_size.height as f32,
-                TAB_CONTEXT_WIDTH,
+                ui::context_menu_width(&self.language.tab_context_labels()),
                 30.0,
                 TAB_CONTEXT_ACTIONS.len(),
             );
@@ -6863,7 +7158,7 @@ impl WmctermApplication {
                 menu.anchor.1,
                 self.window_size.width as f32,
                 self.window_size.height as f32,
-                WORKSPACE_CONTEXT_WIDTH,
+                ui::context_menu_width(&self.language.workspace_context_labels()),
                 30.0,
                 WORKSPACE_CONTEXT_ACTIONS.len(),
             );
@@ -6880,7 +7175,7 @@ impl WmctermApplication {
                 menu.anchor.1,
                 self.window_size.width as f32,
                 self.window_size.height as f32,
-                SIDEBAR_CONTEXT_WIDTH,
+                ui::context_menu_width(&[self.language.new_workspace()]),
                 30.0,
                 1,
             );
@@ -6889,6 +7184,12 @@ impl WmctermApplication {
         }
         if self.prompt.is_some() || self.palette_visible {
             return None;
+        }
+        if self.sidebar_resize_hit(x, y) && !self.pointer_over_overlay() {
+            return Some(NavigationHover::SidebarResize);
+        }
+        if self.sidebar_scrollbar_at_cursor().is_some() {
+            return Some(NavigationHover::SidebarScrollbar);
         }
         if let Some(index) = self
             .titlebar_buttons()
@@ -6960,6 +7261,29 @@ impl WmctermApplication {
                 .new_workspace
                 .contains(x, y)
                 .then_some(NavigationHover::NewWorkspace);
+        }
+        if let Some(workspace) = self.state.active_workspace()
+            && !self
+                .state
+                .panes
+                .get(&workspace.active_pane)
+                .is_some_and(|pane| pane.zoomed)
+        {
+            let area = terminal_workspace_area(
+                self.window_size.width as f32,
+                self.window_size.height as f32,
+                self.sidebar_width(),
+            );
+            if let Some(hovered) = divider_at(&workspace.root, area, x, y, &mut Vec::new()) {
+                let mut dividers = Vec::new();
+                collect_dividers(&workspace.root, area, &mut Vec::new(), &mut dividers);
+                if let Some(index) = dividers
+                    .iter()
+                    .position(|divider| divider.path == hovered.path)
+                {
+                    return Some(NavigationHover::PaneDivider(index));
+                }
+            }
         }
         for (pane, rect) in self.pane_rects() {
             if y < rect.y || y >= rect.y + 25.0 || x < rect.x || x >= rect.x + rect.width {
@@ -7039,7 +7363,11 @@ impl WmctermApplication {
                 SplitAxis::Vertical => CursorIcon::ColResize,
                 SplitAxis::Horizontal => CursorIcon::RowResize,
             }
-        } else if self.scrollbar_drag.is_some() || self.scrollbar_at_cursor().is_some() {
+        } else if self.sidebar_scrollbar_drag.is_some()
+            || self.sidebar_scrollbar_at_cursor().is_some()
+            || self.scrollbar_drag.is_some()
+            || self.scrollbar_at_cursor().is_some()
+        {
             CursorIcon::NsResize
         } else if self.titlebar_command_bounds().contains(x, y) {
             if self.palette_visible {
@@ -7153,7 +7481,7 @@ impl WmctermApplication {
             )
         } else if self.palette_visible {
             let command = self.titlebar_command_bounds();
-            let prefix = format!("{}  > ", self.language.command_palette());
+            let prefix = format!("{} > ", self.language.command_palette());
             let character_width = 14.0 * 0.6;
             let viewport = self.palette_query.viewport(editor_columns(
                 command.width - 24.0 - ui::display_width(&prefix) as f32 * character_width,
@@ -7306,6 +7634,9 @@ impl WmctermApplication {
             self.rebuild_scene();
             return;
         }
+        if self.update_sidebar_scrollbar_drag() {
+            return;
+        }
         if self.update_scrollbar_drag() {
             return;
         }
@@ -7426,6 +7757,7 @@ impl WmctermApplication {
             || self.scrollbar_drag.is_some()
             || self.split_drag.is_some()
             || self.sidebar_drag
+            || self.sidebar_scrollbar_drag.is_some()
             || self.workspace_drag.is_some()
         {
             self.selection_autoscroll_last = None;
@@ -7541,7 +7873,7 @@ impl WmctermApplication {
             }
             TextEditTarget::Palette => {
                 let command = self.titlebar_command_bounds();
-                let prefix = format!("{}  > ", self.language.command_palette());
+                let prefix = format!("{} > ", self.language.command_palette());
                 let character_width = 14.0 * 0.6;
                 let left = command.x + 12.0 + ui::display_width(&prefix) as f32 * character_width;
                 let viewport = self.palette_query.viewport(editor_columns(
@@ -7588,6 +7920,10 @@ impl WmctermApplication {
         }
         if self.sidebar_drag {
             self.sidebar_drag = false;
+            self.rebuild_scene();
+            return;
+        }
+        if self.sidebar_scrollbar_drag.take().is_some() {
             self.rebuild_scene();
             return;
         }
@@ -8056,29 +8392,13 @@ impl WmctermApplication {
         let mut overlay_blocks = Vec::new();
         let mut overlay_rectangles = Vec::new();
         if self.sidebar_visible {
-            let sidebar_resize_hovered =
-                self.sidebar_resize_hit(self.cursor_position.0, self.cursor_position.1);
-            let sidebar_resize_active = self.sidebar_drag || sidebar_resize_hovered;
-            rectangles.extend([
-                RectBlock {
-                    left: 0.0,
-                    top: 0.0,
-                    width: self.sidebar_width(),
-                    height: self.window_size.height as f32,
-                    color: theme_mantle,
-                },
-                RectBlock {
-                    left: self.sidebar_width() - if sidebar_resize_active { 1.5 } else { 0.0 },
-                    top: 0.0,
-                    width: if sidebar_resize_active { 3.0 } else { 1.0 },
-                    height: self.window_size.height as f32,
-                    color: if sidebar_resize_active {
-                        theme_blue
-                    } else {
-                        theme_border
-                    },
-                },
-            ]);
+            rectangles.push(RectBlock {
+                left: 0.0,
+                top: 0.0,
+                width: self.sidebar_width(),
+                height: self.window_size.height as f32,
+                color: theme_mantle,
+            });
             let search = self.workspace_search_bounds();
             rectangles.push(RectBlock {
                 left: search.x,
@@ -8163,13 +8483,23 @@ impl WmctermApplication {
             });
             for row in &sidebar_layout.rows {
                 let item = &self.state.workspaces[row.index];
+                let right_padding = if sidebar_layout.scrollbar.is_some() {
+                    6.0
+                } else {
+                    12.0
+                };
+                let background_right_padding = if sidebar_layout.scrollbar.is_some() {
+                    2.0
+                } else {
+                    6.0
+                };
                 let active = row.index == self.state.active_workspace;
                 let hovered = self.navigation_hover == Some(NavigationHover::Workspace(row.index));
                 if active || hovered {
                     rectangles.push(RectBlock {
                         left: row.bounds.x + 6.0,
                         top: row.bounds.y + 1.0,
-                        width: (row.bounds.width - 12.0).max(1.0),
+                        width: (row.bounds.width - 6.0 - background_right_padding).max(1.0),
                         height: row.bounds.height - 2.0,
                         color: if active { theme_selection } else { theme_hover },
                     });
@@ -8186,7 +8516,7 @@ impl WmctermApplication {
                 rectangles.push(RectBlock {
                     left: row.bounds.x + 12.0,
                     top: row.bounds.y + row.bounds.height - 1.0,
-                    width: (row.bounds.width - 24.0).max(1.0),
+                    width: (row.bounds.width - 12.0 - right_padding).max(1.0),
                     height: 1.0,
                     color: theme_border,
                 });
@@ -8206,11 +8536,12 @@ impl WmctermApplication {
                     } else {
                         16.0
                     };
-                let text_width = (row.bounds.x + row.bounds.width - 12.0 - text_left).max(1.0);
+                let text_width =
+                    (row.bounds.x + row.bounds.width - right_padding - text_left).max(1.0);
                 let text_columns = (text_width / (14.0 * 0.6)).max(1.0) as usize;
                 let agent_priority = self.workspace_agent_priority(row.index);
                 let subagent_count = self.workspace_claude_subagent_count(row.index);
-                let agent_state = if subagent_count == 0 {
+                let mut agent_state = if subagent_count == 0 {
                     self.agent_state_text(agent_priority).to_owned()
                 } else {
                     format!(
@@ -8219,6 +8550,17 @@ impl WmctermApplication {
                         self.language.subagent_count(subagent_count)
                     )
                 };
+                match self.workspace_agent_run_mode(row.index) {
+                    AgentRunMode::Interactive => {}
+                    AgentRunMode::Unattended => {
+                        agent_state.push_str(" · ");
+                        agent_state.push_str(self.language.unattended());
+                    }
+                    AgentRunMode::FullAccess => {
+                        agent_state.push_str(" · ");
+                        agent_state.push_str(self.language.full_access());
+                    }
+                }
                 let show_agent = agent_priority > 0;
                 let agent_color = match agent_priority {
                     5 => theme_red,
@@ -8287,7 +8629,7 @@ impl WmctermApplication {
                         ],
                         left: row.bounds.x + 16.0,
                         top: next_top,
-                        width: row.bounds.width - 28.0,
+                        width: row.bounds.width - 16.0 - right_padding,
                         height: 18.0,
                         color: theme_subtext,
                         font_size: 12.0,
@@ -8307,7 +8649,7 @@ impl WmctermApplication {
                         ],
                         left: row.bounds.x + 16.0,
                         top: next_top,
-                        width: row.bounds.width - 28.0,
+                        width: row.bounds.width - 16.0 - right_padding,
                         height: 18.0,
                         color: theme_subtext,
                         font_size: 12.0,
@@ -8315,7 +8657,8 @@ impl WmctermApplication {
                     });
                     next_top += 19.0;
                 }
-                let path_columns = ((row.bounds.width - 28.0) / (12.0 * 0.6)).max(1.0) as usize;
+                let path_columns =
+                    ((row.bounds.width - 16.0 - right_padding) / (12.0 * 0.6)).max(1.0) as usize;
                 blocks.push(TextBlock {
                     text: ui::truncate_display_width_start(
                         &item.cwd.to_string_lossy(),
@@ -8324,11 +8667,33 @@ impl WmctermApplication {
                     spans: vec![],
                     left: row.bounds.x + 16.0,
                     top: next_top,
-                    width: row.bounds.width - 28.0,
+                    width: row.bounds.width - 16.0 - right_padding,
                     height: 18.0,
                     color: theme_subtext,
                     font_size: 12.0,
                     line_height: 17.0,
+                });
+            }
+            if let Some((track, thumb)) = sidebar_layout.scrollbar {
+                rectangles.push(RectBlock {
+                    left: track.x,
+                    top: track.y,
+                    width: track.width,
+                    height: track.height,
+                    color: theme_surface,
+                });
+                rectangles.push(RectBlock {
+                    left: thumb.x + 1.0,
+                    top: thumb.y,
+                    width: thumb.width - 2.0,
+                    height: thumb.height,
+                    color: if self.sidebar_scrollbar_drag.is_some()
+                        || self.navigation_hover == Some(NavigationHover::SidebarScrollbar)
+                    {
+                        theme_blue
+                    } else {
+                        theme_subtext
+                    },
                 });
             }
             rectangles.push(RectBlock {
@@ -8635,7 +9000,7 @@ impl WmctermApplication {
                     blocks.push(TextBlock {
                         text: String::new(),
                         spans: vec![TextSpan {
-                            text: ui::surface_tab_visible_title(
+                            text: ui::surface_tab_render_title(
                                 &surface.title,
                                 surface.agent.is_some(),
                                 title_bounds.width,
@@ -9142,6 +9507,29 @@ impl WmctermApplication {
                 });
             }
         }
+        if self.sidebar_visible && self.sidebar_width() > 0.0 {
+            let highlighted = self.sidebar_drag
+                || (!self.pointer_over_overlay()
+                    && self.sidebar_resize_hit(self.cursor_position.0, self.cursor_position.1));
+            let edge = ui::sidebar_edge_bounds(
+                self.sidebar_width(),
+                self.window_size.height as f32,
+                if highlighted { 3.0 } else { 1.0 },
+            );
+            // Paint after all panes, but below UI overlays. Both sides of the
+            // stroke reach the bottom equally; no exposed 4px stub remains.
+            rectangles.push(RectBlock {
+                left: edge.x,
+                top: edge.y,
+                width: edge.width,
+                height: edge.height,
+                color: if highlighted {
+                    theme_blue
+                } else {
+                    theme_border
+                },
+            });
+        }
         if self.search_visible {
             let status = self
                 .search_result
@@ -9371,7 +9759,15 @@ impl WmctermApplication {
             });
             for (bounds, text, color) in [
                 (cancel, self.language.cancel(), theme_text),
-                (confirm, self.language.close_anyway(), theme_text),
+                (
+                    confirm,
+                    if matches!(confirmation.target, CloseTarget::FullAccess(_)) {
+                        self.language.confirm()
+                    } else {
+                        self.language.close_anyway()
+                    },
+                    theme_text,
+                ),
             ] {
                 let text_width = ui::display_width(text) as f32 * 14.0 * 0.6;
                 overlay_blocks.push(TextBlock {
@@ -9398,9 +9794,6 @@ impl WmctermApplication {
                 }
                 PromptKind::FindDirectory => self.language.find_workspace().to_owned(),
                 PromptKind::FilterLogs => self.language.filter_logs().to_owned(),
-                PromptKind::ConfirmFullAccess(agent) => {
-                    self.language.full_access_confirmation(agent.name())
-                }
             };
             overlay_rectangles.push(RectBlock {
                 left: 0.0,
@@ -10014,22 +10407,6 @@ impl WmctermApplication {
                 });
             }
         }
-        if self.sidebar_drag {
-            overlay_rectangles.push(RectBlock {
-                left: (self.sidebar_width() - 3.0).max(0.0),
-                top: 0.0,
-                width: 6.0,
-                height: self.window_size.height as f32,
-                color: [theme_blue[0], theme_blue[1], theme_blue[2], 70],
-            });
-            overlay_rectangles.push(RectBlock {
-                left: (self.sidebar_width() - 1.0).max(0.0),
-                top: 0.0,
-                width: 2.0,
-                height: self.window_size.height as f32,
-                color: theme_blue,
-            });
-        }
         rectangles.push(RectBlock {
             left: 0.0,
             top: 0.0,
@@ -10056,10 +10433,10 @@ impl WmctermApplication {
             height: command.height - 2.0,
             color: theme_surface,
         });
-        let palette_prefix = format!("{}  > ", self.language.command_palette());
+        let palette_prefix = format!("{} > ", self.language.command_palette());
         let palette_prefix_columns = ui::display_width(&palette_prefix);
         if self.palette_visible {
-            let prefix = format!("{}  > ", self.language.command_palette());
+            let prefix = format!("{} > ", self.language.command_palette());
             let character_width = 14.0 * 0.6;
             let palette_viewport = self.palette_query.viewport(editor_columns(
                 command.width - 24.0 - ui::display_width(&prefix) as f32 * character_width,
@@ -10238,7 +10615,7 @@ impl WmctermApplication {
                 menu.anchor.1,
                 self.window_size.width as f32,
                 self.window_size.height as f32,
-                NOTIFICATION_CONTEXT_WIDTH,
+                ui::context_menu_width(&self.language.notification_context_labels(false)),
                 30.0,
                 NOTIFICATION_CONTEXT_ACTIONS.len(),
             );
@@ -10249,23 +10626,7 @@ impl WmctermApplication {
                 .iter()
                 .find(|item| item.id == menu.notification)
                 .is_some_and(|item| item.read);
-            let labels = if self.language.is_chinese() {
-                [
-                    "打开通知",
-                    if is_read {
-                        "标记为未读"
-                    } else {
-                        "标记为已读"
-                    },
-                    "清除通知",
-                ]
-            } else {
-                [
-                    "Open Notification",
-                    if is_read { "Mark Unread" } else { "Mark Read" },
-                    "Clear Notification",
-                ]
-            };
+            let labels = self.language.notification_context_labels(is_read);
             for (index, label) in labels.into_iter().enumerate() {
                 if self.navigation_hover == Some(NavigationHover::ContextAction(index)) {
                     overlay_rectangles.push(RectBlock {
@@ -10360,16 +10721,12 @@ impl WmctermApplication {
                 menu.anchor.1,
                 self.window_size.width as f32,
                 self.window_size.height as f32,
-                TERMINAL_CONTEXT_WIDTH,
+                ui::context_menu_width(&self.language.terminal_context_labels()),
                 30.0,
                 TERMINAL_CONTEXT_ACTIONS.len(),
             );
             overlay_rectangles.extend(context_menu_frame(panel, theme_surface, theme_border));
-            let labels = if self.language.is_chinese() {
-                ["复制所选内容", "粘贴", "复制全部", "清除回滚"]
-            } else {
-                ["Copy Selection", "Paste", "Copy All", "Clear Scrollback"]
-            };
+            let labels = self.language.terminal_context_labels();
             for (index, label) in labels.into_iter().enumerate() {
                 if self.navigation_hover == Some(NavigationHover::ContextAction(index)) {
                     overlay_rectangles.push(RectBlock {
@@ -10411,16 +10768,12 @@ impl WmctermApplication {
                 menu.anchor.1,
                 self.window_size.width as f32,
                 self.window_size.height as f32,
-                TAB_CONTEXT_WIDTH,
+                ui::context_menu_width(&self.language.tab_context_labels()),
                 30.0,
                 TAB_CONTEXT_ACTIONS.len(),
             );
             overlay_rectangles.extend(context_menu_frame(panel, theme_surface, theme_border));
-            let labels = if self.language.is_chinese() {
-                ["关闭标签", "关闭其他标签", "新建终端标签"]
-            } else {
-                ["Close Tab", "Close Other Tabs", "New Terminal Tab"]
-            };
+            let labels = self.language.tab_context_labels();
             let tab_count = self
                 .state
                 .panes
@@ -10472,32 +10825,12 @@ impl WmctermApplication {
                 menu.anchor.1,
                 self.window_size.width as f32,
                 self.window_size.height as f32,
-                WORKSPACE_CONTEXT_WIDTH,
+                ui::context_menu_width(&self.language.workspace_context_labels()),
                 30.0,
                 WORKSPACE_CONTEXT_ACTIONS.len(),
             );
             overlay_rectangles.extend(context_menu_frame(panel, theme_surface, theme_border));
-            let labels = if self.language.is_chinese() {
-                [
-                    "新建终端标签",
-                    self.language.open_in_file_manager(),
-                    self.language.open_in_terminal(),
-                    "重命名工作区",
-                    "编辑工作区描述",
-                    "更改目录",
-                    "关闭工作区",
-                ]
-            } else {
-                [
-                    "New Terminal Tab",
-                    self.language.open_in_file_manager(),
-                    self.language.open_in_terminal(),
-                    "Rename Workspace",
-                    "Edit Description",
-                    "Change Directory",
-                    "Close Workspace",
-                ]
-            };
+            let labels = self.language.workspace_context_labels();
             for (index, label) in labels.into_iter().enumerate() {
                 if self.navigation_hover == Some(NavigationHover::ContextAction(index)) {
                     overlay_rectangles.push(RectBlock {
@@ -10547,7 +10880,7 @@ impl WmctermApplication {
                 menu.anchor.1,
                 self.window_size.width as f32,
                 self.window_size.height as f32,
-                SIDEBAR_CONTEXT_WIDTH,
+                ui::context_menu_width(&[self.language.new_workspace()]),
                 30.0,
                 1,
             );
@@ -11665,6 +11998,7 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                         self.rebuild_scene();
                     }
                     self.sidebar_drag = false;
+                    self.sidebar_scrollbar_drag = None;
                     self.workspace_drag = None;
                     self.scrollbar_drag = None;
                     self.text_edit_drag = None;
@@ -13474,11 +13808,15 @@ fn agent_state_priority(state: wmcterm_core::AgentState) -> u8 {
     }
 }
 
-fn detected_foreground_agent_metadata(agent: AgentKind) -> wmcterm_core::AgentMetadata {
+fn detected_foreground_agent_metadata(
+    agent: AgentKind,
+    run_mode: AgentRunMode,
+) -> wmcterm_core::AgentMetadata {
     wmcterm_core::AgentMetadata {
         name: agent.as_str().to_owned(),
         state: wmcterm_core::AgentState::Idle,
         session_id: None,
+        run_mode,
     }
 }
 
@@ -13992,6 +14330,7 @@ fn effective_agent_lifecycle(
 fn agent_session_event_kind(
     event: &AgentEvent,
     request_suffix: &str,
+    run_mode: AgentRunMode,
 ) -> Option<AgentSessionEventKind> {
     match event {
         AgentEvent::SessionStart { .. } => None,
@@ -14007,7 +14346,16 @@ fn agent_session_event_kind(
         // through `agent.approval.register` instead.
         AgentEvent::PermissionRequest { .. } => Some(AgentSessionEventKind::Telemetry(
             AgentTelemetry::StateObserved {
-                state: wmcterm_core::AgentState::WaitingForPermission,
+                // `--approve-for-me` resolves this request inside Codex's
+                // automatic reviewer, while full-access mode bypasses the
+                // approval flow entirely. The hook has no matching resolved
+                // event, so projecting either mode as a human wait would
+                // leave the workspace stuck until the turn's final Stop hook.
+                state: if run_mode != AgentRunMode::Interactive {
+                    wmcterm_core::AgentState::Running
+                } else {
+                    wmcterm_core::AgentState::WaitingForPermission
+                },
             },
         )),
         AgentEvent::NeedsInput { message } => {
@@ -14038,19 +14386,115 @@ fn agent_session_event_kind(
     }
 }
 
-fn resume_info(state: &AppState, terminal: TerminalId) -> Option<AgentResumeInfo> {
-    let metadata = state
+fn agent_transition_for_run_mode(
+    event: &AgentEvent,
+    run_mode: AgentRunMode,
+) -> wmcterm_agent::AgentTransition {
+    if run_mode != AgentRunMode::Interactive
+        && matches!(event, AgentEvent::PermissionRequest { .. })
+    {
+        return wmcterm_agent::AgentTransition {
+            state: wmcterm_core::AgentState::Running,
+            attention: AttentionState::None,
+            notification: None,
+        };
+    }
+    reduce_agent(event)
+}
+
+struct PersistedAgentResume {
+    agent: AgentResumeInfo,
+    managed: bool,
+}
+
+fn resume_info(
+    state: &AppState,
+    sessions: &HashMap<SurfaceId, AgentSession>,
+    foreground_agents: &HashMap<TerminalId, (AgentKind, AgentRunMode)>,
+    terminal: TerminalId,
+) -> Option<PersistedAgentResume> {
+    let (surface_id, metadata) = state
         .surfaces
-        .values()
-        .find(|surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal))?
-        .agent
-        .as_ref()?;
+        .iter()
+        .find(|(_, surface)| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal))
+        .and_then(|(surface_id, surface)| {
+            surface
+                .agent
+                .as_ref()
+                .map(|metadata| (*surface_id, metadata))
+        })?;
+    let session = sessions.get(&surface_id)?;
+    let managed = agent_launch_is_managed(session.launch_command.as_deref(), &metadata.name);
+    let foreground_matches = foreground_agents
+        .get(&terminal)
+        .zip(metadata.name.parse::<AgentKind>().ok())
+        .is_some_and(|((foreground, _), observed)| *foreground == observed);
+    if !should_persist_agent_resume(managed, session.lifecycle.phase, foreground_matches) {
+        return None;
+    }
     let session_id = metadata.session_id.clone()?;
-    match metadata.name.to_ascii_lowercase().as_str() {
+    let agent = match metadata.name.to_ascii_lowercase().as_str() {
         "claude" | "claude code" => Some(AgentResumeInfo::Claude { session_id }),
         "codex" => Some(AgentResumeInfo::Codex { session_id }),
         "opencode" => Some(AgentResumeInfo::OpenCode { session_id }),
         _ => None,
+    }?;
+    Some(PersistedAgentResume { agent, managed })
+}
+
+fn should_persist_agent_resume(
+    managed: bool,
+    phase: AgentLifecyclePhase,
+    foreground_matches: bool,
+) -> bool {
+    managed || (phase == AgentLifecyclePhase::Running && foreground_matches)
+}
+
+fn agent_launch_is_managed(launch_command: Option<&str>, observed_agent: &str) -> bool {
+    launch_command
+        .filter(|command| !command.contains(MANUAL_AGENT_RESUME_MARKER))
+        .and_then(AgentKind::from_process_command)
+        .zip(observed_agent.parse::<AgentKind>().ok())
+        .is_some_and(|(launched, observed)| launched == observed)
+}
+
+const MANUAL_AGENT_RESUME_MARKER: &str = "WMCTERM_MANUAL_AGENT_RESUME";
+
+fn is_manual_agent_resume_command(command: &str) -> bool {
+    command.contains(MANUAL_AGENT_RESUME_MARKER)
+}
+
+fn manual_agent_resume_command(resume: &str) -> String {
+    #[cfg(windows)]
+    {
+        let shell = env::var_os("SHELL").unwrap_or_else(|| "powershell.exe".into());
+        let name = std::path::Path::new(&shell)
+            .file_stem()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default()
+            .to_ascii_lowercase();
+        let shell = shell.to_string_lossy();
+        match name.as_str() {
+            "powershell" | "pwsh" => format!(
+                "$env:{MANUAL_AGENT_RESUME_MARKER}='1'; {resume}; Remove-Item Env:{MANUAL_AGENT_RESUME_MARKER} -ErrorAction SilentlyContinue; & {} -NoLogo",
+                shell_quote_command(&shell)
+            ),
+            "cmd" => format!(
+                "set {MANUAL_AGENT_RESUME_MARKER}=1 && {resume} & set {MANUAL_AGENT_RESUME_MARKER}= & \"{shell}\" /D"
+            ),
+            _ => format!(
+                "{MANUAL_AGENT_RESUME_MARKER}=1 {resume}; exec {} -l",
+                shell_quote_command(&shell)
+            ),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let shell = env::var_os("SHELL").unwrap_or_else(|| "sh".into());
+        format!(
+            "{MANUAL_AGENT_RESUME_MARKER}=1 {resume}; exec {} -l",
+            shell_quote_command(&shell.to_string_lossy())
+        )
     }
 }
 
@@ -15032,6 +15476,210 @@ mod tests {
     }
 
     #[test]
+    fn codex_resume_requires_a_nonempty_matching_rollout() {
+        let home =
+            std::env::temp_dir().join(format!("wmcterm-rollout-test-{}", uuid::Uuid::new_v4()));
+        let id = uuid::Uuid::new_v4().to_string();
+        let folder = home.join("sessions/2026/09/07");
+        std::fs::create_dir_all(&folder).unwrap();
+        assert!(!codex_rollout_exists(&home, &id));
+        let file = folder.join(format!("rollout-2026-09-07T00-00-00-{id}.jsonl"));
+        std::fs::write(&file, "").unwrap();
+        assert!(!codex_rollout_exists(&home, &id));
+        std::fs::write(&file, "{\"type\":\"session_meta\"}\n").unwrap();
+        assert!(codex_rollout_exists(&home, &id));
+        assert!(!codex_rollout_exists(
+            &home,
+            &uuid::Uuid::new_v4().to_string()
+        ));
+        assert!(!codex_rollout_exists(&home, "../invalid"));
+        std::fs::create_dir_all(home.join("archived_sessions")).unwrap();
+        std::fs::rename(
+            &file,
+            home.join("archived_sessions")
+                .join(file.file_name().unwrap()),
+        )
+        .unwrap();
+        assert!(codex_rollout_exists(&home, &id));
+        std::fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
+    fn missing_codex_record_restores_shell_without_stale_agent_state() {
+        for command in [
+            None,
+            Some(manual_agent_resume_command("codex resume empty-thread")),
+            Some("codex resume empty-thread".into()),
+        ] {
+            let mut app = AppState::new("empty", PathBuf::from("/tmp"));
+            let surface = app.surfaces.values_mut().next().unwrap();
+            let SurfaceKind::Terminal(terminal_id) = surface.kind else {
+                panic!("terminal")
+            };
+            let surface_id = surface.id;
+            surface.agent = Some(wmcterm_core::AgentMetadata {
+                name: "codex".into(),
+                session_id: Some("empty-thread".into()),
+                state: AgentState::Running,
+                run_mode: AgentRunMode::Unattended,
+            });
+            surface.attention = AttentionState::Activity;
+            app.workspaces[0].status = wmcterm_core::WorkspaceStatus::NeedsInput;
+            let mut terminal = terminal_resume(
+                command.as_deref(),
+                Some(AgentResumeInfo::Codex {
+                    session_id: "empty-thread".into(),
+                }),
+            );
+            terminal.terminal_id = terminal_id;
+            terminal.scrollback = Some("previous terminal output".into());
+            let mut session = Session {
+                version: SESSION_VERSION,
+                app,
+                terminals: vec![terminal],
+                agent_sessions: vec![AgentSession::new(surface_id)],
+                window: None,
+            };
+            discard_codex_resumes_without_record(&mut session, |_| true);
+            assert!(session.terminals[0].agent.is_some());
+            let mut explicit = session.clone();
+            explicit.terminals[0].command = Some("codex --approve-for-me".into());
+            discard_codex_resumes_without_record(&mut explicit, |_| false);
+            assert_eq!(
+                explicit.terminals[0].command.as_deref(),
+                Some("codex --approve-for-me")
+            );
+            assert!(explicit.app.surfaces[&surface_id].agent.is_some());
+            let mut unbound = session.clone();
+            unbound.terminals[0].agent = None;
+            unbound.terminals[0].command = None;
+            unbound
+                .app
+                .surfaces
+                .get_mut(&surface_id)
+                .unwrap()
+                .agent
+                .as_mut()
+                .unwrap()
+                .session_id = None;
+            discard_codex_resumes_without_record(&mut unbound, |_| true);
+            assert!(unbound.app.surfaces[&surface_id].agent.is_none());
+            assert!(unbound.agent_sessions.is_empty());
+            discard_codex_resumes_without_record(&mut session, |_| false);
+            assert!(session.terminals[0].agent.is_none());
+            assert!(session.terminals[0].command.is_none());
+            assert_eq!(
+                session.terminals[0].scrollback.as_deref(),
+                Some("previous terminal output")
+            );
+            assert!(session.app.surfaces[&surface_id].agent.is_none());
+            assert_eq!(
+                session.app.surfaces[&surface_id].attention,
+                AttentionState::None
+            );
+            assert_eq!(
+                session.app.workspaces[0].status,
+                wmcterm_core::WorkspaceStatus::Idle
+            );
+            assert!(session.agent_sessions.is_empty());
+        }
+    }
+
+    #[test]
+    fn restored_managed_and_manual_codex_drop_stale_modes_without_losing_session_state() {
+        for mode in [AgentRunMode::Unattended, AgentRunMode::FullAccess] {
+            for command in [
+                None,
+                Some("codex resume manual-thread".to_owned()),
+                Some(manual_agent_resume_command("codex resume manual-thread")),
+            ] {
+                let mut state = AppState::new("restore", PathBuf::from("/tmp"));
+                let surface = state.surfaces.values_mut().next().unwrap();
+                let SurfaceKind::Terminal(terminal_id) = surface.kind else {
+                    panic!("terminal")
+                };
+                surface.agent = Some(wmcterm_core::AgentMetadata {
+                    name: "codex".into(),
+                    state: AgentState::Running,
+                    session_id: Some("manual-thread".into()),
+                    run_mode: mode,
+                });
+                let surface_id = surface.id;
+                let mut resume = terminal_resume(
+                    command.as_deref(),
+                    Some(AgentResumeInfo::Codex {
+                        session_id: "manual-thread".into(),
+                    }),
+                );
+                resume.terminal_id = terminal_id;
+                reconcile_restored_agent_modes(&mut state, &[resume]);
+                let metadata = state.surfaces[&surface_id].agent.as_ref().unwrap();
+                assert_eq!(metadata.run_mode, AgentRunMode::Interactive);
+                assert_eq!(metadata.session_id.as_deref(), Some("manual-thread"));
+                assert_eq!(metadata.state, AgentState::Running);
+            }
+        }
+    }
+
+    #[test]
+    fn restoring_explicit_agent_launch_preserves_its_mode() {
+        let mut state = AppState::new("restore", PathBuf::from("/tmp"));
+        let surface = state.surfaces.values_mut().next().unwrap();
+        let SurfaceKind::Terminal(terminal_id) = surface.kind else {
+            panic!("terminal")
+        };
+        surface.agent = Some(detected_foreground_agent_metadata(
+            AgentKind::Codex,
+            AgentRunMode::Unattended,
+        ));
+        let surface_id = surface.id;
+        let mut resume = terminal_resume(
+            Some("codex --approve-for-me"),
+            Some(AgentResumeInfo::Codex {
+                session_id: "manual-thread".into(),
+            }),
+        );
+        resume.terminal_id = terminal_id;
+        reconcile_restored_agent_modes(&mut state, &[resume]);
+        assert_eq!(
+            state.surfaces[&surface_id].agent.as_ref().unwrap().run_mode,
+            AgentRunMode::Unattended
+        );
+    }
+
+    #[test]
+    fn detected_mode_updates_preserve_hook_task_state_and_session_identity() {
+        let mut metadata = wmcterm_core::AgentMetadata {
+            name: "codex".into(),
+            state: AgentState::WaitingForPermission,
+            session_id: Some("thread".into()),
+            run_mode: AgentRunMode::Unattended,
+        };
+        assert!(sync_detected_agent_mode(
+            &mut metadata,
+            AgentKind::Codex,
+            AgentRunMode::Interactive
+        ));
+        assert_eq!(metadata.state, AgentState::WaitingForPermission);
+        assert_eq!(metadata.session_id.as_deref(), Some("thread"));
+        assert!(!sync_detected_agent_mode(
+            &mut metadata,
+            AgentKind::Claude,
+            AgentRunMode::FullAccess
+        ));
+        assert!(!sync_detected_agent_mode(
+            &mut metadata,
+            AgentKind::Codex,
+            AgentRunMode::Interactive
+        ));
+        assert!(sync_detected_agent_mode(
+            &mut metadata,
+            AgentKind::Codex,
+            AgentRunMode::Unattended
+        ));
+    }
+
+    #[test]
     fn restored_codex_teams_child_degrades_to_standalone_resume() {
         let terminal = terminal_resume(
             Some("/opt/codex resume --remote ws://127.0.0.1:44459 child-thread"),
@@ -15043,6 +15691,65 @@ mod tests {
             restored_terminal_command(&terminal).as_deref(),
             Some("codex resume child-thread")
         );
+    }
+
+    #[test]
+    fn legacy_direct_manual_resume_returns_to_a_shell_after_agent_exit() {
+        let terminal = terminal_resume(
+            Some("codex resume manual-thread"),
+            Some(AgentResumeInfo::Codex {
+                session_id: "manual-thread".into(),
+            }),
+        );
+        let command = restored_terminal_command(&terminal).unwrap();
+        assert!(command.contains(MANUAL_AGENT_RESUME_MARKER));
+        assert!(command.contains("codex resume manual-thread"));
+        #[cfg(not(windows))]
+        assert!(command.contains("; exec "));
+    }
+
+    #[test]
+    fn agent_resume_policy_distinguishes_managed_and_manual_exits() {
+        assert!(agent_launch_is_managed(
+            Some("wmcterm agent --mode interactive codex"),
+            "codex"
+        ));
+        assert!(agent_launch_is_managed(
+            Some("claude --dangerously-skip-permissions"),
+            "Claude Code"
+        ));
+        assert!(!agent_launch_is_managed(Some("bash"), "codex"));
+        assert!(!agent_launch_is_managed(None, "claude"));
+        let manual_resume = manual_agent_resume_command("codex resume session-one");
+        assert!(manual_resume.contains(MANUAL_AGENT_RESUME_MARKER));
+        assert!(manual_resume.contains("codex resume session-one"));
+        assert!(is_manual_agent_resume_command(&manual_resume));
+        assert!(!is_manual_agent_resume_command("codex"));
+        assert!(!is_manual_agent_resume_command("/bin/bash -l"));
+        assert!(!agent_launch_is_managed(Some(&manual_resume), "codex"));
+        #[cfg(not(windows))]
+        assert!(manual_resume.contains("; exec "));
+
+        assert!(should_persist_agent_resume(
+            false,
+            AgentLifecyclePhase::Running,
+            true
+        ));
+        assert!(!should_persist_agent_resume(
+            false,
+            AgentLifecyclePhase::Running,
+            false
+        ));
+        assert!(!should_persist_agent_resume(
+            false,
+            AgentLifecyclePhase::Exited,
+            true
+        ));
+        assert!(should_persist_agent_resume(
+            true,
+            AgentLifecyclePhase::Exited,
+            false
+        ));
     }
 
     #[test]
@@ -15586,7 +16293,8 @@ mod tests {
 
     #[test]
     fn newly_detected_foreground_agent_is_idle_until_work_is_submitted() {
-        let metadata = detected_foreground_agent_metadata(AgentKind::Codex);
+        let metadata =
+            detected_foreground_agent_metadata(AgentKind::Codex, AgentRunMode::Interactive);
         assert_eq!(metadata.name, "codex");
         assert_eq!(metadata.state, AgentState::Idle);
         assert_eq!(
@@ -16958,6 +17666,7 @@ mod tests {
                 message: "allow shell?".into(),
             },
             "17",
+            AgentRunMode::Interactive,
         )
         .unwrap();
         assert!(matches!(
@@ -16967,11 +17676,50 @@ mod tests {
             })
         ));
 
+        let unattended_permission = agent_session_event_kind(
+            &AgentEvent::PermissionRequest {
+                message: "review command?".into(),
+            },
+            "17-auto",
+            AgentRunMode::Unattended,
+        )
+        .unwrap();
+        assert!(matches!(
+            unattended_permission,
+            AgentSessionEventKind::Telemetry(AgentTelemetry::StateObserved {
+                state: AgentState::Running
+            })
+        ));
+        let unattended_transition = agent_transition_for_run_mode(
+            &AgentEvent::PermissionRequest {
+                message: "review command?".into(),
+            },
+            AgentRunMode::Unattended,
+        );
+        assert_eq!(unattended_transition.state, AgentState::Running);
+        assert_eq!(unattended_transition.attention, AttentionState::None);
+        assert_eq!(unattended_transition.notification, None);
+        assert!(matches!(
+            agent_session_event_kind(
+                &AgentEvent::PermissionRequest {
+                    message: "unexpected approval?".into(),
+                },
+                "17-full",
+                AgentRunMode::FullAccess,
+            ),
+            Some(AgentSessionEventKind::Telemetry(
+                AgentTelemetry::StateObserved {
+                    state: AgentState::Running
+                }
+            ))
+        ));
+
         let input = agent_session_event_kind(
             &AgentEvent::NeedsInput {
                 message: "choose target".into(),
             },
             "18",
+            AgentRunMode::Interactive,
         )
         .unwrap();
         assert!(matches!(
@@ -16988,7 +17736,8 @@ mod tests {
                 &AgentEvent::ToolUse {
                     tool: "cargo test".into()
                 },
-                "19"
+                "19",
+                AgentRunMode::Interactive,
             ),
             Some(AgentSessionEventKind::Telemetry(AgentTelemetry::Activity {
                 summary: Some(summary)
@@ -17000,7 +17749,8 @@ mod tests {
                     success: false,
                     message: Some("failed".into())
                 },
-                "20"
+                "20",
+                AgentRunMode::Interactive,
             ),
             Some(AgentSessionEventKind::Telemetry(
                 AgentTelemetry::StateObserved {
@@ -17014,7 +17764,8 @@ mod tests {
                     success: true,
                     message: Some("done".into())
                 },
-                "21"
+                "21",
+                AgentRunMode::Interactive,
             ),
             Some(AgentSessionEventKind::Telemetry(
                 AgentTelemetry::StateObserved {
@@ -17028,7 +17779,8 @@ mod tests {
                     agent: "codex".into(),
                     session_id: None
                 },
-                "22"
+                "22",
+                AgentRunMode::Interactive,
             )
             .is_none()
         );
@@ -17168,6 +17920,7 @@ mod tests {
             name: "codex".into(),
             state: AgentState::Running,
             session_id: Some("session-one".into()),
+            run_mode: AgentRunMode::Interactive,
         });
         let hook = wmcterm_agent::normalize_codex_subagent_hook_event(
             Some("SubagentStart"),
@@ -17232,6 +17985,7 @@ mod tests {
             name: "claude".into(),
             state: AgentState::Running,
             session_id: Some("session-one".into()),
+            run_mode: AgentRunMode::Interactive,
         });
         assert!(error(call(&mut app, base())).contains("non-Codex"));
 
@@ -17239,6 +17993,7 @@ mod tests {
             name: "codex".into(),
             state: AgentState::Running,
             session_id: Some("other-session".into()),
+            run_mode: AgentRunMode::Interactive,
         });
         assert!(error(call(&mut app, base())).contains("session"));
 
@@ -17246,6 +18001,7 @@ mod tests {
             name: "codex".into(),
             state: AgentState::Running,
             session_id: Some("session-one".into()),
+            run_mode: AgentRunMode::Interactive,
         });
         for field in ["turn_id", "agent_id", "agent_type", "session_id"] {
             let mut params = base();
@@ -17377,6 +18133,14 @@ mod tests {
             codex_subagent_count(&app.codex_subagents, other_surface, "session-one"),
             1
         );
+
+        app.foreground_agents
+            .insert(terminal, (AgentKind::Codex, AgentRunMode::Interactive));
+        app.automatic_agent_status.remove(&terminal);
+        assert!(app.state.surfaces[&surface].agent.is_some());
+        assert!(app.update_foreground_agent(terminal, &[]));
+        assert!(!app.foreground_agents.contains_key(&terminal));
+        assert!(app.state.surfaces[&surface].agent.is_none());
     }
 
     #[test]

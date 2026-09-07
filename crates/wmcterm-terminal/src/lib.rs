@@ -1525,6 +1525,7 @@ mod tests {
             for (key, text, expected) in [
                 (InputKey::Character('a'), "a", 0x01),
                 (InputKey::Character('c'), "\u{3}", 0x03),
+                (InputKey::Character('c'), "c", 0x03),
                 (InputKey::Character('d'), "\u{4}", 0x04),
                 (InputKey::Character('t'), "t", 0x14),
                 (InputKey::Character('z'), "z", 0x1a),

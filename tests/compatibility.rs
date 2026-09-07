@@ -22,7 +22,12 @@ fn wait_for_text(session: &TerminalSession, needle: &str) -> bool {
 #[test]
 fn bash_runs_through_terminal_actor() {
     let session = TerminalSession::spawn(
-        CommandSpec::new("bash").args(["--noprofile", "--norc"]),
+        // A PTY makes Bash interactive: skipping startup files alone still
+        // loads and saves the caller's history. Disable both history recording
+        // and access to the real history file for this test shell.
+        CommandSpec::new("bash")
+            .args(["--noprofile", "--norc", "+o", "history"])
+            .env("HISTFILE", "/dev/null"),
         TerminalSize::new(60, 10).unwrap(),
     )
     .unwrap();

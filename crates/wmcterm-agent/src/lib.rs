@@ -2,7 +2,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::HashMap, fmt, str::FromStr};
-use wmcterm_core::{AgentState, AttentionState};
+use wmcterm_core::{AgentRunMode, AgentState, AttentionState};
 
 /// Stable identity used to prove that an event came from the expected agent
 /// process rather than a reused PID or an unrelated local process.
@@ -404,6 +404,35 @@ impl AgentKind {
             }
         }
         None
+    }
+
+    /// Describe the permission/sandbox mode exposed by an Agent command line.
+    /// This metadata must never be used to grant or relax permissions.
+    pub fn run_mode_from_process_command(self, command: &str) -> AgentRunMode {
+        let arguments: Vec<_> = command
+            .split_ascii_whitespace()
+            .map(|argument| argument.trim_matches(|character| matches!(character, '\'' | '"')))
+            .collect();
+        match self {
+            Self::Codex
+                if arguments.iter().any(|argument| {
+                    matches!(
+                        *argument,
+                        "--dangerously-bypass-approvals-and-sandbox" | "--yolo"
+                    )
+                }) =>
+            {
+                AgentRunMode::FullAccess
+            }
+            Self::Codex
+                if arguments
+                    .iter()
+                    .any(|argument| matches!(*argument, "--approve-for-me" | "--full-auto")) =>
+            {
+                AgentRunMode::Unattended
+            }
+            _ => AgentRunMode::Interactive,
+        }
     }
 }
 
@@ -1887,6 +1916,19 @@ mod tests {
         );
         assert_eq!(AgentKind::from_process_command("compile project"), None);
         assert_eq!(AgentKind::from_process_command("code src/lib.rs"), None);
+        assert_eq!(
+            AgentKind::Codex.run_mode_from_process_command("codex --approve-for-me"),
+            AgentRunMode::Unattended
+        );
+        assert_eq!(
+            AgentKind::Codex
+                .run_mode_from_process_command("codex --dangerously-bypass-approvals-and-sandbox"),
+            AgentRunMode::FullAccess
+        );
+        assert_eq!(
+            AgentKind::Codex.run_mode_from_process_command("codex --model gpt-test"),
+            AgentRunMode::Interactive
+        );
     }
 
     #[test]
@@ -2098,6 +2140,14 @@ mod tests {
 
     #[test]
     fn normalizes_codex_and_opencode_native_events() {
+        let submitted = normalize_hook_json(
+            AgentKind::Codex,
+            None,
+            r#"{"hook_event_name":"UserPromptSubmit","session_id":"session-1","turn_id":"turn-1"}"#,
+        )
+        .unwrap();
+        assert!(matches!(submitted, AgentEvent::ToolUse { .. }));
+        assert_eq!(reduce(&submitted).state, AgentState::Running);
         assert_eq!(
             normalize_hook_json(
                 AgentKind::Codex,

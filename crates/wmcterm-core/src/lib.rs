@@ -281,6 +281,8 @@ pub struct AgentMetadata {
     pub name: String,
     pub state: AgentState,
     pub session_id: Option<String>,
+    #[serde(default)]
+    pub run_mode: AgentRunMode,
 }
 
 pub const AGENT_SESSION_SCHEMA_VERSION: u32 = 1;

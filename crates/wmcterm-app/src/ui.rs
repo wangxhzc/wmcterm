@@ -45,6 +45,23 @@ pub(crate) fn titlebar_chrome_layout(window_width: f32) -> Vec<Bounds> {
     bounds
 }
 
+/// Center an odd-width stroke on the boundary pixel, below the titlebar.
+/// Render after pane backgrounds so its terminal-side pixels stay continuous.
+pub(crate) fn sidebar_edge_bounds(width: f32, height: f32, thickness: f32) -> Bounds {
+    let thickness = if width > 0.0 {
+        thickness.max(1.0).min(width * 2.0 + 1.0)
+    } else {
+        0.0
+    };
+    let top = 40.0_f32.min(height.max(0.0));
+    Bounds {
+        x: (width - (thickness - 1.0).max(0.0) / 2.0).max(0.0),
+        y: top,
+        width: thickness,
+        height: (height - top).max(0.0),
+    }
+}
+
 pub(crate) fn centered_text_left(bounds: Bounds, text: &str, font_size: f32) -> f32 {
     let text_width = display_width(text) as f32 * font_size * 0.6;
     bounds.x + ((bounds.width - text_width) / 2.0).max(0.0)
@@ -122,7 +139,7 @@ pub(crate) fn list_scrollbar(
     visible: usize,
     scroll: usize,
 ) -> Option<(Bounds, Bounds)> {
-    if total <= visible || visible == 0 {
+    if total <= visible || visible == 0 || panel.width < 7.0 || panel.height <= 12.0 {
         return None;
     }
     let track = Bounds {
@@ -131,7 +148,9 @@ pub(crate) fn list_scrollbar(
         width: 3.0,
         height: (panel.height - 12.0).max(1.0),
     };
-    let thumb_height = (track.height * visible as f32 / total as f32).max(18.0);
+    let thumb_height = (track.height * visible as f32 / total as f32)
+        .max(18.0)
+        .min(track.height);
     let max_scroll = total - visible;
     let travel = (track.height - thumb_height).max(0.0);
     let thumb = Bounds {
@@ -347,6 +366,16 @@ pub(crate) fn notification_row_at(
 
 /// Position a compact pointer-anchored menu without allowing it to escape the
 /// window. The same bounds are used for drawing and hit testing.
+/// Match the 15px monospace menu text and its 14px horizontal insets.
+pub(crate) fn context_menu_width(labels: &[&str]) -> f32 {
+    let columns = labels
+        .iter()
+        .map(|label| display_width(label))
+        .max()
+        .unwrap_or(0);
+    (columns as f32 * 15.0 * 0.6 + 28.0).ceil().max(120.0)
+}
+
 pub(crate) fn popup_menu(
     anchor_x: f32,
     anchor_y: f32,
@@ -605,8 +634,25 @@ pub(crate) fn surface_tab_visible_title(
     available_width: f32,
     cell_width: f32,
 ) -> String {
-    let max_columns = (available_width / cell_width.max(1.0)).floor().max(1.0) as usize;
+    // Widths are assembled from the same fractional cell width used here, but
+    // f32 round-off can leave an exact fit infinitesimally below an integer.
+    // Keep a tiny column-space tolerance so a complete final character is not
+    // unnecessarily replaced by an ellipsis.
+    let max_columns = (available_width / cell_width.max(1.0) + 0.001)
+        .floor()
+        .max(1.0) as usize;
     truncate_display_width(&surface_tab_title(title, agent), max_columns)
+}
+
+/// Preserve the visible spacing while preventing a title's final word from
+/// wrapping onto a clipped second line in glyphon's bounded text buffer.
+pub(crate) fn surface_tab_render_title(
+    title: &str,
+    agent: bool,
+    available_width: f32,
+    cell_width: f32,
+) -> String {
+    surface_tab_visible_title(title, agent, available_width, cell_width).replace(' ', "\u{a0}")
 }
 
 fn split_agent_spinner(title: &str) -> (Option<char>, &str) {
@@ -631,22 +677,23 @@ fn split_agent_spinner(title: &str) -> (Option<char>, &str) {
 /// when a title is short or contains wide characters.
 const SURFACE_TAB_LEFT_INSET: f32 = 7.0;
 const SURFACE_TAB_TITLE_NUMBER_GAP: f32 = 4.0;
+const SURFACE_TAB_TITLE_SHAPING_SLACK: f32 = 4.0;
 const SURFACE_TAB_NUMBER_CLOSE_GAP: f32 = 4.0;
 const SURFACE_TAB_NUMBER_SLACK: f32 = 4.0;
 const SURFACE_TAB_MAX_CLOSE_WIDTH: f32 = 24.0;
 
-#[cfg(test)]
-fn surface_tab_width_at(title: &str, index: usize, cell_width: f32, agent: bool) -> f32 {
+pub(crate) fn surface_tab_width_at(title: &str, index: usize, cell_width: f32, agent: bool) -> f32 {
     let title_columns = display_width(&surface_tab_title(title, agent)) as f32;
     let number_columns = display_width(&(index + 1).to_string()) as f32;
     (SURFACE_TAB_LEFT_INSET
         + title_columns * cell_width
+        + SURFACE_TAB_TITLE_SHAPING_SLACK
         + SURFACE_TAB_TITLE_NUMBER_GAP
         + number_columns * cell_width
         + SURFACE_TAB_NUMBER_SLACK
         + SURFACE_TAB_NUMBER_CLOSE_GAP
         + SURFACE_TAB_MAX_CLOSE_WIDTH)
-        .max(64.0)
+        .clamp(64.0, 240.0)
 }
 
 pub(crate) fn surface_tab_text_bounds(
@@ -689,6 +736,7 @@ pub(crate) struct SidebarRow {
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct SidebarLayout {
     pub rows: Vec<SidebarRow>,
+    pub scrollbar: Option<(Bounds, Bounds)>,
     pub new_workspace: Bounds,
     pub scroll: usize,
     pub max_scroll: usize,
@@ -703,12 +751,12 @@ pub(crate) fn sidebar_layout(
     requested_scroll: usize,
 ) -> SidebarLayout {
     let rows_top = 88.0;
-    // Keep a reliable context-menu target below the final workspace row.
-    // This remains available even when the workspace list needs to scroll.
-    let footer_height = 32.0;
-    let available = (height - rows_top - footer_height).max(1.0);
+    // The context-menu space belongs to the end of the list, not to a fixed
+    // footer. The rail and intermediate workspace rows use the full viewport.
+    let trailing_space = 32.0;
+    let available = (height - rows_top).max(1.0);
     let mut max_scroll = row_heights.len();
-    let mut tail_height = 0.0;
+    let mut tail_height = trailing_space;
     while max_scroll > 0 {
         let candidate = row_heights[max_scroll - 1].max(1.0);
         if max_scroll < row_heights.len() && tail_height + candidate > available {
@@ -718,6 +766,36 @@ pub(crate) fn sidebar_layout(
         tail_height += candidate;
     }
     let scroll = requested_scroll.min(max_scroll);
+    // Keep the rail separate from both the row content and the outer 5px
+    // sidebar resize target. The search/header stays unobstructed.
+    let scrollbar = (max_scroll > 0 && width >= 40.0 && height > rows_top + 24.0).then(|| {
+        let track = Bounds {
+            x: width - 16.0,
+            y: rows_top,
+            width: 8.0,
+            height: available,
+        };
+        let total_height: f32 = row_heights
+            .iter()
+            .map(|height| height.max(1.0))
+            .sum::<f32>()
+            + trailing_space;
+        let thumb_height = (available * available / total_height)
+            .max(24.0)
+            .min(available);
+        let thumb = Bounds {
+            y: track.y + (track.height - thumb_height) * scroll as f32 / max_scroll as f32,
+            height: thumb_height,
+            ..track
+        };
+        (track, thumb)
+    });
+    let row_width = if scrollbar.is_some() {
+        width - 18.0
+    } else {
+        width
+    };
+
     let mut top = rows_top;
     let mut rows = Vec::new();
     for (index, height) in row_heights.iter().copied().enumerate().skip(scroll) {
@@ -730,7 +808,7 @@ pub(crate) fn sidebar_layout(
             bounds: Bounds {
                 x: 0.0,
                 y: top,
-                width,
+                width: row_width,
                 height,
             },
         });
@@ -738,6 +816,7 @@ pub(crate) fn sidebar_layout(
     }
     SidebarLayout {
         rows,
+        scrollbar,
         new_workspace: Bounds {
             x: (width - 40.0).max(0.0),
             y: 49.0,
@@ -792,35 +871,60 @@ pub(crate) fn surface_tab_overflow_bounds(
     })
 }
 
-/// Give visible tabs equal, comfortable widths while retaining the active tab.
-/// Constrained panes show a stable page of tabs and reserve an overflow target;
-/// every visible surface keeps a close target so a pane may remain empty.
+/// Keep tabs close to their content width while retaining the active tab.
+/// Constrained panes compress a stable page of tabs and reserve an overflow
+/// target; every visible surface keeps a close target so a pane may remain
+/// empty.
 pub(crate) fn surface_tabs_layout(
     pane: Bounds,
-    tab_count: usize,
+    preferred_widths: &[f32],
     active: usize,
 ) -> Vec<SurfaceTab> {
+    let tab_count = preferred_widths.len();
     if tab_count == 0 || pane.width <= 32.0 {
         return Vec::new();
     }
     let active = active.min(tab_count - 1);
     let left = pane.x;
     let full_available = (pane.width - 28.0).max(1.0);
-    let unconstrained_count = (full_available / 80.0).floor().max(1.0) as usize;
-    let overflow_width = if tab_count > unconstrained_count {
-        SURFACE_TAB_OVERFLOW_WIDTH.min(full_available)
-    } else {
+    let preferred_widths: Vec<_> = preferred_widths
+        .iter()
+        .map(|width| width.clamp(64.0, 240.0))
+        .collect();
+    let all_fit = preferred_widths.iter().sum::<f32>() <= full_available;
+    let overflow_width = if all_fit {
         0.0
+    } else {
+        SURFACE_TAB_OVERFLOW_WIDTH.min(full_available)
     };
     let available = (full_available - overflow_width).max(1.0);
-    let minimum_width = 80.0_f32.min(available);
-    let visible_count = ((available / minimum_width).floor() as usize).clamp(1, tab_count);
+    let minimum_width = 64.0_f32.min(available);
+    let visible_count = if all_fit {
+        tab_count
+    } else {
+        ((available / minimum_width).floor() as usize).clamp(1, tab_count)
+    };
     let start = active / visible_count * visible_count;
     let end = (start + visible_count).min(tab_count);
-    let width = (available / (end - start) as f32).min(240.0);
+    let visible_preferred = &preferred_widths[start..end];
+    let preferred_total = visible_preferred.iter().sum::<f32>();
+    let minimum_total = minimum_width * visible_preferred.len() as f32;
+    let widths: Vec<_> = if preferred_total <= available {
+        visible_preferred.to_vec()
+    } else {
+        let distributable = (available - minimum_total).max(0.0);
+        let preferred_extra = (preferred_total - minimum_total).max(1.0);
+        visible_preferred
+            .iter()
+            .map(|width| {
+                minimum_width + distributable * (width - minimum_width).max(0.0) / preferred_extra
+            })
+            .collect()
+    };
     let mut x = left;
     (start..end)
-        .map(|index| {
+        .zip(widths)
+        .map(|(index, width)| {
             let bounds = Bounds {
                 x,
                 y: pane.y,
@@ -968,6 +1072,47 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_edges_are_centered_and_span_a_continuous_height() {
+        for width in [0.0, 2.0, 160.0, 260.5] {
+            for height in [0.0, 20.0, 650.0] {
+                for thickness in [1.0, 3.0] {
+                    let edge = sidebar_edge_bounds(width, height, thickness);
+                    assert!(edge.x >= 0.0 && edge.y >= 0.0);
+                    if width > 0.0 {
+                        assert_eq!(edge.x + edge.width / 2.0, width + 0.5);
+                    } else {
+                        assert_eq!(edge.width, 0.0);
+                    }
+                    assert_eq!(edge.y + edge.height, height);
+                    assert!(edge.y >= 40.0 || edge.height == 0.0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn short_list_scrollbar_thumb_stays_inside_its_track() {
+        for height in [1.0, 12.0, 13.0, 20.0, 30.0, 100.0] {
+            let panel = Bounds {
+                x: 10.0,
+                y: 20.0,
+                width: 100.0,
+                height,
+            };
+            for scroll in [0, 99] {
+                if let Some((track, thumb)) = list_scrollbar(panel, 100, 1, scroll) {
+                    assert!(track.y >= panel.y);
+                    assert!(track.y + track.height <= panel.y + panel.height);
+                    assert!(thumb.y >= track.y);
+                    assert!(thumb.y + thumb.height <= track.y + track.height);
+                } else {
+                    assert!(height <= 12.0);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn list_scrollbar_tracks_the_visible_slice() {
         let panel = Bounds {
             x: 10.0,
@@ -990,6 +1135,70 @@ mod tests {
             assert!(panel.x + panel.width <= width + f32::EPSILON);
             assert!(panel.y + panel.height <= height + f32::EPSILON);
         }
+    }
+
+    #[test]
+    fn localized_context_menus_fit_labels_and_keep_hit_regions_inside_windows() {
+        use crate::i18n::Language;
+
+        for language in [Language::English, Language::SimplifiedChinese] {
+            let menus = [
+                language.tab_context_labels().to_vec(),
+                language.workspace_context_labels().to_vec(),
+                language.terminal_context_labels().to_vec(),
+                language.notification_context_labels(false).to_vec(),
+                language.notification_context_labels(true).to_vec(),
+                vec![language.new_workspace()],
+            ];
+            for labels in menus {
+                let width = context_menu_width(&labels);
+                for label in &labels {
+                    assert!(width - 28.0 >= display_width(label) as f32 * 9.0);
+                }
+                assert!((120.0..=220.0).contains(&width));
+                for window_width in [100.0, 320.0, 1920.0] {
+                    let panel = popup_menu(
+                        window_width - 1.0,
+                        359.0,
+                        window_width,
+                        360.0,
+                        width,
+                        30.0,
+                        labels.len(),
+                    );
+                    assert!(panel.x >= 8.0);
+                    assert!(panel.x + panel.width <= window_width - 8.0);
+                    assert_eq!(
+                        menu_row_at(
+                            panel,
+                            panel.x + panel.width - 1.0,
+                            panel.y + 15.0,
+                            30.0,
+                            labels.len()
+                        ),
+                        Some(0)
+                    );
+                    assert_eq!(
+                        menu_row_at(
+                            panel,
+                            panel.x + panel.width + 1.0,
+                            panel.y + 15.0,
+                            30.0,
+                            labels.len()
+                        ),
+                        None
+                    );
+                }
+            }
+            assert_eq!(
+                context_menu_width(&language.notification_context_labels(false)),
+                context_menu_width(&language.notification_context_labels(true)),
+            );
+        }
+        assert!(
+            context_menu_width(&Language::SimplifiedChinese.terminal_context_labels())
+                < context_menu_width(&Language::English.terminal_context_labels())
+        );
     }
 
     #[test]
@@ -1282,6 +1491,24 @@ mod tests {
         };
         let (title, _) = surface_tab_text_bounds(tab, Some(close), 0, 7.2);
         assert!(title.width >= display_width(&surface_tab_title("⠼ wmcterm", true)) as f32 * 7.2);
+
+        let claude_title = "* Claude Code";
+        let width = surface_tab_width_at(claude_title, 0, 7.2, true);
+        let tab = Bounds { width, ..tab };
+        let close = Bounds {
+            x: width - SURFACE_TAB_MAX_CLOSE_WIDTH,
+            ..close
+        };
+        let (title, _) = surface_tab_text_bounds(tab, Some(close), 0, 7.2);
+        assert_eq!(
+            surface_tab_visible_title(claude_title, true, title.width, 7.2),
+            surface_tab_title(claude_title, true)
+        );
+        assert!(
+            title.width
+                >= display_width(&surface_tab_title(claude_title, true)) as f32 * 7.2
+                    + SURFACE_TAB_TITLE_SHAPING_SLACK
+        );
     }
 
     #[test]
@@ -1319,7 +1546,7 @@ mod tests {
         let equally_visible = surface_tab_width_at("a title that …", 0, 8.0, false);
         assert!(long > equally_visible);
         assert_eq!(surface_tab_label("terminal", 0, false), "terminal 1");
-        assert_eq!(surface_tab_width_at("tab", 0, 8.0, false), 75.0);
+        assert_eq!(surface_tab_width_at("tab", 0, 8.0, false), 79.0);
         assert_eq!(
             surface_tab_width_at("终端", 0, 8.0, false),
             surface_tab_width_at("term", 0, 8.0, false)
@@ -1352,6 +1579,10 @@ mod tests {
             surface_tab_visible_title("terminal workspace", false, 24.0 * 8.0, 8.0),
             "terminal workspace"
         );
+        let rendered = surface_tab_render_title("* Claude Code", true, 15.0 * 8.0, 8.0);
+        assert_eq!(rendered, "\u{a0}\u{a0}*\u{a0}Claude\u{a0}Code");
+        assert!(!rendered.contains(' '));
+        assert_eq!(display_width(&rendered), 15);
     }
 
     #[test]
@@ -1398,6 +1629,73 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_scrollbar_reserves_space_and_maps_both_endpoints() {
+        let heights: Vec<_> = (0..30)
+            .map(|index| if index % 2 == 0 { 64.0 } else { 82.0 })
+            .collect();
+        for width in [160.0, 260.0, 500.0] {
+            for height in [220.0, 650.0, 900.0] {
+                let top = sidebar_layout(width, height, &heights, 0);
+                let bottom = sidebar_layout(width, height, &heights, usize::MAX);
+                let (track, thumb) = top.scrollbar.unwrap();
+                let (bottom_track, bottom_thumb) = bottom.scrollbar.unwrap();
+                assert_eq!(track, bottom_track);
+                assert_eq!(thumb.height, bottom_thumb.height);
+                assert_eq!(thumb.y, track.y);
+                assert!(
+                    (bottom_thumb.y + bottom_thumb.height - track.y - track.height).abs() < 0.001
+                );
+                assert!(track.y >= top.new_workspace.y + top.new_workspace.height);
+                assert_eq!(track.y + track.height, height);
+                assert!(track.x + track.width < width - 5.0);
+                for row in top.rows.iter().chain(&bottom.rows) {
+                    assert!(row.bounds.x + row.bounds.width < track.x);
+                    assert!(!row.bounds.contains(track.x + 1.0, row.bounds.y + 1.0));
+                }
+                assert_eq!(bottom.rows.last().unwrap().index, heights.len() - 1);
+                for (pointer, expected) in [(track.y - 100.0, 0), (height + 100.0, top.max_scroll)]
+                {
+                    assert_eq!(
+                        crate::scrollbar_scroll_for_pointer(
+                            track,
+                            thumb,
+                            top.max_scroll,
+                            pointer,
+                            thumb.height / 2.0
+                        ),
+                        expected
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sidebar_scrollbar_disappears_when_filter_or_resize_fits_all_rows() {
+        assert!(
+            sidebar_layout(260.0, 300.0, &[64.0; 10], 0)
+                .scrollbar
+                .is_some()
+        );
+        for heights in [vec![], vec![64.0], vec![64.0; 2]] {
+            let layout = sidebar_layout(260.0, 300.0, &heights, 9);
+            assert!(layout.scrollbar.is_none());
+            assert_eq!(layout.scroll, 0);
+            assert!(layout.rows.iter().all(|row| row.bounds.width == 260.0));
+        }
+        assert!(
+            sidebar_layout(260.0, 900.0, &[64.0; 10], 9)
+                .scrollbar
+                .is_none()
+        );
+        assert!(
+            sidebar_layout(260.0, 100.0, &[64.0; 10], 0)
+                .scrollbar
+                .is_none()
+        );
+    }
+
+    #[test]
     fn sidebar_scroll_clamps_and_uses_the_same_row_rects_for_hits() {
         let layout = sidebar_layout(240.0, 320.0, &[46.0; 10], 99);
         assert_eq!(layout.scroll, layout.max_scroll);
@@ -1432,18 +1730,22 @@ mod tests {
     #[test]
     fn sidebar_layout_reserves_a_context_menu_target_below_rows() {
         let height = 400.0;
-        let layout = sidebar_layout(240.0, height, &[64.0; 20], 0);
-        let rows_bottom = layout
-            .rows
-            .last()
-            .map_or(88.0, |row| row.bounds.y + row.bounds.height);
-        assert!(height - rows_bottom >= 32.0);
+        let top = sidebar_layout(240.0, height, &[48.0; 20], 0);
+        // Intermediate rows can occupy the former fixed footer area.
+        assert!(top.rows.last().unwrap().bounds.y + 48.0 > height - 32.0);
+        let bottom = sidebar_layout(240.0, height, &[48.0; 20], usize::MAX);
+        let last = bottom.rows.last().unwrap();
+        assert_eq!(last.index, 19);
+        assert!(height - (last.bounds.y + last.bounds.height) >= 32.0);
         assert!(
-            !layout
+            !bottom
                 .rows
                 .iter()
                 .any(|row| row.bounds.contains(20.0, height - 1.0))
         );
+        let (track, thumb) = bottom.scrollbar.unwrap();
+        assert_eq!(track.y + track.height, height);
+        assert!((thumb.y + thumb.height - height).abs() < 0.001);
     }
 
     #[test]
@@ -1464,7 +1766,7 @@ mod tests {
     }
 
     #[test]
-    fn sidebar_layout_does_not_let_a_row_invade_a_small_footer() {
+    fn sidebar_layout_omits_rows_that_do_not_fit_a_tiny_viewport() {
         let height = 100.0;
         let layout = sidebar_layout(240.0, height, &[64.0], 0);
         assert!(layout.rows.is_empty());
@@ -1485,7 +1787,7 @@ mod tests {
             height: 300.0,
         };
         for active in 0..8 {
-            let tabs = surface_tabs_layout(pane, 8, active);
+            let tabs = surface_tabs_layout(pane, &[80.0; 8], active);
             assert!(tabs.iter().any(|tab| tab.index == active));
             assert!(
                 tabs.windows(2)
@@ -1501,7 +1803,7 @@ mod tests {
     }
 
     #[test]
-    fn surface_tabs_share_spare_width_up_to_a_comfortable_maximum() {
+    fn short_surface_tabs_leave_spare_width_at_the_end() {
         let tabs = surface_tabs_layout(
             Bounds {
                 x: 0.0,
@@ -1509,13 +1811,14 @@ mod tests {
                 width: 500.0,
                 height: 300.0,
             },
-            2,
+            &[92.0, 80.0],
             0,
         );
 
         assert_eq!(tabs.len(), 2);
-        assert_eq!(tabs[0].bounds.width, 236.0);
-        assert_eq!(tabs[1].bounds.width, 236.0);
+        assert_eq!(tabs[0].bounds.width, 92.0);
+        assert_eq!(tabs[1].bounds.width, 80.0);
+        assert!(tabs[1].bounds.x + tabs[1].bounds.width < 472.0);
     }
 
     #[test]
@@ -1527,7 +1830,7 @@ mod tests {
                 width: 250.0,
                 height: 300.0,
             },
-            8,
+            &[80.0; 8],
             4,
         );
 
@@ -1557,8 +1860,8 @@ mod tests {
             width: 250.0,
             height: 300.0,
         };
-        let before = surface_tabs_layout(pane, 8, 2);
-        let after = surface_tabs_layout(pane, 8, 3);
+        let before = surface_tabs_layout(pane, &[80.0; 8], 2);
+        let after = surface_tabs_layout(pane, &[80.0; 8], 3);
 
         assert_eq!(before, after);
         assert_eq!(
@@ -1576,7 +1879,7 @@ mod tests {
                 width: 300.0,
                 height: 200.0,
             },
-            1,
+            &[80.0],
             0,
         );
         assert_eq!(tabs.len(), 1);

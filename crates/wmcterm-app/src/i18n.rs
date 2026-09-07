@@ -7,6 +7,66 @@ pub(crate) enum Language {
 }
 
 impl Language {
+    pub(crate) fn notification_context_labels(self, is_read: bool) -> [&'static str; 3] {
+        if self.is_chinese() {
+            [
+                "打开通知",
+                if is_read {
+                    "标记为未读"
+                } else {
+                    "标记为已读"
+                },
+                "清除通知",
+            ]
+        } else {
+            [
+                "Open Notification",
+                if is_read { "Mark Unread" } else { "Mark Read" },
+                "Clear Notification",
+            ]
+        }
+    }
+
+    pub(crate) fn terminal_context_labels(self) -> [&'static str; 4] {
+        if self.is_chinese() {
+            ["复制", "粘贴", "复制全部", "清除回滚"]
+        } else {
+            ["Copy", "Paste", "Copy All", "Clear Scrollback"]
+        }
+    }
+
+    pub(crate) fn tab_context_labels(self) -> [&'static str; 3] {
+        if self.is_chinese() {
+            ["关闭标签", "关闭其他标签", "新建终端标签"]
+        } else {
+            ["Close Tab", "Close Other Tabs", "New Terminal Tab"]
+        }
+    }
+
+    pub(crate) fn workspace_context_labels(self) -> [&'static str; 7] {
+        if self.is_chinese() {
+            [
+                "新建终端标签",
+                self.open_in_file_manager(),
+                self.open_in_terminal(),
+                "重命名工作区",
+                "编辑工作区描述",
+                "更改目录",
+                "关闭工作区",
+            ]
+        } else {
+            [
+                "New Terminal Tab",
+                self.open_in_file_manager(),
+                self.open_in_terminal(),
+                "Rename Workspace",
+                "Edit Description",
+                "Change Directory",
+                "Close Workspace",
+            ]
+        }
+    }
+
     pub(crate) fn resolve(preference: UiLanguage) -> Self {
         match preference {
             UiLanguage::English => Self::English,
@@ -198,6 +258,14 @@ impl Language {
         }
     }
 
+    pub(crate) const fn confirm(self) -> &'static str {
+        if self.is_chinese() {
+            "确认"
+        } else {
+            "Confirm"
+        }
+    }
+
     pub(crate) const fn close_anyway(self) -> &'static str {
         if self.is_chinese() {
             "仍然关闭"
@@ -337,19 +405,19 @@ impl Language {
         }
     }
 
-    pub(crate) fn full_access_confirmation(self, agent: &str) -> String {
+    pub(crate) fn full_access_confirmation_title(self, agent: &str) -> String {
         if self.is_chinese() {
-            format!("{agent} 完全访问（危险）：输入 FULL ACCESS")
+            format!("确认启动 {agent} 完全访问？")
         } else {
-            format!("{agent} Full Access (unsafe): type FULL ACCESS")
+            format!("Start {agent} with full access?")
         }
     }
 
-    pub(crate) const fn full_access_confirmation_error(self) -> &'static str {
+    pub(crate) const fn full_access_confirmation_message(self) -> &'static str {
         if self.is_chinese() {
-            "确认短语不匹配；未启动 Agent"
+            "危险：将跳过权限确认和沙箱限制。Agent 可以不经询问修改系统中的文件并执行命令。"
         } else {
-            "Confirmation phrase did not match; Agent was not started"
+            "Danger: this bypasses approval prompts and sandbox restrictions. The Agent can modify system files and run commands without asking."
         }
     }
 
@@ -365,6 +433,22 @@ impl Language {
 
     pub(crate) const fn agent(self) -> &'static str {
         "Agent"
+    }
+
+    pub(crate) const fn unattended(self) -> &'static str {
+        if self.is_chinese() {
+            "自动审查"
+        } else {
+            "auto-review"
+        }
+    }
+
+    pub(crate) const fn full_access(self) -> &'static str {
+        if self.is_chinese() {
+            "危险全权限"
+        } else {
+            "dangerous full access"
+        }
     }
 
     pub(crate) const fn idle(self) -> &'static str {
