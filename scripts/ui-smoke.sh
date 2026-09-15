@@ -94,7 +94,8 @@ for language in en zh-CN; do
         xdotool mousemove --window "$window_id" 80 105
         xdotool click 3
         sleep 0.2
-        xdotool mousemove --window "$window_id" 100 150
+        # Rename is the fourth 30px row after the workspace menu opens at y=105.
+        xdotool mousemove --window "$window_id" 100 210
         xdotool click 1
         sleep 0.2
         import -window "$window_id" "${16}"
@@ -105,8 +106,8 @@ for language in en zh-CN; do
         sleep 0.2
         import -window "$window_id" "$7"
         identify "$7" >/dev/null
-        # The close action is the sixth 30px row in the workspace menu.
-        xdotool mousemove --window "$window_id" 100 270
+        # Close is the seventh 30px row in the workspace menu.
+        xdotool mousemove --window "$window_id" 100 300
         xdotool click 1
         sleep 0.2
         import -window "$window_id" "${12}"

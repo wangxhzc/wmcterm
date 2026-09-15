@@ -3560,8 +3560,10 @@ version = "0.1.0"
 dependencies = [
  "flume",
  "libghostty-vt",
+ "serde_json",
  "thiserror 2.0.20",
  "tracing",
+ "uuid",
  "wmcterm-agent",
  "wmcterm-pty",
 ]

@@ -11170,7 +11170,19 @@ impl WmctermApplication {
                     "decision_modes": ["deny", "once", "always", "all"],
                     "fail_closed": true
                 },
+                "ssh": {
+                    "shell": "bash >= 4.2.46",
+                    "target": "explicit surface_id UUID; integrated idle local Bash",
+                    "remote_directory": "~/.wmcterm/tmp",
+                    "max_command_bytes": 16384,
+                    "max_output_bytes": 1048576,
+                    "output": "merged PTY bytes, UTF-8 lossy, ANSI preserved",
+                    "persistent": false,
+                    "focus": false,
+                    "authentication": "interactive OpenSSH; connecting includes authentication waits"
+                },
                 "methods": [
+                    "ssh.connect", "ssh.status", "ssh.exec", "ssh.cancel",
                     "app.status", "workspace.list", "workspace.create", "workspace.activate",
                     "workspace.rename", "workspace.describe", "workspace.move",
                     "workspace.cwd",
@@ -11460,6 +11472,20 @@ impl WmctermApplication {
                     self.activate_surface_id(surface).map_err(|error| error.to_string())?;
                     Ok(json!({"ok": true}))
                 }),
+            "ssh.connect" | "ssh.status" | "ssh.exec" | "ssh.cancel" => {
+                let surface = request.params.get("surface_id").and_then(Value::as_str)
+                    .ok_or_else(|| "SSH operations require an explicit surface_id UUID".to_owned())?;
+                uuid::Uuid::parse_str(surface).map_err(|_| "invalid surface_id UUID".to_owned())?;
+                let mut params = request.params.clone();
+                if params.get("surface").is_some_and(|value| value.as_str() != Some(surface)) {
+                    return Err("surface and surface_id disagree".into());
+                }
+                params["surface"] = surface.into();
+                rpc_target_pane_in_state(&self.state, &params)?;
+                let terminal = self.terminal_for_params(&params)?;
+                let runtime = self.terminals.get(&terminal).ok_or_else(|| "target terminal is not running".to_owned())?;
+                runtime.session.ssh_request(&request.method, request.params.clone())
+            }
             "screen.read" => {
                 let terminal = self.terminal_for_params(&request.params)?;
                 let runtime = self.terminals.get(&terminal).ok_or_else(|| "target terminal is not running".to_owned())?;

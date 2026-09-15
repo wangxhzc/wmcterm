@@ -12,3 +12,5 @@ wmcterm-pty = { path = "../wmcterm-pty" }
 wmcterm-agent = { path = "../wmcterm-agent" }
 thiserror.workspace = true
 tracing.workspace = true
+serde_json.workspace = true
+uuid.workspace = true

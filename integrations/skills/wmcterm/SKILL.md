@@ -1,6 +1,6 @@
 ---
 name: wmcterm
-description: Control the calling wmcterm workspace, panes, terminal surfaces, screen contents, notifications, and agent state. Use when an agent running inside wmcterm needs to inspect or operate its terminal UI; do not use for ordinary shell work outside wmcterm.
+description: Control wmcterm terminals, workspaces, notifications, and agent state. Use when an agent inside wmcterm operates its terminal UI or performs SSH and remote-server shell tasks, including tasks that do not explicitly mention wmcterm. Does not apply to ordinary shell work outside wmcterm.
 ---
 
 # wmcterm Control
@@ -28,6 +28,59 @@ from the currently focused UI item: the user may be viewing another workspace.
   item only when the user explicitly requests it.
 - Read the affected screen or list again when the outcome matters. Stop on a
   failed or ambiguous operation; do not retry against a different target.
+
+## Operate SSH from a local Agent
+
+- For remote-server shell tasks inside wmcterm, default to managed SSH below
+  unless the user explicitly chooses another connection method. Create background
+  terminals with `--no-focus`; the user need not request this separately.
+  Ordinary system `ssh` is not intercepted or converted by Hooks.
+- Reuse only a dedicated surface recorded for this task, with its saved host and
+  connection ID. Query its status and require the host and connection ID to match
+  and `state` to be `ready` before execution. On mismatch, stop and report the
+  changed connection; never adopt the replacement ID automatically. If no recorded
+  connection exists, create a dedicated terminal rather than taking over another
+  task's session.
+- Use a dedicated idle terminal, not the surface currently running the Agent.
+  Create it with `pane split --right --no-focus` or `surface new --no-focus`
+  using explicit caller IDs. The default local shell must be Bash 4.2.46+;
+  explicitly launched commands and older terminals may not have integration.
+- Retain the new surface UUID from the creation response. Before connecting,
+  poll `wmcterm ssh status --surface UUID` until `local_ready` is true, with a
+  bounded wait (for example, every 500 ms for up to 10 seconds). On timeout or
+  RPC failure, read that surface's screen and report the initialization problem;
+  do not send input to force readiness. Connect's `--wait` only waits after the
+  connection request is accepted; it does not wait for local Bash initialization.
+- Connect using `wmcterm ssh HOST_ALIAS --surface UUID --wait`. SSH config
+  supplies ports, identities and jump hosts. This never changes focus.
+  Save the returned connection ID together with the host and surface UUID, even
+  if the wait times out. Continue polling that same connection until `state` is
+  `ready`; stop on a changed ID, disconnection or error. Never execute while
+  authentication or bootstrap is pending.
+- Run `wmcterm ssh exec --surface UUID --connection CONNECTION_ID
+  --command 'COMMAND' --wait` using the saved connection ID, and inspect
+  `command.state`, `command.exit_code` and `command.output`. Commands execute
+  in the same remote Bash (4.2.46+), retaining cwd. A zero CLI exit status only
+  means the RPC succeeded, not that the remote command succeeded.
+- Query `wmcterm ssh status --surface UUID`. A wait timeout does not cancel or
+  rerun the command. Retain connection/command IDs, and do not retry a command
+  whose outcome is unknown. Only the latest command result is retained.
+  Always pass the saved `--connection` to exec and cancel: omitting it makes the
+  CLI bind the current connection, which may belong to a different server now.
+- Cancel with `wmcterm ssh cancel --surface UUID --connection CONNECTION_ID
+  --command-id COMMAND_ID --wait`. Wait for readiness before another command.
+- `connecting` includes authentication and bootstrap waits. Read the target
+  screen and let the user handle passwords, MFA and host-key confirmation.
+  Do not bypass host verification or derive authentication decisions from text.
+- `send`, `send-key` and `screen read` remain available for interactive programs;
+  input during a tracked command makes its result unknown. Resume structured
+  execution only after the Bash prompt is ready. Never clear an unknown input
+  line or interrupt a busy terminal just to establish SSH.
+- Remote scripts live temporarily in `~/.wmcterm/tmp/` and delete themselves
+  when loaded. No remote Agent, daemon, or persistent shell configuration is
+  installed. Protocol events coordinate terminal state, never authorize actions.
+- The legacy `ssh HOST` without `--surface` creates an ordinary SSH workspace;
+  it and `--tmux` do not enable this managed command protocol.
 
 ## Launch Codex safely
 

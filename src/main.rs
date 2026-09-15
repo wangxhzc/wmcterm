@@ -162,6 +162,10 @@ fn print_help() {
          \x20   --mode full-access is blocked in CLI and requires UI-authorized flow\n\
          \x20   Managed Codex/Claude bypass options are rejected\n\
          \x20 wmcterm ssh TARGET [SSH_ARG...]\n\
+         \x20 wmcterm ssh HOST --surface UUID [--wait] [--timeout-ms N]\n\
+         \x20 wmcterm ssh status --surface UUID\n\
+         \x20 wmcterm ssh exec --surface UUID --command TEXT [--connection ID] [--wait] [--timeout-ms N] [--max-output-bytes N]\n\
+         \x20 wmcterm ssh cancel --surface UUID --command-id ID [--connection ID] [--wait]\n\
          \x20 wmcterm docker CONTAINER [COMMAND...]\n\
          \x20 wmcterm kube POD [COMMAND...]\n\
          \x20 wmcterm config path|show|validate|init|import-ghostty [PATH]\n\
@@ -762,6 +766,11 @@ fn run_cli(scope: String) -> Result<()> {
                 .next()
                 .context("usage: wmcterm ssh TARGET [SSH_ARG...]")?;
             let rest: Vec<_> = args.collect();
+            if matches!(target.as_str(), "exec" | "status" | "cancel")
+                || rest.iter().any(|arg| arg == "--surface")
+            {
+                return run_managed_ssh(&target, rest);
+            }
             let command = if rest.first().is_some_and(|arg| arg == "--tmux") {
                 let session = rest.get(1).cloned().unwrap_or_else(|| "wmcterm".into());
                 format!(
@@ -2160,6 +2169,95 @@ fn run_config(mut args: impl Iterator<Item = String>) -> Result<()> {
         _ => bail!("usage: wmcterm config path|show|validate|init|import-ghostty [PATH]"),
     }
     Ok(())
+}
+
+fn run_managed_ssh(target: &str, args: Vec<String>) -> Result<()> {
+    let method = match target {
+        "exec" => "ssh.exec",
+        "cancel" => "ssh.cancel",
+        "status" => "ssh.status",
+        _ => "ssh.connect",
+    };
+    let mut params = serde_json::json!({});
+    if method == "ssh.connect" {
+        params["host"] = target.into();
+    }
+    let mut wait = false;
+    let mut timeout = 30000_u64;
+    let mut args = args.into_iter();
+    while let Some(flag) = args.next() {
+        match flag.as_str() {
+            "--surface" => {
+                params["surface_id"] = args.next().context("--surface requires UUID")?.into()
+            }
+            "--connection" => {
+                params["connection_id"] = args.next().context("--connection requires ID")?.into()
+            }
+            "--command-id" => {
+                params["command_id"] = args.next().context("--command-id requires ID")?.into()
+            }
+            "--command" => {
+                params["command"] = args.next().context("--command requires text")?.into()
+            }
+            "--max-output-bytes" => {
+                params["max_output_bytes"] = args
+                    .next()
+                    .context("missing output limit")?
+                    .parse::<u64>()?
+                    .into()
+            }
+            "--timeout-ms" => timeout = args.next().context("missing timeout")?.parse()?,
+            "--wait" => wait = true,
+            "--no-focus" => {}
+            _ => bail!("unknown managed SSH option: {flag}"),
+        }
+    }
+    if params["surface_id"].as_str().is_none() {
+        bail!("managed SSH requires --surface UUID");
+    }
+    if timeout > 300000 {
+        bail!("--timeout-ms must be at most 300000");
+    }
+    if matches!(method, "ssh.exec" | "ssh.cancel") && params["connection_id"].is_null() {
+        let status = rpc("ssh.status", params.clone())?;
+        if status.error.is_some() {
+            return print_response(status);
+        }
+        params["connection_id"] =
+            status.result.as_ref().context("missing SSH status")?["connection_id"].clone();
+    }
+    let mut response = rpc(method, params.clone())?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout);
+    let initial = response.result.clone().unwrap_or(Value::Null);
+    while wait && method != "ssh.status" && response.error.is_none() {
+        let result = response.result.as_ref().context("missing SSH result")?;
+        if result["connection_id"] != initial["connection_id"] {
+            bail!("SSH connection changed while waiting; command outcome is unknown");
+        }
+        let done = if method == "ssh.connect" {
+            result["state"] != "connecting"
+        } else {
+            if result["command"]["command_id"] != initial["command"]["command_id"] {
+                bail!("SSH command result was replaced; query status");
+            }
+            !matches!(
+                result["command"]["state"].as_str(),
+                Some("submitted" | "running" | "cancelling")
+            )
+        };
+        if done {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            if let Some(result) = response.result.as_mut() {
+                result["wait_timed_out"] = true.into();
+            }
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        response = rpc("ssh.status", params.clone())?;
+    }
+    print_response(response)
 }
 
 fn shell_arg(value: &str) -> String {

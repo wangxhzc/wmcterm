@@ -16,6 +16,8 @@ use thiserror::Error;
 use wmcterm_agent::{AgentEvent, OscEvent, OscScanner};
 use wmcterm_pty::{CommandSpec, PtyCommand, PtyEvent, PtySession, PtySize};
 
+mod ssh;
+
 /// Ghostty measures scrollback capacity in bytes, not rows. Keep the standalone
 /// terminal constructors aligned with Ghostty's default allocation.
 pub const DEFAULT_SCROLLBACK_BYTES: usize = 128_000_000;
@@ -831,6 +833,12 @@ pub enum TerminalEffect {
 
 #[derive(Debug, Clone)]
 pub enum SessionCommand {
+    Ssh {
+        method: String,
+        params: serde_json::Value,
+        deadline: std::time::Instant,
+        reply: std::sync::mpsc::SyncSender<Result<serde_json::Value, String>>,
+    },
     Input(Vec<u8>),
     Key(KeyInput),
     Paste(String),
@@ -896,6 +904,7 @@ pub struct TerminalSession {
     commands: flume::Sender<SessionCommand>,
     events: flume::Receiver<SessionEvent>,
     worker: Option<JoinHandle<()>>,
+    final_ssh_status: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
 }
 
 impl TerminalSession {
@@ -945,6 +954,9 @@ impl TerminalSession {
         history: Option<String>,
         theme: Option<TerminalTheme>,
     ) -> Result<Self, TerminalError> {
+        let ssh = ssh::SshState::default();
+        let final_ssh_status = ssh.final_status.clone();
+        let command = command.with_bash_rc(&ssh.local_rc());
         let pty = PtySession::spawn(command, PtySize::new(size.cols, size.rows))
             .map_err(|error| TerminalError::Runtime(error.to_string()))?;
         let (command_tx, command_rx) = flume::unbounded();
@@ -963,6 +975,7 @@ impl TerminalSession {
                     theme,
                     command_rx,
                     event_tx,
+                    ssh,
                 )
             })
             .map_err(|error| TerminalError::Runtime(error.to_string()))?;
@@ -970,6 +983,7 @@ impl TerminalSession {
             commands: command_tx,
             events: event_rx,
             worker: Some(worker),
+            final_ssh_status,
         })
     }
     pub fn send(&self, command: SessionCommand) -> Result<(), flume::SendError<SessionCommand>> {
@@ -987,6 +1001,35 @@ impl TerminalSession {
         receiver
             .recv_timeout(std::time::Duration::from_millis(500))
             .ok()
+    }
+
+    pub fn ssh_request(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        if method == "ssh.status"
+            && let Some(status) = self
+                .final_ssh_status
+                .lock()
+                .map_err(|e| e.to_string())?
+                .clone()
+        {
+            return Ok(status);
+        }
+        let (reply, receiver) = std::sync::mpsc::sync_channel(1);
+        self.send(SessionCommand::Ssh {
+            method: method.into(),
+            params,
+            deadline: std::time::Instant::now() + std::time::Duration::from_millis(400),
+            reply,
+        })
+        .map_err(|e| e.to_string())?;
+        receiver
+            .recv_timeout(std::time::Duration::from_millis(500))
+            .map_err(|_| {
+                "SSH actor response unavailable; query status before retrying".to_owned()
+            })?
     }
 }
 
@@ -1185,6 +1228,7 @@ fn process_pty_output_chunk(
     forward_terminal_effects(engine, pty, events, reply_limiter, reply_limit_warned);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_terminal_actor(
     pty: PtySession,
     size: TerminalSize,
@@ -1193,6 +1237,7 @@ fn run_terminal_actor(
     theme: Option<TerminalTheme>,
     commands: flume::Receiver<SessionCommand>,
     events: flume::Sender<SessionEvent>,
+    mut ssh: ssh::SshState,
 ) {
     let Ok(mut engine) =
         TerminalEngine::new_with_scrollback_limits(size, scrollback.bytes, scrollback.rows)
@@ -1258,8 +1303,36 @@ fn run_terminal_actor(
         };
         let Some(incoming) = incoming else { return };
         match incoming {
+            Incoming::Command(SessionCommand::Ssh {
+                method,
+                params,
+                reply,
+                deadline,
+            }) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = reply.send(Err("SSH request expired before submission".into()));
+                    continue;
+                }
+                let result = ssh.request(&method, &params).and_then(|line| {
+                    if let Some(line) = line {
+                        let bytes = if method == "ssh.cancel" {
+                            vec![3]
+                        } else {
+                            ssh.prepare_dispatch(line);
+                            ssh::DISPATCH_PROBE.to_vec()
+                        };
+                        pty.send(PtyCommand::Input(bytes))
+                            .map_err(|e| e.to_string())?;
+                    }
+                    Ok(ssh.status())
+                });
+                let _ = reply.send(result);
+            }
             Incoming::SnapshotDeadline => continue,
             Incoming::Command(SessionCommand::Input(bytes)) => {
+                if !bytes.is_empty() {
+                    ssh.user_input();
+                }
                 if engine.scroll_to_bottom() {
                     publish_snapshot(&mut engine, &events, &mut snapshot_schedule, false);
                 }
@@ -1267,6 +1340,9 @@ fn run_terminal_actor(
             }
             Incoming::Command(SessionCommand::Key(input)) => {
                 if let Ok(bytes) = engine.encode_key(&input) {
+                    if !bytes.is_empty() {
+                        ssh.user_input();
+                    }
                     if engine.scroll_to_bottom() {
                         publish_snapshot(&mut engine, &events, &mut snapshot_schedule, false);
                     }
@@ -1274,6 +1350,9 @@ fn run_terminal_actor(
                 }
             }
             Incoming::Command(SessionCommand::Paste(text)) => {
+                if !text.is_empty() {
+                    ssh.user_input();
+                }
                 if let Ok(bytes) = engine.encode_paste(&text) {
                     if engine.scroll_to_bottom() {
                         publish_snapshot(&mut engine, &events, &mut snapshot_schedule, false);
@@ -1282,6 +1361,7 @@ fn run_terminal_actor(
                 }
             }
             Incoming::Command(SessionCommand::PasteLine(text)) => {
+                ssh.user_input();
                 if let Ok(mut bytes) = engine.encode_paste(&text) {
                     bytes.push(b'\r');
                     if engine.scroll_to_bottom() {
@@ -1313,6 +1393,7 @@ fn run_terminal_actor(
             },
             Incoming::Command(SessionCommand::Mouse(input)) => match engine.encode_mouse(input) {
                 Ok(bytes) if !bytes.is_empty() => {
+                    ssh.user_input();
                     let _ = pty.send(PtyCommand::Input(bytes));
                 }
                 Ok(_) => {}
@@ -1366,6 +1447,10 @@ fn run_terminal_actor(
             }
             Incoming::Command(SessionCommand::Shutdown) => return,
             Incoming::Pty(PtyEvent::Output(bytes)) => {
+                ssh.feed(&bytes);
+                if let Some(bytes) = ssh.take_dispatch_output() {
+                    let _ = pty.send(PtyCommand::Input(bytes));
+                }
                 process_pty_output_chunk(
                     &bytes,
                     &mut engine,

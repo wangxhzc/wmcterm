@@ -104,6 +104,59 @@ cargo run
 工作区条目支持按住整行拖动排序；移动超过少量阈值后才进入拖动状态，拖动时会显示
 跟随指针的条目预览和插入位置线。搜索工作区时暂不启用排序，以免过滤结果改变持久顺序。
 
+## 本地 Agent 操作 SSH
+
+本地 Agent 可以在指定的空闲 Bash 终端中连接远端并获取命令结果。需要本地和远端
+Bash 4.2.46+，本地系统 OpenSSH，以及远端 `mktemp`、`od`、`tr` 等基础工具。
+普通新建终端的默认 Shell 为 Bash 时自动启用会话集成；已运行的旧终端、显式启动
+命令和其他 Shell 不会被自动接管。Agent 自己正在运行的终端不是空闲 Shell，应先
+使用 `pane split --right --no-focus` 或 `surface new --no-focus` 创建操作终端。
+
+```bash
+wmcterm ssh dev-server --surface SURFACE_UUID --wait
+wmcterm ssh exec --surface SURFACE_UUID --connection CONNECTION_ID --command 'cd /srv/app; git status --short' --wait
+wmcterm ssh status --surface SURFACE_UUID
+wmcterm ssh cancel --surface SURFACE_UUID --connection CONNECTION_ID --command-id COMMAND_ID --wait
+```
+
+新建终端后先轮询 `ssh status`，等待 `local_ready=true`（例如每 500 毫秒一次，
+最多 10 秒）；超时则检查屏幕并报告问题。连接命令的 `--wait` 不等待本地 Shell
+初始化。保存连接返回的 `connection_id`，确认 `state=ready` 后才能执行命令。
+后续执行和取消始终传入保存的连接 ID，连接变化时停止，避免误操作另一台服务器。
+
+内置 Skill 指引 wmcterm 内的 Agent 默认使用托管 SSH 处理远端 Shell 任务，自动
+创建不切换焦点的终端，或复用当前任务已记录且主机和连接 ID 均匹配的专用连接。
+用户明确指定其他连接方式时遵循用户选择；Hook 不会拦截或改写普通系统 `ssh`。
+
+端口、密钥、跳板机使用 `~/.ssh/config` 中的主机别名配置。连接不会切换焦点。
+密码、主机指纹确认和 MFA 仍由 OpenSSH 在该终端交互；`connecting` 包含等待认证
+和等待远端集成就绪，不能单凭此状态区分两者。需要时读取该 Surface 的屏幕并由用户
+完成认证。没有 `--surface` 的旧 `wmcterm ssh TARGET [SSH_ARG...]` 仍创建普通 SSH
+工作区，`--tmux` 也保留旧行为，不提供上述结构化命令接口。
+
+远端只在 `~/.wmcterm/tmp/` 创建权限为 `0600` 的独立临时脚本；两个目录为 `0700`。
+脚本加载时立即删除，不修改 `.bashrc` 或安装服务。集成先加载已有 `.bashrc`，保留
+原 `PROMPT_COMMAND`，启动的是交互式非登录 Bash，不自动加载 `.bash_profile`。
+异常启动可能留下临时文件，不会扫描或删除其他连接的文件。
+
+RPC 为 `ssh.connect/status/exec/cancel`，都要求 `surface_id` UUID。`connect` 接受
+`host`；`exec` 接受 `connection_id`、`command`、可选 `max_output_bytes`；`cancel`
+还要求 `command_id`。CLI 未传 `--connection` 时先查询并绑定当前连接，RPC 不做隐式
+绑定。每个 Surface 只允许一个执行中的命令，状态保留最近一次结果，下一条命令会替换它。
+命令以当前 Bash 中的函数内 `eval` 执行，cwd 和普通变量可延续，不等同于独立进程
+或顶层脚本；修改集成函数、Readline 绑定和提示符 hook 会影响后续自动化。
+
+返回值包含 `state`、`connection_id`、远端 `cwd` 和 `command`，后者包含
+`command_id/state/output/exit_code/truncated`。输出是合并 stdout/stderr 的 PTY
+内容，保留 ANSI 和 CRLF，后台进程输出也可能混入。默认最多 64 KiB，可通过
+`--max-output-bytes` 提高到 1 MiB；不在 UTF-8 字符中间返回截断片段。
+`--wait` 默认最多等待 30 秒，`--timeout-ms` 上限 300000；超时返回
+`wait_timed_out: true`，不停止或重跑命令，后续通过 `ssh status` 查询。
+取消先发送 Ctrl+C，确认恢复提示符前仍为 `cancelling`；忽略中断的程序可能继续运行。
+人工输入使执行结果变为 `outcome_unknown`；可用已有 `send/send-key/screen read`
+接管交互程序，回到提示符后再继续。断线、`exit` 或 `exec` 不会被误报为命令成功。
+连接和命令 ID 不跨应用重启恢复，也不会自动重连或重放命令。
+
 ## CLI 和 IPC
 
 GUI 通过 `wmcterm.sock` 提供 JSON-RPC。在 Windows 上，该路径是一个端点文件，
@@ -415,6 +468,9 @@ scripts/package-release.sh
 # Debian/Ubuntu 依赖：xvfb xdotool imagemagick
 scripts/ui-smoke.sh
 scripts/runtime-control-smoke.sh
+xvfb-run -a python3 scripts/ssh-smoke.py target/debug/wmcterm
+# 指定旧版 Bash，同时验证本地与远端（不替换系统 Shell）：
+WMCTERM_TEST_BASH=/path/to/bash-4.2.46/bash xvfb-run -a python3 scripts/ssh-smoke.py target/debug/wmcterm
 ```
 
 生成的截图写入 `target/ui-smoke-en.png` 和 `target/ui-smoke-zh-CN.png`。运行时控制

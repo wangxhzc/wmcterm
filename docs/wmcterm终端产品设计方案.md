@@ -2372,3 +2372,37 @@ Codex 的会话 ID 不代表 rollout 已持久化。会话保存和加载阶段�
 同时移除对应 Surface AgentMetadata 与旧 AgentSession；按原样重放的显式命令
 不被此检查改写。前台 Agent 消失后，在重新计算状态前清除旧会话和子 Agent 状态，
 避免把已结束的 Running/Waiting 状态投射回工作区。
+
+### 本地 Agent 的 Bash SSH 闭环
+
+SSH 结构化操作由 `wmcterm-terminal::ssh` 实现，PTY 读取、协议状态和输入提交均在
+终端 actor 内执行。UI/RPC 仅显式定位 Surface 并发送有期限的请求，不根据焦点选终端。
+本地普通 Bash 通过临时进程替换 rc 加载会话集成；远端通过同一 SSH 连接创建
+`~/.wmcterm/tmp/bash.XXXXXXXXXX`，加载时删除。目录 0700、脚本 0600，不部署 daemon。
+支持 Bash 4.2.46+，保留用户 `.bashrc` 和原提示符命令，不采用登录 Shell 语义。
+Bash 5.1+ 使用数组式 PROMPT_COMMAND，旧版在原字符串前插入独立提示符 hook，保留
+原命令收到的退出码。Readline 探测使用两字节按键序列，兼容 Bash 4.2 的 bind -x
+仅支持单层 keymap 间接查找的限制；WMCTERM_TEST_BASH 可指定测试用 Bash 可执行文件。
+
+每个 actor 有随机本地 token，每次连接生成新的 connection ID，执行生成 command ID。
+有界 OSC 777 帧报告 ready/start/done/rejected 及十六进制 UTF-8 cwd，跨 PTY chunk
+解析并校验 token、命令 ID 和状态顺序。该协议不具有身份认证能力，远端进程可能伪造
+终端输出，绝不能用作 Agent 审批依据。输出缓存位于 start/done 边界之间，默认 64 KiB、
+最多 1 MiB，保留原 PTY ANSI/CRLF；它不是隔离的 stdout/stderr，后台输出也可能混入。
+
+actor 首先检查本地/远端就绪状态，只发送 Readline 探测键；绑定函数确认输入行为空并
+应答后，actor 才发送编码命令，执行函数内 eval，避免将命令交给尚未结束的提示符 hook
+或拼接用户未提交的输入。人工介入会撤销尚未发送的内容。支持 Emacs 和 vi keymap。
+人工输入令当前命令结果变为 outcome_unknown；提示符恢复后方可再次执行。单连接仅一个
+执行中的命令，保留最近一次结果，不实现命令重放或无界历史。超时只结束 CLI 轮询；
+取消发送 Ctrl+C 并等待提示符确认，不假定进程已经停止。断线后旧连接 ID 失效。
+
+`ssh.connect/status/exec/cancel` 要求 surface_id UUID；exec/cancel 必须匹配 connection_id，
+cancel 还要匹配 command_id。CLI 可先查询再绑定连接，但 Agent Skill 要求保存连接 ID，
+后续 exec/cancel 显式携带，发现连接变化时停止。Skill 默认将 wmcterm 内的远端 Shell
+任务路由到不切换焦点的专用终端，仅复用当前任务记录且主机、连接 ID 均匹配的连接。
+新建终端先限时轮询 local_ready，再 connect；连接达到 ready 后才执行命令。
+Hook 不拦截普通 ssh。SSH 正在认证与尚未收到远端握手
+均显示 connecting，由终端完成密码、MFA 和主机验证交互。应用重启后不恢复此类连接。
+旧无 --surface SSH/tmux 工作区入口保留原行为。验收脚本 `scripts/ssh-smoke.py` 在
+Xvfb、临时用户目录、独立 IPC 和回环 sshd 下运行，不操作调用者的窗口或终端。

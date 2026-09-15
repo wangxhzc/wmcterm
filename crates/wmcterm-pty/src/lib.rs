@@ -29,6 +29,24 @@ pub struct CommandSpec {
 }
 
 impl CommandSpec {
+    /// Integrate only a plain interactive Bash, never an explicit user command.
+    pub fn with_bash_rc(mut self, script: &str) -> Self {
+        if self.args.is_empty()
+            && std::path::Path::new(&self.program).file_name() == Some(OsStr::new("bash"))
+        {
+            let quoted = format!("'{}'", script.replace('\'', "'\\''"));
+            let program = format!(
+                "'{}'",
+                self.program.to_string_lossy().replace('\'', "'\\''")
+            );
+            self.args = vec![
+                "-c".into(),
+                format!("exec {program} --rcfile <(printf %s {quoted}) -i").into(),
+            ];
+        }
+        self
+    }
+
     pub fn new(program: impl AsRef<OsStr>) -> Self {
         Self {
             program: program.as_ref().to_owned(),
