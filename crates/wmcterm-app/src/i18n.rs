@@ -413,11 +413,23 @@ impl Language {
         }
     }
 
-    pub(crate) const fn full_access_confirmation_message(self) -> &'static str {
-        if self.is_chinese() {
+    pub(crate) const fn full_access_confirmation_message(self, codex: bool) -> &'static str {
+        if codex && self.is_chinese() {
+            "危险：Codex 将跳过审批和沙箱，可直接修改系统文件、执行命令。此会话在重启后仍以完全访问模式恢复。"
+        } else if codex {
+            "Danger: no approvals or sandbox. Codex may change system files. Full access persists after restart."
+        } else if self.is_chinese() {
             "危险：将跳过权限确认和沙箱限制。Agent 可以不经询问修改系统中的文件并执行命令。"
         } else {
             "Danger: this bypasses approval prompts and sandbox restrictions. The Agent can modify system files and run commands without asking."
+        }
+    }
+
+    pub(crate) const fn codex_parent_unavailable(self) -> &'static str {
+        if self.is_chinese() {
+            "Codex 父会话不可用；子会话未自动启动。可在终端中手动恢复。"
+        } else {
+            "Codex parent session is unavailable; child was not started. Resume it manually from the terminal."
         }
     }
 
@@ -440,6 +452,14 @@ impl Language {
             "自动审查"
         } else {
             "auto-review"
+        }
+    }
+
+    pub(crate) const fn interactive(self) -> &'static str {
+        if self.is_chinese() {
+            "普通交互"
+        } else {
+            "interactive"
         }
     }
 

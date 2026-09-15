@@ -272,8 +272,10 @@ CLI 也是稳定的 Agent 控制接口。在 wmcterm 终端内启动的命令会
 根 Codex TUI。子 Agent 的线程创建事件会生成原生 wmcterm 窗格且不抢夺焦点：第一个
 窗格在右侧打开，后续 Agent 向下打开。自动展开默认最多两层，可通过
 `WMCTERM_CODEX_MAX_AUTO_DEPTH` 限制。此集成要求 Codex CLI 提供
-`app-server --listen` 和 `--remote` 选项。如果可选的 app-server 集成无法启动，
-托管 Codex 会报告原因并回退到普通 Codex TUI，而不会导致 Codex 不可用。
+`app-server --listen` 和 `--remote` 选项，以及带 `approvalsReviewer` 的线程恢复协议
+（已核验 Codex 0.154.0）。集成或权限核验失败会显示错误，不再自动回退到普通 TUI。
+退出后的终端可按 Enter 重试；需要独立恢复时，用户可另开 Shell 执行
+`codex resume <会话ID>`，或显式添加 `--approve-for-me` 选择自动审查。
 如果长时间运行期间最后创建的子 Agent 窗格已被关闭，后续线程会自动回退到仍存活的
 根 Codex 表面继续分割，不会因缓存的表面 ID 失效而放弃创建窗格。
 监视器会恢复启动时已加载的线程，以及之后公告且排除了 turns 的线程。这样，初始线程或
@@ -301,6 +303,10 @@ Workspace cwd 显式传给私有 app-server 的远程 TUI。Codex 0.149.1 至 0.
 `/resume` 会新建一个未继承 remote cwd 的 picker 连接，因此仍可能固定显示
 `Filter: All`；这个 provider 缺陷无法由外部启动参数修复。调用者显式传入
 `-C`/`--cd` 时以该目录为准。
+托管根 TUI 不携带审批、沙箱或自动审查覆盖参数；权限代理在服务端的线程创建、恢复
+和 fork 请求中应用所选模式，核验返回的实际权限后才允许启动 turn，因此重启恢复和
+会话内 `/resume` 不再触发远程恢复的 permission overrides 错误。当前托管入口不支持
+`--add-dir`、外部 `--remote` 及自定义 `permissions` 配置覆盖，遇到这些参数会明确报错。
 已对照 Codex 0.154.0 协议核验恢复订阅：watcher 不覆盖线程保存的 cwd、权限或
 worktree 配置。子 Agent 窗格使用其线程的 cwd，保持 `focus: false`；只读线程
 仍交由原生 TUI 展示。提问由 Codex TUI 处理，不映射为允许/拒绝审批。
@@ -399,17 +405,21 @@ command = "cargo test"
 工作区布局、表面、终端命令和受支持的 Agent 会话 ID 会从平台数据目录恢复。可见的
 回滚历史会保留；PTY 进程内存绝不会被序列化，命令以及 Claude/Codex/OpenCode 的
 resume 标识符会按启动来源恢复。由 wmcterm Agent 入口启动并已取得 session ID 的
-会话始终使用 provider 的 resume 命令恢复，不会重新执行原始启动命令；Shell 中手动
+会话恢复原线程，不会重新执行初始提示词；Shell 中手动
 启动的 Agent 仅在 wmcterm 关闭时生命周期仍在运行且前台进程仍是该 Agent 才恢复；
 已经退出回到 Shell、明确结束或失败的手动 Agent 重开后回到普通终端。
 仍在运行的手动 Agent 恢复时保留交互式 Shell 语义：resume 作为 Shell 子命令运行，
 退出 Agent 后回到 Shell，Surface、滚动历史和终端会话不会随 Agent 一同退出。
-`codex-teams` 子分区保存的私有 loopback
-app-server 地址只在当前进程内有效；重启后这些子分区会稳定降级为独立的
-`codex resume` 会话，不会重放已经失效的 `--remote` 地址。Claude Code 的
-session ID 和恢复命令不依赖此类临时 endpoint，保持原有恢复行为。
-上述自动生成的恢复命令不继承自动审批或完全访问参数，工作区 Agent 标签也同步
-恢复为普通交互模式；手动进程后续被检测到的审批模式会更新标签，不覆盖任务状态或会话 ID。
+新版本会保存托管 Codex 的线程 ID、权限模式、权限配置、工作目录与 Teams 父子关系。
+普通交互、自动审查和危险全权限均按原模式恢复，重建私有 app-server 和审批桥。
+危险全权限沿用首次 GUI 确认；确认文案明确说明此会话重启后仍按该模式恢复。
+CLI/RPC 仍不能直接选择危险全权限。子窗格连接新服务，不复用旧端口，不重复创建，
+其权限和工作目录保持独立；缺少父会话的子窗格停留在 Shell 并显示原因。
+旧会话没有托管恢复记录时仍按普通 provider resume 恢复，旧 Teams 子窗格降级为
+独立会话。Shell 手动启动的 Codex 和其他 provider 保持原来的恢复策略。
+权限标签统一显示普通交互、自动审查或危险全权限，与运行中、等待等任务状态分开。
+托管模式以服务端核验结果为准；Shell 模式由进程识别，均不把权限模式当作运行状态。
+设计与验证说明见 [Codex 托管恢复设计](docs/rust-libghostty-vt-winit-wgpu-terminal-design.md)。
 
 可使用 `wmcterm config init`、`config show`、`config validate` 或
 `config import-ghostty [PATH]`。UI 每秒重新加载一次有效的配置变更。支持主题颜色、
@@ -502,6 +512,9 @@ scripts/package-release.sh
 # Debian/Ubuntu 依赖：xvfb xdotool imagemagick
 scripts/ui-smoke.sh
 scripts/runtime-control-smoke.sh
+python3 scripts/codex-permissions-smoke.py
+# Requires Codex 0.154.0+ and Node.js 22+; isolated real server, no model turns:
+xvfb-run -a --server-args='-screen 0 1280x800x24' python3 scripts/codex-managed-restore-smoke.py
 xvfb-run -a python3 scripts/ssh-smoke.py target/debug/wmcterm
 # 指定旧版 Bash，同时验证本地与远端（不替换系统 Shell）：
 WMCTERM_TEST_BASH=/path/to/bash-4.2.46/bash xvfb-run -a python3 scripts/ssh-smoke.py target/debug/wmcterm

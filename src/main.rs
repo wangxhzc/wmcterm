@@ -45,6 +45,9 @@ fn main() -> Result<()> {
     if mode.as_deref() == Some("codex-teams") {
         return run_codex_teams();
     }
+    if mode.as_deref() == Some("codex-managed") {
+        return run_claimed_codex();
+    }
     if matches!(
         mode.as_deref(),
         Some(
@@ -162,6 +165,8 @@ fn print_help() {
          \x20   Unattended: Codex --approve-for-me/workspace-write; Claude --permission-mode auto\n\
          \x20   --mode full-access is blocked in CLI and requires UI-authorized flow\n\
          \x20   Managed Codex/Claude bypass options are rejected\n\
+         \x20   Managed Codex restores its saved mode and Teams bridge after restart\n\
+         \x20   Remote /resume permissions are applied and verified server-side; failures do not downgrade\n\
          \x20 wmcterm ssh TARGET [SSH_ARG...]\n\
          \x20 wmcterm ssh HOST --surface UUID [--wait] [--timeout-ms N]\n\
          \x20 wmcterm ssh HOST --new --pane UUID [--timeout-ms N]\n\
@@ -185,6 +190,35 @@ fn run_codex_teams() -> Result<()> {
         AgentRunMode::Interactive,
         &env::args().skip(2).collect::<Vec<_>>(),
     )?;
+    launch_managed_codex(args)
+}
+
+fn run_claimed_codex() -> Result<()> {
+    let token = env::var("WMCTERM_CODEX_LAUNCH_TOKEN")
+        .context("Codex managed launch requires a GUI-issued token")?;
+    let socket =
+        env::var_os("WMCTERM_CONTROL_SOCKET").context("wmcterm control socket is unavailable")?;
+    let response = call(
+        Path::new(&socket),
+        &Request {
+            id: "codex-launch-claim".into(),
+            method: "agent.codex.claim".into(),
+            params: serde_json::json!({
+                "surface_id": env::var("WMCTERM_SURFACE_ID")?,
+                "lifecycle_id": env::var("WMCTERM_TERMINAL_LIFECYCLE_ID")?,
+                "token": token,
+            }),
+        },
+    )?;
+    if let Some(error) = response.error {
+        bail!("{}", error.message);
+    }
+    let args: Vec<String> =
+        serde_json::from_value(response.result.context("missing launch claim")?["args"].clone())?;
+    launch_managed_codex(args)
+}
+
+fn launch_managed_codex(args: Vec<String>) -> Result<()> {
     let config = codex_teams_config(
         env::var("WMCTERM_WORKSPACE_ID").ok(),
         env::var("WMCTERM_SURFACE_ID").ok(),
@@ -193,19 +227,8 @@ fn run_codex_teams() -> Result<()> {
         env::var_os("WMCTERM_CODEX_PATH"),
         wmcterm_codex::allocate_loopback_endpoint()?,
     )?;
-    let codex_program = config.codex_program.clone();
-    let status = match wmcterm_codex::launch_codex_teams(config, &args) {
-        Ok(status) => status,
-        Err(error) => {
-            eprintln!(
-                "wmcterm: Codex app-server integration is unavailable ({error}); starting Codex without the teams bridge"
-            );
-            std::process::Command::new(&codex_program)
-                .args(&args)
-                .status()
-                .with_context(|| format!("could not start Codex `{}`", codex_program.display()))?
-        }
-    };
+    let status = wmcterm_codex::launch_codex_teams(config, &args)
+        .context("managed Codex failed; permissions were not downgraded. Retry the managed launch, or explicitly resume with native Codex")?;
     if !status.success() {
         bail!("Codex exited with status {status}");
     }
@@ -315,6 +338,13 @@ fn plan_codex_launch_args(mode: AgentRunMode, args: &[String]) -> Result<Vec<Str
         AgentRunMode::FullAccess => unreachable!("full access is rejected above"),
     }
     planned.extend_from_slice(args);
+    if wmcterm_codex::CodexPermissions::extract(&planned)?
+        .0
+        .run_mode()
+        == AgentRunMode::FullAccess
+    {
+        bail!("Codex full access is not allowed by wmcterm's managed CLI launcher");
+    }
     Ok(planned)
 }
 
@@ -3107,6 +3137,12 @@ mod tests {
     #[test]
     fn codex_launch_rejects_cli_full_access_mode_without_ui_authorization() {
         assert!(plan_codex_launch_args(AgentRunMode::FullAccess, &["--model".into()]).is_err());
+        for argument in [
+            "-sdanger-full-access",
+            "-csandbox_mode=\"danger-full-access\"",
+        ] {
+            assert!(plan_codex_launch_args(AgentRunMode::Interactive, &[argument.into()]).is_err());
+        }
     }
 
     #[test]

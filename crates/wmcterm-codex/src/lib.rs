@@ -3,6 +3,9 @@
 //! Protocol parsing intentionally lives outside the terminal core because the
 //! app-server command is experimental and may evolve independently.
 
+mod permissions;
+pub use permissions::CodexPermissions;
+
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::Write;
@@ -537,9 +540,13 @@ pub struct BridgeConfig {
 pub struct CodexLaunchPlan {
     pub app_server_args: Vec<String>,
     pub root_args: Vec<String>,
+    pub permissions: CodexPermissions,
 }
 
-pub fn codex_launch_plan(config: &BridgeConfig, codex_args: &[String]) -> CodexLaunchPlan {
+pub fn codex_launch_plan(
+    config: &BridgeConfig,
+    codex_args: &[String],
+) -> Result<CodexLaunchPlan, BridgeError> {
     codex_launch_plan_for_endpoint(config, &config.endpoint, codex_args)
 }
 
@@ -547,27 +554,29 @@ fn codex_launch_plan_for_endpoint(
     config: &BridgeConfig,
     client_endpoint: &str,
     codex_args: &[String],
-) -> CodexLaunchPlan {
+) -> Result<CodexLaunchPlan, BridgeError> {
+    let (permissions, codex_args) = CodexPermissions::extract(codex_args)?;
     let mut root_args = vec!["--remote".to_owned(), client_endpoint.to_owned()];
     // A remote Codex TUI cannot infer the server-side workspace cwd. Give it
     // an explicit override so `/resume` sends a cwd filter to `thread/list`,
     // matching the behavior of a local `codex resume` picker. Preserve a cwd
     // supplied by the caller as the more specific choice.
-    if !has_explicit_cwd(codex_args) {
+    if !has_explicit_cwd(&codex_args) {
         root_args.extend([
             "--cd".to_owned(),
             config.workspace_cwd.to_string_lossy().into_owned(),
         ]);
     }
-    root_args.extend_from_slice(codex_args);
-    CodexLaunchPlan {
+    root_args.extend_from_slice(&codex_args);
+    Ok(CodexLaunchPlan {
         app_server_args: vec![
             "app-server".to_owned(),
             "--listen".to_owned(),
             config.endpoint.clone(),
         ],
         root_args,
-    }
+        permissions,
+    })
 }
 
 fn has_explicit_cwd(args: &[String]) -> bool {
@@ -963,6 +972,20 @@ impl CodexWatcher {
                     }
                     ensure_success_response(&value, "thread/resume")?;
                     self.observe_value(&value);
+                    if value
+                        .pointer("/result/thread")
+                        .and_then(SubagentThread::from_thread_value)
+                        .is_some()
+                        && let Some(permissions) = CodexPermissions::from_thread_response(&value)
+                    {
+                        permissions::control(
+                            &self.config,
+                            "agent.codex.child-mode",
+                            json!({
+                                "thread_id": thread_id, "mode": permissions.run_mode(),
+                            }),
+                        )?;
+                    }
                     return Ok(());
                 }
                 self.handle_server_value(socket, &value)?;
@@ -1071,6 +1094,9 @@ impl CodexWatcher {
             &child.thread_id,
         );
         let mut params = json!({
+            "root_surface_id": self.config.root_surface_id,
+            "lifecycle_id": std::env::var("WMCTERM_TERMINAL_LIFECYCLE_ID").unwrap_or_default(),
+            "thread_id": child.thread_id,
             "workspace": self.config.workspace_id,
             "surface": target,
             "direction": direction,
@@ -1095,7 +1121,7 @@ impl CodexWatcher {
                 &self.config.control_socket,
                 &Request {
                     id: format!("codex-team-{}", RPC_ID.fetch_add(1, Ordering::Relaxed)),
-                    method: "pane.split".into(),
+                    method: "agent.codex.child".into(),
                     params,
                 },
             )
@@ -1412,7 +1438,7 @@ pub fn launch_codex_teams(
     config: BridgeConfig,
     codex_args: &[String],
 ) -> Result<ExitStatus, BridgeError> {
-    let plan = codex_launch_plan(&config, codex_args);
+    let mut plan = codex_launch_plan(&config, codex_args)?;
     let mut app_server_command = managed_codex_command(&config.codex_program);
     let mut app_server = app_server_command
         .args(&plan.app_server_args)
@@ -1427,6 +1453,16 @@ pub fn launch_codex_teams(
         let _ = app_server.wait();
         return Err(error);
     }
+    let permission_proxy =
+        match permissions::PermissionProxy::start(config.clone(), plan.permissions.clone()) {
+            Ok(proxy) => proxy,
+            Err(error) => {
+                let _ = app_server.kill();
+                let _ = app_server.wait();
+                return Err(error);
+            }
+        };
+    plan.root_args[1] = permission_proxy.endpoint.clone();
     let watcher_config = config.clone();
     let watcher_client_endpoint = config.endpoint.clone();
     let stop = Arc::new(AtomicBool::new(false));
@@ -1464,6 +1500,7 @@ pub fn launch_codex_teams(
 fn managed_codex_command(program: &Path) -> Command {
     let mut command = Command::new(program);
     command.env(APPROVAL_BRIDGE_ENV, APPROVAL_BRIDGE_ENV_VALUE);
+    command.env_remove("WMCTERM_CODEX_LAUNCH_TOKEN");
     command
 }
 
@@ -1760,7 +1797,8 @@ mod tests {
         let plan = codex_launch_plan(
             &config,
             &["--model".into(), "gpt-test".into(), "prompt text".into()],
-        );
+        )
+        .unwrap();
         assert_eq!(
             plan.app_server_args,
             ["app-server", "--listen", "ws://127.0.0.1:43123"]
@@ -1789,7 +1827,7 @@ mod tests {
             vec!["-C".into(), "/work/override".into()],
             vec!["-C/work/override".into()],
         ] {
-            let plan = codex_launch_plan(&config, &args);
+            let plan = codex_launch_plan(&config, &args).unwrap();
             assert_eq!(
                 plan.root_args
                     .iter()
@@ -1810,7 +1848,7 @@ mod tests {
     #[test]
     fn cwd_like_prompt_after_option_terminator_does_not_disable_filtering() {
         let config = test_config("ws://127.0.0.1:43123".into());
-        let plan = codex_launch_plan(&config, &["--".into(), "--cd=prompt".into()]);
+        let plan = codex_launch_plan(&config, &["--".into(), "--cd=prompt".into()]).unwrap();
         assert!(
             plan.root_args
                 .windows(2)
@@ -2299,7 +2337,7 @@ mod tests {
             next_rpc_id()
         ));
         let _control_server = wmcterm_ipc::UnixServer::spawn(&control_path, move |request| {
-            assert_eq!(request.method, "pane.split");
+            assert_eq!(request.method, "agent.codex.child");
             assert_eq!(request.params["workspace"], "workspace");
             assert_eq!(request.params["surface"], "surface");
             assert_eq!(request.params["focus"], false);
@@ -2337,7 +2375,7 @@ mod tests {
         let targets = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let recorded_targets = Arc::clone(&targets);
         let _control_server = wmcterm_ipc::UnixServer::spawn(&control_path, move |request| {
-            assert_eq!(request.method, "pane.split");
+            assert_eq!(request.method, "agent.codex.child");
             let target = request.params["surface"].as_str().unwrap().to_owned();
             recorded_targets.lock().unwrap().push(target.clone());
             if target == "closed-child-surface" {

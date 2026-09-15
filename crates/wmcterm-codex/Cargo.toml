@@ -10,6 +10,9 @@ directories.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml_edit.workspace = true
+toml.workspace = true
+uuid.workspace = true
+wmcterm-core = { path = "../wmcterm-core" }
 wmcterm-ipc = { path = "../wmcterm-ipc" }
 thiserror.workspace = true
 tungstenite.workspace = true

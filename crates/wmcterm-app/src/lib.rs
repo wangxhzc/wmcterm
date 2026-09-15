@@ -1,3 +1,4 @@
+mod codex_restore;
 mod i18n;
 mod system_proxy;
 mod text_edit;
@@ -50,8 +51,8 @@ use wmcterm_ipc::{
 use wmcterm_pty::CommandSpec;
 use wmcterm_renderer::{GpuRenderer, RectBlock, TextBlock, TextSpan, default_window_attributes};
 use wmcterm_session::{
-    AgentResumeInfo, SESSION_VERSION, Session, TerminalResume, WindowState, load as load_session,
-    save as save_session, state_path,
+    AgentResumeInfo, ManagedCodexResume, SESSION_VERSION, Session, TerminalResume, WindowState,
+    load as load_session, save as save_session, state_path,
 };
 use wmcterm_surface::{
     LogFilter, LogLevel, LogSurface, MarkdownBlock, MarkdownDocument, MarkdownSurface,
@@ -750,6 +751,22 @@ pub fn run() -> Result<()> {
                 .collect()
         })
         .unwrap_or_default();
+    let restored_codex = restored
+        .as_ref()
+        .map(|session| {
+            session
+                .terminals
+                .iter()
+                .filter_map(|terminal| {
+                    terminal.managed_codex.clone().map(|saved| {
+                        let mut runtime = ManagedCodexRuntime::new(saved);
+                        runtime.cwd = Some(terminal.cwd.clone());
+                        (terminal.terminal_id, runtime)
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
     let restored_state = restored.map(|mut session| {
         reconcile_restored_agent_modes(&mut session.app, &session.terminals);
         session.app
@@ -762,35 +779,66 @@ pub fn run() -> Result<()> {
         restored_history,
         restored_window,
         restored_agent_sessions,
+        restored_codex,
     )?;
     event_loop.run_app(&mut app)?;
     if let Some(path) = state_path() {
         let terminals = app
-            .terminals
-            .iter()
-            .map(|(terminal_id, runtime)| {
-                let resume = resume_info(
-                    &app.state,
-                    &app.agent_sessions,
-                    &app.foreground_agents,
-                    *terminal_id,
-                );
+            .state
+            .surfaces
+            .values()
+            .filter_map(|surface| {
+                if let SurfaceKind::Terminal(id) = surface.kind {
+                    Some(id)
+                } else {
+                    None
+                }
+            })
+            .map(|terminal_id| {
+                let runtime = app.terminals.get(&terminal_id);
+                let resume = app
+                    .managed_codex
+                    .get(&terminal_id)
+                    .filter(|codex| !codex.saved.session_id.is_empty())
+                    .map(|codex| PersistedAgentResume {
+                        agent: AgentResumeInfo::Codex {
+                            session_id: codex.saved.session_id.clone(),
+                        },
+                        managed: true,
+                    })
+                    .or_else(|| {
+                        resume_info(
+                            &app.state,
+                            &app.agent_sessions,
+                            &app.foreground_agents,
+                            terminal_id,
+                        )
+                    });
                 TerminalResume {
-                    terminal_id: *terminal_id,
+                    managed_codex: app
+                        .managed_codex
+                        .get(&terminal_id)
+                        .map(|codex| codex.saved.clone()),
+                    terminal_id,
                     cwd: app
-                        .cwd_for_terminal(*terminal_id)
+                        .managed_codex
+                        .get(&terminal_id)
+                        .and_then(|codex| codex.cwd.clone())
+                        .or_else(|| app.cwd_for_terminal(terminal_id))
                         .unwrap_or_else(|| env::current_dir().unwrap_or_default()),
                     command: match resume.as_ref() {
                         Some(resume) if resume.managed => None,
                         Some(resume) => Some(manual_agent_resume_command(&resume.agent.command())),
                         None => app
                             .commands
-                            .get(terminal_id)
+                            .get(&terminal_id)
                             .filter(|command| !command.contains(MANUAL_AGENT_RESUME_MARKER))
                             .cloned(),
                     },
                     agent: resume.map(|resume| resume.agent),
-                    scrollback: runtime.session.export_history(),
+                    scrollback: runtime
+                        .and_then(|runtime| runtime.session.export_history())
+                        .or_else(|| app.restored_history.get(&terminal_id).cloned()),
                 }
             })
             .collect();
@@ -857,14 +905,23 @@ fn discard_unavailable_codex_resumes(session: &mut Session) {
 fn discard_codex_resumes_without_record(session: &mut Session, exists: impl Fn(&str) -> bool) {
     let mut cleared = HashSet::new();
     for terminal in &mut session.terminals {
-        let discard = match &terminal.agent {
+        let invalid_managed = terminal.managed_codex.as_ref().is_some_and(|saved| {
+            !matches!(&terminal.agent, Some(AgentResumeInfo::Codex { session_id }) if session_id == &saved.session_id)
+                || !exists(&saved.session_id)
+        });
+        let discard = invalid_managed || match &terminal.agent {
             Some(agent @ AgentResumeInfo::Codex { session_id }) => {
                 let generated = terminal.command.as_ref().is_none_or(|command| {
                     command == &agent.command()
                         || is_manual_agent_resume_command(command)
                         || is_stale_codex_teams_child_command(command, session_id)
                 });
-                generated && !exists(session_id)
+                generated
+                    && (!exists(session_id)
+                        || terminal
+                            .managed_codex
+                            .as_ref()
+                            .is_some_and(|saved| saved.session_id != *session_id))
             }
             None if terminal.command.is_none() => session.app.surfaces.values().any(|surface| {
                 matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal.terminal_id)
@@ -880,6 +937,7 @@ fn discard_codex_resumes_without_record(session: &mut Session, exists: impl Fn(&
         }
         terminal.command = None;
         terminal.agent = None;
+        terminal.managed_codex = None;
         for surface in session.app.surfaces.values_mut().filter(|surface| {
             matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal.terminal_id)
         }) {
@@ -920,14 +978,20 @@ fn reconcile_restored_agent_modes(state: &mut AppState, terminals: &[TerminalRes
         };
         // These generated resume commands intentionally omit elevated modes.
         // Preserve metadata for explicit launch commands that are replayed as-is.
-        if command != agent.command() && !is_manual_agent_resume_command(&command) {
+        if terminal.managed_codex.is_none()
+            && command != agent.command()
+            && !is_manual_agent_resume_command(&command)
+        {
             continue;
         }
         for surface in state.surfaces.values_mut().filter(|surface| {
             matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal.terminal_id)
         }) {
             if let Some(metadata) = &mut surface.agent {
-                metadata.run_mode = AgentRunMode::Interactive;
+                metadata.run_mode = terminal.managed_codex.as_ref().map(|codex| codex.mode).unwrap_or_default();
+                if terminal.managed_codex.is_some() {
+                    metadata.state = wmcterm_core::AgentState::Idle;
+                }
             }
         }
     }
@@ -948,6 +1012,9 @@ fn sync_detected_agent_mode(
 }
 
 fn restored_terminal_command(terminal: &TerminalResume) -> Option<String> {
+    if terminal.managed_codex.is_some() {
+        return Some("wmcterm codex-managed".into());
+    }
     match (&terminal.command, &terminal.agent) {
         (Some(command), Some(agent @ AgentResumeInfo::Codex { session_id }))
             if is_stale_codex_teams_child_command(command, session_id) =>
@@ -992,7 +1059,32 @@ fn is_stale_codex_teams_child_command(command: &str, session_id: &str) -> bool {
         && port.parse::<u16>().is_ok_and(|port| port != 0)
 }
 
+struct ManagedCodexRuntime {
+    saved: ManagedCodexResume,
+    launch_token: Option<String>,
+    claimed: bool,
+    endpoint: Option<String>,
+    program: Option<PathBuf>,
+    cwd: Option<PathBuf>,
+    verified: bool,
+}
+
+impl ManagedCodexRuntime {
+    fn new(saved: ManagedCodexResume) -> Self {
+        Self {
+            saved,
+            launch_token: None,
+            claimed: false,
+            endpoint: None,
+            program: None,
+            cwd: None,
+            verified: false,
+        }
+    }
+}
+
 struct WmctermApplication {
+    managed_codex: HashMap<TerminalId, ManagedCodexRuntime>,
     renderer: Option<GpuRenderer>,
     state: AppState,
     terminals: HashMap<TerminalId, TerminalRuntime>,
@@ -1092,6 +1184,7 @@ struct WmctermApplication {
 }
 
 impl WmctermApplication {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         proxy: EventLoopProxy<UserEvent>,
         config: Config,
@@ -1100,6 +1193,7 @@ impl WmctermApplication {
         restored_history: HashMap<TerminalId, String>,
         restored_window: Option<WindowState>,
         restored_agent_sessions: HashMap<SurfaceId, AgentSession>,
+        restored_codex: HashMap<TerminalId, ManagedCodexRuntime>,
     ) -> Result<Self> {
         Self::new_configured(
             proxy,
@@ -1109,6 +1203,7 @@ impl WmctermApplication {
             restored_history,
             restored_window,
             restored_agent_sessions,
+            restored_codex,
             true,
         )
     }
@@ -1122,6 +1217,7 @@ impl WmctermApplication {
         restored_history: HashMap<TerminalId, String>,
         restored_window: Option<WindowState>,
         restored_agent_sessions: HashMap<SurfaceId, AgentSession>,
+        restored_codex: HashMap<TerminalId, ManagedCodexRuntime>,
         enable_ipc: bool,
     ) -> Result<Self> {
         let raw_process_cwd = env::current_dir()?;
@@ -1196,6 +1292,7 @@ impl WmctermApplication {
             wmcterm_config::config_path().map(|path| ConfigReloader::new(vec![path]));
         let language = Language::resolve(config.ui.language);
         let mut app = Self {
+            managed_codex: restored_codex,
             renderer: None,
             state,
             terminals: HashMap::new(),
@@ -1326,6 +1423,27 @@ impl WmctermApplication {
             })
             .collect();
         for id in terminal_ids {
+            if let Some(parent) = app
+                .managed_codex
+                .get(&id)
+                .and_then(|codex| codex.saved.parent_surface)
+            {
+                let parent_exists = app.state.surfaces.get(&parent).is_some_and(|surface| {
+                    matches!(surface.kind, SurfaceKind::Terminal(root) if app.managed_codex.contains_key(&root))
+                });
+                if parent_exists {
+                    continue;
+                }
+                if let Err(error) = app.spawn_terminal_command(id, None) {
+                    app.report_terminal_notice(id, TerminalNotice::SpawnFailed(error.to_string()));
+                } else {
+                    app.report_terminal_notice(
+                        id,
+                        TerminalNotice::Warning(app.language.codex_parent_unavailable().into()),
+                    );
+                }
+                continue;
+            }
             if let Err(error) = app.spawn_terminal(id) {
                 tracing::error!(terminal=%id, %error, "spawning restored terminal failed");
                 app.report_terminal_notice(id, TerminalNotice::SpawnFailed(error.to_string()));
@@ -1335,6 +1453,39 @@ impl WmctermApplication {
     }
 
     fn spawn_terminal(&mut self, id: TerminalId) -> Result<()> {
+        if let Some(parent) = self
+            .managed_codex
+            .get(&id)
+            .and_then(|codex| codex.saved.parent_surface)
+        {
+            let parent_terminal = self
+                .state
+                .surfaces
+                .get(&parent)
+                .and_then(|surface| match surface.kind {
+                    SurfaceKind::Terminal(terminal) => Some(terminal),
+                    _ => None,
+                })
+                .context("Codex parent surface is unavailable")?;
+            let root = self
+                .managed_codex
+                .get(&parent_terminal)
+                .filter(|root| root.verified)
+                .context("Codex parent has not completed managed restore")?;
+            let endpoint = root
+                .endpoint
+                .clone()
+                .context("Codex parent endpoint is unavailable")?;
+            let program = root
+                .program
+                .clone()
+                .context("Codex parent executable is unavailable")?;
+            let child = self.managed_codex.get_mut(&id).expect("child found above");
+            let command =
+                wmcterm_codex::resume_command(&program, &endpoint, &child.saved.session_id);
+            child.endpoint = Some(endpoint);
+            return self.spawn_terminal_command(id, Some(command));
+        }
         self.spawn_terminal_command(id, self.commands.get(&id).cloned())
     }
 
@@ -1368,11 +1519,32 @@ impl WmctermApplication {
         }
         let size = TerminalSize::new(80, 24)?;
         let lifecycle_id = uuid::Uuid::new_v4().to_string();
-        let mut spec = terminal_command_spec(options.command.as_deref())
+        let command_spec = if let Some(codex) = self
+            .managed_codex
+            .get_mut(&id)
+            .filter(|codex| codex.saved.parent_surface.is_none())
+        {
+            let token = uuid::Uuid::new_v4().to_string();
+            codex.launch_token = Some(token.clone());
+            codex.claimed = false;
+            codex.endpoint = None;
+            codex.verified = false;
+            CommandSpec::new(env::current_exe()?)
+                .args(["codex-managed"])
+                .env("WMCTERM_CODEX_LAUNCH_TOKEN", token)
+        } else {
+            terminal_command_spec(options.command.as_deref())
+        };
+        let mut spec = command_spec
             .cwd(
                 options
                     .cwd
                     .clone()
+                    .or_else(|| {
+                        self.managed_codex
+                            .get(&id)
+                            .and_then(|codex| codex.cwd.clone())
+                    })
                     .or_else(|| self.cwd_for_terminal(id))
                     .unwrap_or_else(|| env::current_dir().unwrap_or_default()),
             )
@@ -1667,6 +1839,12 @@ impl WmctermApplication {
                     self.close_agent_session_for_terminal(terminal_id, status.clone());
                     self.clear_manual_agent_resume_after_terminal_exit(terminal_id);
                     self.report_terminal_notice(terminal_id, TerminalNotice::Exited(status));
+                    if self.codex_child_needs_reconnect(terminal_id) {
+                        self.terminals.remove(&terminal_id);
+                        if let Err(error) = self.spawn_terminal(terminal_id) {
+                            self.report_terminal_notice(terminal_id, TerminalNotice::SpawnFailed(error.to_string()));
+                        }
+                    }
                     changed = true;
                 }
                 SessionEvent::Error(error) => {
@@ -2366,8 +2544,16 @@ impl WmctermApplication {
 
     fn update_foreground_agent(&mut self, terminal: TerminalId, commands: &[String]) -> bool {
         let detected = commands.iter().find_map(|command| {
-            AgentKind::from_process_command(command)
-                .map(|agent| (agent, agent.run_mode_from_process_command(command)))
+            AgentKind::from_process_command(command).map(|agent| {
+                (
+                    agent,
+                    self.managed_codex
+                        .get(&terminal)
+                        .filter(|_| agent == AgentKind::Codex)
+                        .map(|codex| codex.saved.mode)
+                        .unwrap_or_else(|| agent.run_mode_from_process_command(command)),
+                )
+            })
         });
         let previous = self.foreground_agents.get(&terminal).copied();
         if previous == detected {
@@ -4724,7 +4910,10 @@ impl WmctermApplication {
         self.close_confirmation = Some(CloseConfirmation {
             target: CloseTarget::FullAccess(agent),
             title: self.language.full_access_confirmation_title(agent.name()),
-            message: self.language.full_access_confirmation_message().into(),
+            message: self
+                .language
+                .full_access_confirmation_message(agent == ManagedAgent::Codex)
+                .into(),
         });
         self.rebuild_scene();
     }
@@ -4945,7 +5134,11 @@ impl WmctermApplication {
             }
             CloseTarget::Application => self.quit_requested = true,
             CloseTarget::FullAccess(agent) => {
-                self.new_surface_command(Some(agent.full_access_command().into()));
+                if agent == ManagedAgent::Codex {
+                    self.new_surface_codex(AgentRunMode::FullAccess);
+                } else {
+                    self.new_surface_command(Some(agent.full_access_command().into()));
+                }
             }
         }
         self.update_navigation_hover();
@@ -5078,6 +5271,7 @@ impl WmctermApplication {
             }
             for terminal in terminal_ids {
                 self.terminals.remove(&terminal);
+                self.managed_codex.remove(&terminal);
                 self.commands.remove(&terminal);
                 self.terminal_notices.remove(&terminal);
                 self.terminal_processes.remove(&terminal);
@@ -5093,6 +5287,18 @@ impl WmctermApplication {
     }
 
     fn new_surface_command(&mut self, command: Option<String>) -> Option<wmcterm_core::SurfaceId> {
+        self.new_surface_command_with_codex(command, None)
+    }
+
+    fn new_surface_codex(&mut self, mode: AgentRunMode) -> Option<SurfaceId> {
+        self.new_surface_command_with_codex(Some("wmcterm codex-managed".into()), Some(mode))
+    }
+
+    fn new_surface_command_with_codex(
+        &mut self,
+        command: Option<String>,
+        codex_mode: Option<AgentRunMode>,
+    ) -> Option<SurfaceId> {
         let pane_id = self
             .state
             .active_workspace()
@@ -5103,6 +5309,17 @@ impl WmctermApplication {
             _ => return None,
         };
         let surface_id = surface.id;
+        if let Some(mode) = codex_mode {
+            self.managed_codex.insert(
+                terminal,
+                ManagedCodexRuntime::new(ManagedCodexResume {
+                    session_id: String::new(),
+                    mode,
+                    parent_surface: None,
+                    permissions: None,
+                }),
+            );
+        }
         self.state.surfaces.insert(surface_id, surface);
         if let Some(pane) = self.state.panes.get_mut(&pane_id) {
             pane.surfaces.push(surface_id);
@@ -5387,6 +5604,7 @@ impl WmctermApplication {
             && let SurfaceKind::Terminal(terminal) = surface.kind
         {
             self.terminals.remove(&terminal);
+            self.managed_codex.remove(&terminal);
             self.commands.remove(&terminal);
             self.terminal_notices.remove(&terminal);
             self.terminal_processes.remove(&terminal);
@@ -5465,6 +5683,7 @@ impl WmctermApplication {
             && let SurfaceKind::Terminal(terminal) = surface.kind
         {
             self.terminals.remove(&terminal);
+            self.managed_codex.remove(&terminal);
             self.commands.remove(&terminal);
             self.terminal_notices.remove(&terminal);
             self.terminal_processes.remove(&terminal);
@@ -5649,6 +5868,7 @@ impl WmctermApplication {
                         && let SurfaceKind::Terminal(terminal) = surface.kind
                     {
                         self.terminals.remove(&terminal);
+                        self.managed_codex.remove(&terminal);
                         self.commands.remove(&terminal);
                         self.terminal_notices.remove(&terminal);
                         self.terminal_processes.remove(&terminal);
@@ -8562,7 +8782,10 @@ impl WmctermApplication {
                     )
                 };
                 match self.workspace_agent_run_mode(row.index) {
-                    AgentRunMode::Interactive => {}
+                    AgentRunMode::Interactive => {
+                        agent_state.push_str(" · ");
+                        agent_state.push_str(self.language.interactive());
+                    }
                     AgentRunMode::Unattended => {
                         agent_state.push_str(" · ");
                         agent_state.push_str(self.language.unattended());
@@ -9780,13 +10003,13 @@ impl WmctermApplication {
                     theme_text,
                 ),
             ] {
-                let text_width = ui::display_width(text) as f32 * 14.0 * 0.6;
+                let (text, left) = ui::centered_truncated_text_left(bounds, text, 14.0);
                 overlay_blocks.push(TextBlock {
-                    text: text.into(),
+                    text,
                     spans: vec![],
-                    left: bounds.x + (bounds.width - text_width).max(0.0) / 2.0,
+                    left,
                     top: bounds.y + 7.0,
-                    width: text_width.max(1.0),
+                    width: (bounds.x + bounds.width - 8.0 - left).max(1.0),
                     height: 22.0,
                     color,
                     font_size: 14.0,
@@ -11181,6 +11404,15 @@ impl WmctermApplication {
                     "decision_modes": ["deny", "once", "always", "all"],
                     "fail_closed": true
                 },
+                "codex_restore": {
+                    "managed_modes": ["interactive", "unattended", "full-access"],
+                    "preserves_mode": true,
+                    "rebuilds_teams_bridge": true,
+                    "permission_verification": "server response before turn/start",
+                    "full_access": "GUI confirmation or persisted managed session; not a CLI/RPC launch option",
+                    "failure": "no automatic permission downgrade; Enter retries an exited terminal",
+                    "legacy": "missing managed restore record uses interactive provider resume"
+                },
                 "agent_events": [
                     "session_start", "tool_use", "permission_request", "needs_input",
                     "turn_complete", "turn_failed", "stop"
@@ -11755,6 +11987,12 @@ impl WmctermApplication {
                 self.rebuild_scene();
                 Ok(json!(reply))
             }
+            "agent.codex.claim" => self.claim_codex_launch(&request.params),
+            "agent.codex.register" => self.register_codex_launch(&request.params),
+            "agent.codex.ready" => self.codex_launch_ready(&request.params),
+            "agent.codex.child" => self.codex_child(&request.params),
+            "agent.codex.child-mode" => self.codex_child_mode(&request.params),
+            "agent.codex.stopped" => self.codex_launch_stopped(&request.params),
             "agent.update" => {
                 let claude_hook = request
                     .params
@@ -15525,6 +15763,7 @@ mod tests {
 
     fn terminal_resume(command: Option<&str>, agent: Option<AgentResumeInfo>) -> TerminalResume {
         TerminalResume {
+            managed_codex: None,
             terminal_id: TerminalId::new_v4(),
             cwd: PathBuf::from("/tmp/project"),
             command: command.map(str::to_owned),
@@ -18043,10 +18282,12 @@ mod tests {
             HashMap::new(),
             None,
             HashMap::new(),
+            HashMap::new(),
             false,
         )
         .unwrap();
         let lifecycle = app.terminals[&terminal].lifecycle_id.clone();
+        codex_restore::tests::check_launch_rpc(&mut app, terminal, surface, &lifecycle);
         app.state.surfaces.get_mut(&surface).unwrap().agent = Some(wmcterm_core::AgentMetadata {
             name: "codex".into(),
             state: AgentState::Running,

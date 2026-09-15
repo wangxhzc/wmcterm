@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use directories::ProjectDirs;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use wmcterm_core::{AgentSession, AppState, TerminalId};
+use wmcterm_core::{AgentRunMode, AgentSession, AppState, SurfaceId, TerminalId};
 
 pub const SESSION_VERSION: u32 = 1;
 
@@ -33,7 +33,20 @@ pub struct TerminalResume {
     pub command: Option<String>,
     pub agent: Option<AgentResumeInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub managed_codex: Option<ManagedCodexResume>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scrollback: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManagedCodexResume {
+    pub session_id: String,
+    #[serde(default)]
+    pub mode: AgentRunMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_surface: Option<SurfaceId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permissions: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +108,34 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
+    fn managed_codex_restore_round_trips_modes_and_keeps_legacy_defaults() {
+        let legacy = serde_json::json!({
+            "terminal_id": TerminalId::new_v4(), "cwd": "/tmp", "command": null,
+            "agent": {"agent": "codex", "session_id": "old-thread"}
+        });
+        let restored: TerminalResume = serde_json::from_value(legacy).unwrap();
+        assert!(restored.managed_codex.is_none());
+        for mode in [
+            AgentRunMode::Interactive,
+            AgentRunMode::Unattended,
+            AgentRunMode::FullAccess,
+        ] {
+            let saved = ManagedCodexResume {
+                session_id: "thread".into(),
+                mode,
+                parent_surface: Some(SurfaceId::new_v4()),
+                permissions: None,
+            };
+            let decoded: ManagedCodexResume =
+                serde_json::from_value(serde_json::to_value(&saved).unwrap()).unwrap();
+            assert_eq!(decoded, saved);
+        }
+        let old: ManagedCodexResume =
+            serde_json::from_value(serde_json::json!({"session_id": "thread"})).unwrap();
+        assert_eq!(old.mode, AgentRunMode::Interactive);
+    }
+
+    #[test]
     fn atomically_round_trips_a_session() {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -147,6 +188,7 @@ mod tests {
             version: SESSION_VERSION,
             app: AppState::default(),
             terminals: vec![TerminalResume {
+                managed_codex: None,
                 terminal_id: TerminalId::new_v4(),
                 cwd: PathBuf::from("/tmp/project"),
                 command: Some("cargo test".into()),

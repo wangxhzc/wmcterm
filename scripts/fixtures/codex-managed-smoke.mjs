@@ -1,0 +1,52 @@
+// Real app-server, deterministic TUI client, and no model turns.
+import assert from 'node:assert/strict';
+import { appendFileSync } from 'node:fs';
+
+const args = process.argv.slice(2);
+assert(!args.some(arg => ['--approve-for-me', '--sandbox', '--ask-for-approval', '--dangerously-bypass-approvals-and-sandbox'].includes(arg)));
+const socket = new WebSocket(args[args.indexOf('--remote') + 1]);
+const pending = new Map();
+let sequence = 0;
+const timeout = setTimeout(() => { console.error('managed Codex smoke timed out'); process.exit(1); }, 20000);
+socket.addEventListener('message', event => {
+  const message = JSON.parse(event.data);
+  if (!message.method && pending.has(message.id)) {
+    const { resolve, reject } = pending.get(message.id);
+    pending.delete(message.id);
+    if (message.error) reject(new Error(JSON.stringify(message.error)));
+    else resolve(message.result);
+  }
+});
+const request = (method, params) => new Promise((resolve, reject) => {
+  const id = ++sequence;
+  pending.set(id, { resolve, reject });
+  socket.send(JSON.stringify({ id, method, params }));
+});
+socket.addEventListener('open', async () => {
+  try {
+    await request('initialize', { clientInfo: { name: 'wmcterm_smoke_tui', version: '1' }, capabilities: { experimentalApi: true } });
+    socket.send(JSON.stringify({ method: 'initialized' }));
+    const resume = args.indexOf('resume');
+    const result = resume >= 0
+      ? await request('thread/resume', { threadId: args[resume + 1] })
+      : await request('thread/start', { cwd: process.cwd() });
+    const threadId = result.thread.id;
+    await request('thread/inject_items', { threadId, items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'wmcterm restore smoke fixture; no model turn.' }] }] });
+    // The same RPC used by the in-session /resume path.
+    const resumed = await request('thread/resume', { threadId });
+    assert.equal(resumed.approvalPolicy, result.approvalPolicy);
+    assert.equal(resumed.approvalsReviewer, result.approvalsReviewer);
+    assert.deepEqual(resumed.sandbox, result.sandbox);
+    appendFileSync(process.env.WMCTERM_TEST_RESULTS, JSON.stringify({
+      threadId, policy: resumed.approvalPolicy, reviewer: resumed.approvalsReviewer,
+      sandbox: resumed.sandbox.type, resumed: resume >= 0,
+    }) + '\n');
+    clearTimeout(timeout);
+    socket.close();
+  } catch (error) {
+    console.error(error);
+    process.exitCode = 1;
+    clearTimeout(timeout);
+    socket.close();
+  }
+});

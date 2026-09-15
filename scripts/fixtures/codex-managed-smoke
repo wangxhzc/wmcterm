@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+if [ "${1:-}" = app-server ]; then
+    exec "$WMCTERM_TEST_REAL_CODEX" "$@"
+fi
+exec node "$(dirname "$0")/codex-managed-smoke.mjs" "$@"

@@ -256,9 +256,27 @@ rows and the sidebar resize edge. Mouse-wheel scrolling remains available.
 The sidebar scrollbar track extends to the bottom. The 32px blank context-menu
 area follows the last workspace as part of the scrollable list.
 
-Generated Agent resume commands do not retain unattended/full-access launch flags.
-Restored sidebar metadata uses interactive mode until current process detection
-provides a different mode; this applies to managed and manually launched sessions.
+Managed Codex sessions with a saved managed restore record retain their original
+interactive, auto-review, or dangerous full-access mode after restarting wmcterm.
+The application rebuilds the Teams bridge, verifies server-side permissions, and
+reattaches saved child surfaces without focus changes or duplicate panes. Child
+threads retain their own permissions and cwd. An unavailable parent leaves its
+child at a shell with an explanation. Legacy records and manually launched Agents
+keep the ordinary interactive resume policy.
+
+Full-access restore is performed by the application using the persisted GUI
+choice. Agents must not call private `agent.codex.*` launch/restore methods or try
+to obtain GUI launch tokens. CLI full-access and bypass options remain blocked.
+An integration or permission-verification failure stops managed startup instead
+of falling back automatically. Enter retries an exited terminal; a native
+`codex resume` in a new shell is an explicit alternative without Teams ownership.
+Managed remote `/resume` applies permissions through the server protocol, not TUI
+permission flags. `--add-dir`, an external `--remote`, and custom `permissions`
+overrides are currently unsupported by the managed permission bridge.
+
+The sidebar displays interactive, auto-review, or dangerous full access
+independently of idle/running/waiting/completed state. Managed labels follow
+verified server settings; manual labels follow foreground process detection.
 
 A Codex session ID alone is not sufficient for automatic resume. On save/load,
 wmcterm checks for a nonempty matching rollout in the current Codex home; absent

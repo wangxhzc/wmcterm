@@ -2344,6 +2344,10 @@ Rust actor、winit 事件循环、wgpu surface 和 glyphon 缓存。因此只借
 
 ## 33.14 Agent 恢复按启动来源和退出状态决策
 
+2026-09-15 更新：带托管恢复记录的 Codex 已改为按原权限模式重建 Teams 服务并恢复
+原线程，三种模式均保留。下述普通 resume 降级规则仅适用于旧记录、手动 Agent 和
+其他 provider。详见 [Codex 托管恢复设计](rust-libghostty-vt-winit-wgpu-terminal-design.md)。
+
 实现状态（2026-09-01）：会话持久化区分 wmcterm Agent 入口启动和 Shell 手动启动。
 前者在取得 provider session ID 后始终保存 resume 信息，并在重开时直接执行 Codex、
 Claude 或 OpenCode 的 resume 命令，不再重放原始启动命令。后者只有在 wmcterm 关闭时
@@ -2376,7 +2380,7 @@ PowerShell、cmd 和兼容 Shell。
 避免一侧被终端背景盖住而在底部露出短线；不再叠加额外拖动光晕。通用列表滑块
 高度不得超过轨道高度；空间不足以容纳轨道内边距时不绘制滚动条。
 
-恢复 Agent 时，生成的普通 resume 命令与 Surface AgentMetadata.run_mode 必须
+恢复未带 Codex 托管恢复记录的 Agent 时，生成的普通 resume 命令与 Surface AgentMetadata.run_mode 必须
 保持一致：在构造 UI 和接收 Hook 前，将对应 Surface 的旧自动审批/完全访问模式
 重置为 Interactive。命令面板托管启动、手动 Shell 包装恢复、旧直接恢复以及失效
 remote 子会话降级均适用；按原样重放的显式启动命令不由此规则改写。手动 Agent
