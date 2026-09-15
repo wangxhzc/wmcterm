@@ -231,6 +231,16 @@ pub fn handle_permission_request_with(
     control: &mut impl ApprovalControl,
     stop: Option<&AtomicBool>,
 ) -> HookOutcome {
+    let started = Instant::now();
+    let interrupted = || {
+        if stop.is_some_and(|stop| stop.load(Ordering::Acquire)) {
+            Some(("hook_interrupted", ClaudeApprovalError::Interrupted))
+        } else if started.elapsed() >= config.timeout {
+            Some(("hook_timeout", ClaudeApprovalError::Timeout(config.timeout)))
+        } else {
+            None
+        }
+    };
     let request = match PermissionRequest::parse(raw) {
         Ok(request) => request,
         Err(error) => return HookOutcome::denied(error),
@@ -241,6 +251,9 @@ pub fn handle_permission_request_with(
     };
     let ApprovalControlStatus::Pending { approval_id } = registered else {
         if let ApprovalControlStatus::Resolved { decision } = registered {
+            if let Some((_, error)) = interrupted() {
+                return HookOutcome::denied(error);
+            }
             return resolved_outcome(&request, decision);
         }
         unreachable!();
@@ -251,17 +264,18 @@ pub fn handle_permission_request_with(
         ));
     }
 
-    let started = Instant::now();
     loop {
-        if stop.is_some_and(|stop| stop.load(Ordering::Acquire)) {
-            let _ = control.cancel(&approval_id, "hook_interrupted");
-            return HookOutcome::denied(ClaudeApprovalError::Interrupted);
+        if let Some((reason, error)) = interrupted() {
+            let _ = control.cancel(&approval_id, reason);
+            return HookOutcome::denied(error);
         }
-        if started.elapsed() >= config.timeout {
-            let _ = control.cancel(&approval_id, "hook_timeout");
-            return HookOutcome::denied(ClaudeApprovalError::Timeout(config.timeout));
+        let status = control.poll(&approval_id);
+        // A blocking IPC call may outlive the hook's deadline or shutdown.
+        if let Some((reason, error)) = interrupted() {
+            let _ = control.cancel(&approval_id, reason);
+            return HookOutcome::denied(error);
         }
-        match control.poll(&approval_id) {
+        match status {
             Ok(ApprovalControlStatus::Resolved { decision }) => {
                 return resolved_outcome(&request, decision);
             }
@@ -684,6 +698,9 @@ mod tests {
         polls: VecDeque<Result<ApprovalControlStatus, ClaudeApprovalError>>,
         cancelled: Vec<(String, String)>,
         registration: Option<Value>,
+        register_delay: Duration,
+        poll_delay: Duration,
+        stop_on_poll: Option<std::sync::Arc<AtomicBool>>,
     }
 
     impl ApprovalControl for MockControl {
@@ -693,6 +710,7 @@ mod tests {
             config: &BridgeConfig,
         ) -> Result<ApprovalControlStatus, ClaudeApprovalError> {
             self.registration = Some(request.registration_params(config));
+            std::thread::sleep(self.register_delay);
             self.register.take().unwrap()
         }
 
@@ -700,6 +718,10 @@ mod tests {
             &mut self,
             _approval_id: &str,
         ) -> Result<ApprovalControlStatus, ClaudeApprovalError> {
+            std::thread::sleep(self.poll_delay);
+            if let Some(stop) = &self.stop_on_poll {
+                stop.store(true, Ordering::Release);
+            }
             self.polls.pop_front().unwrap_or_else(|| {
                 Ok(ApprovalControlStatus::Pending {
                     approval_id: "approval-1".into(),
@@ -902,6 +924,101 @@ mod tests {
         assert_eq!(
             control.cancelled,
             vec![("approval-1".into(), "hook_timeout".into())]
+        );
+    }
+
+    #[test]
+    fn registration_time_counts_toward_deadline() {
+        for status in [
+            ApprovalControlStatus::Pending {
+                approval_id: "approval-1".into(),
+            },
+            ApprovalControlStatus::Resolved {
+                decision: ApprovalDecision::Once,
+            },
+        ] {
+            let pending = matches!(status, ApprovalControlStatus::Pending { .. });
+            let mut control = MockControl {
+                register: Some(Ok(status)),
+                register_delay: Duration::from_millis(20),
+                polls: VecDeque::from([Ok(ApprovalControlStatus::Resolved {
+                    decision: ApprovalDecision::Once,
+                })]),
+                ..Default::default()
+            };
+            let outcome =
+                handle_permission_request_with(&request(json!([])), &config(), &mut control, None);
+            assert_eq!(
+                outcome.output["hookSpecificOutput"]["decision"]["behavior"],
+                "deny"
+            );
+            assert!(outcome.diagnostic.unwrap().contains("timed out"));
+            assert_eq!(control.polls.len(), 1);
+            assert_eq!(control.cancelled.len(), usize::from(pending));
+        }
+    }
+
+    #[test]
+    fn approval_returned_after_poll_deadline_is_denied() {
+        let mut control = MockControl {
+            register: Some(Ok(ApprovalControlStatus::Pending {
+                approval_id: "approval-1".into(),
+            })),
+            poll_delay: Duration::from_millis(110),
+            polls: VecDeque::from([Ok(ApprovalControlStatus::Resolved {
+                decision: ApprovalDecision::Once,
+            })]),
+            ..Default::default()
+        };
+        let mut config = config();
+        config.timeout = Duration::from_millis(100);
+        let outcome =
+            handle_permission_request_with(&request(json!([])), &config, &mut control, None);
+        assert!(
+            control.polls.is_empty(),
+            "the late approval must reach the post-poll deadline check"
+        );
+        assert_eq!(
+            outcome.output["hookSpecificOutput"]["decision"]["behavior"],
+            "deny"
+        );
+        assert_eq!(
+            control.cancelled,
+            vec![("approval-1".into(), "hook_timeout".into())]
+        );
+    }
+
+    #[test]
+    fn shutdown_during_poll_rejects_returned_approval() {
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let mut control = MockControl {
+            register: Some(Ok(ApprovalControlStatus::Pending {
+                approval_id: "approval-1".into(),
+            })),
+            stop_on_poll: Some(stop.clone()),
+            polls: VecDeque::from([Ok(ApprovalControlStatus::Resolved {
+                decision: ApprovalDecision::Always,
+            })]),
+            ..Default::default()
+        };
+        let outcome = handle_permission_request_with(
+            &request(json!([suggestion()])),
+            &config(),
+            &mut control,
+            Some(&stop),
+        );
+        assert_eq!(
+            outcome.output["hookSpecificOutput"]["decision"]["behavior"],
+            "deny"
+        );
+        assert!(
+            outcome.output["hookSpecificOutput"]["decision"]
+                .get("updatedPermissions")
+                .is_none()
+        );
+        assert_eq!(
+            control.cancelled,
+            vec![("approval-1".into(), "hook_interrupted".into())]
         );
     }
 

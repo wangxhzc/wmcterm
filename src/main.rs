@@ -154,6 +154,7 @@ fn print_help() {
          \x20 wmcterm agent-event JSON\n\
          \x20 wmcterm agent-request list|reply|cancel ...\n\
          \x20 wmcterm hook receive|plan|install --agent KIND [--event NAME]\n\
+         \x20   Claude StopFailure reports a failed turn without ending the session\n\
          \x20 wmcterm skill print|install [--scope project|user] [--force]\n\
          \x20 wmcterm agent [--mode interactive|unattended|full-access] claude|codex|gemini|opencode [ARG...]\n\
          \x20 wmcterm codex-teams [CODEX_ARG...]\n\

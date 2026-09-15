@@ -37,6 +37,9 @@ cat >"$CLAUDE_CONFIG_DIR/settings.json" <<'JSON'
     "Stop": [
       {"hooks": [{"type": "command", "command": "/old/wmcterm hook receive --agent claude"}]},
       {"hooks": [{"type": "command", "command": "keep-claude-hook"}]}
+    ],
+    "StopFailure": [
+      {"hooks": [{"type": "command", "command": "keep-claude-failure-hook"}]}
     ]
   }
 }
@@ -91,7 +94,17 @@ assert "/old/wmcterm" not in claude_text
 assert "keep-codex-hook" in codex_text
 assert "keep-codex-interrupt" in codex_text
 assert "keep-claude-hook" in claude_text
+assert "keep-claude-failure-hook" in claude_text
 assert codex_hooks["hooks"]["Interrupt"]
+failure_hooks = claude_settings["hooks"]["StopFailure"]
+failure_receivers = [
+    hook["command"]
+    for entry in failure_hooks
+    for hook in entry.get("hooks", [])
+    if "wmcterm hook receive --agent claude" in hook.get("command", "")
+]
+assert len(failure_receivers) == 1, failure_receivers
+assert "--event StopFailure" in failure_receivers[0]
 
 skill_paths = (
     home / ".agents/skills/wmcterm/SKILL.md",

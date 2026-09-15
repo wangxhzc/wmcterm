@@ -2170,6 +2170,16 @@ impl WmctermApplication {
         terminal: TerminalId,
         hook: &ClaudeHookEvent,
     ) -> Result<(), String> {
+        let surface = self.validate_claude_hook(terminal, hook)?;
+        apply_claude_subagent_status(&mut self.claude_subagents, surface, hook);
+        Ok(())
+    }
+
+    fn validate_claude_hook(
+        &self,
+        terminal: TerminalId,
+        hook: &ClaudeHookEvent,
+    ) -> Result<SurfaceId, String> {
         let (_, _, surface) = terminal_context_ids(&self.state, terminal)
             .ok_or_else(|| "Claude hook terminal context not found".to_owned())?;
         let metadata = self
@@ -2187,8 +2197,7 @@ impl WmctermApplication {
         if metadata.session_id.as_deref() != Some(hook.session_id.as_str()) {
             return Err("Claude hook session does not match its surface".into());
         }
-        apply_claude_subagent_status(&mut self.claude_subagents, surface, hook);
-        Ok(())
+        Ok(surface)
     }
 
     fn validate_codex_session(
@@ -11172,6 +11181,10 @@ impl WmctermApplication {
                     "decision_modes": ["deny", "once", "always", "all"],
                     "fail_closed": true
                 },
+                "agent_events": [
+                    "session_start", "tool_use", "permission_request", "needs_input",
+                    "turn_complete", "turn_failed", "stop"
+                ],
                 "ssh": {
                     "shell": "bash >= 4.2.46",
                     "target": "explicit surface_id UUID; integrated idle local Bash",
@@ -11785,6 +11798,14 @@ impl WmctermApplication {
                     }
                     if let Some(session_id) = codex_session_end.as_deref() {
                         self.validate_codex_session(terminal, session_id)?;
+                    }
+                    if let Some(hook) = claude_hook.as_ref() {
+                        if hook.to_agent_event() != event {
+                            return Err("Claude hook does not match its projected Agent event".into());
+                        }
+                        if hook.kind != ClaudeHookKind::SessionStart {
+                            self.validate_claude_hook(terminal, hook)?;
+                        }
                     }
                     if !self.record_agent_event(terminal, &request.params, &event)? {
                         if let Some(session_id) = codex_session_end.as_deref() {
@@ -14399,6 +14420,11 @@ fn agent_session_event_kind(
                 state: wmcterm_core::AgentState::Idle,
             },
         )),
+        AgentEvent::TurnFailed { .. } => Some(AgentSessionEventKind::Telemetry(
+            AgentTelemetry::StateObserved {
+                state: wmcterm_core::AgentState::Error,
+            },
+        )),
         // Hook Stop means the current turn has returned to the interactive
         // prompt; it does not mean that the long-lived Agent process exited.
         // The PTY exit path owns the actual lifecycle transition.
@@ -14842,7 +14868,8 @@ fn apply_claude_subagent_status(
         | ClaudeHookKind::PostToolUseFailure
         | ClaudeHookKind::PermissionRequest
         | ClaudeHookKind::Notification
-        | ClaudeHookKind::Stop => {}
+        | ClaudeHookKind::Stop
+        | ClaudeHookKind::StopFailure => {}
     }
 }
 
@@ -16469,6 +16496,71 @@ mod tests {
     }
 
     #[test]
+    fn claude_failed_turn_preserves_lifecycle_and_pending_approvals() {
+        let hook = wmcterm_agent::normalize_claude_hook_event(
+            Some("StopFailure"),
+            &json!({"session_id": "live-session", "error": "authentication_failed"}),
+        )
+        .unwrap();
+        let mut session = AgentSession::new(SurfaceId::new_v4());
+        let make_event = |id: &str, kind| AgentSessionEvent {
+            event_id: id.into(),
+            lifecycle_generation: 1,
+            lifecycle_id: Some("live-lifecycle".into()),
+            sequence: None,
+            occurred_at_unix_ms: 100,
+            kind,
+        };
+        session
+            .apply_event(&make_event(
+                "start",
+                AgentSessionEventKind::Lifecycle(AgentLifecycleEvent::Started {
+                    launch: AgentLaunchInfo {
+                        agent_kind: AgentKindId::new("claude"),
+                        session_id: Some("live-session".into()),
+                        ..Default::default()
+                    },
+                }),
+            ))
+            .unwrap();
+        let failed =
+            agent_session_event_kind(&hook.to_agent_event(), "failure", AgentRunMode::Interactive)
+                .unwrap();
+        session
+            .apply_event(&make_event("failure", failed.clone()))
+            .unwrap();
+        assert_eq!(session.state, AgentState::Error);
+        assert_eq!(session.lifecycle.phase, AgentLifecyclePhase::Running);
+        assert_eq!(session.session_id.as_deref(), Some("live-session"));
+        session
+            .apply_event(&make_event(
+                "retry",
+                AgentSessionEventKind::Telemetry(AgentTelemetry::Activity {
+                    summary: Some("retry".into()),
+                }),
+            ))
+            .unwrap();
+        assert_eq!(session.state, AgentState::Running);
+        let approval = AgentActionRequest {
+            request_id: "pending".into(),
+            kind: AgentRequestKind::Permission,
+            message: "Approve command".into(),
+            choices: Vec::new(),
+        };
+        session
+            .apply_event(&make_event(
+                "approval",
+                AgentSessionEventKind::ActionRequired(approval.clone()),
+            ))
+            .unwrap();
+        session
+            .apply_event(&make_event("failure-with-approval", failed))
+            .unwrap();
+        assert_eq!(session.pending_requests, vec![approval]);
+        assert_eq!(session.state, AgentState::WaitingForPermission);
+    }
+
+    #[test]
     fn claude_subagent_status_is_scoped_by_session_and_surface() {
         let surface = SurfaceId::new_v4();
         let other_surface = SurfaceId::new_v4();
@@ -16520,6 +16612,14 @@ mod tests {
         )
         .unwrap();
         apply_claude_subagent_status(&mut statuses, other_surface, &goal_stop);
+        assert_eq!(statuses.len(), 2);
+
+        let failure = wmcterm_agent::normalize_claude_hook_event(
+            Some("StopFailure"),
+            &json!({"session_id": "one", "error": "rate_limit"}),
+        )
+        .unwrap();
+        apply_claude_subagent_status(&mut statuses, other_surface, &failure);
         assert_eq!(statuses.len(), 2);
 
         let session_end = wmcterm_agent::normalize_claude_hook_event(
@@ -18169,6 +18269,85 @@ mod tests {
         assert!(app.update_foreground_agent(terminal, &[]));
         assert!(!app.foreground_agents.contains_key(&terminal));
         assert!(app.state.surfaces[&surface].agent.is_none());
+
+        // Reuse the isolated application: winit permits only one event loop
+        // per process, including when checking another provider's RPC route.
+        app.agent_sessions.remove(&surface);
+        let claude_params = |event: AgentEvent| {
+            let mut params = serde_json::to_value(event).unwrap();
+            params["terminal"] = terminal.to_string().into();
+            params["surface"] = surface.to_string().into();
+            params["surface_id"] = surface.to_string().into();
+            params["lifecycle_id"] = lifecycle.clone().into();
+            params
+        };
+        let start = call(
+            &mut app,
+            claude_params(AgentEvent::SessionStart {
+                agent: "claude".into(),
+                session_id: Some("claude-current".into()),
+            }),
+        );
+        assert!(start.error.is_none(), "{:?}", start.error);
+        let failure = |session: &str| {
+            let hook = wmcterm_agent::normalize_claude_hook_event(
+                Some("StopFailure"),
+                &json!({"session_id": session, "error": "rate_limit"}),
+            )
+            .unwrap();
+            let mut params = claude_params(hook.to_agent_event());
+            params["claude_hook"] = serde_json::to_value(hook).unwrap();
+            params
+        };
+        let accepted = call(&mut app, failure("claude-current"));
+        assert!(accepted.error.is_none(), "{:?}", accepted.error);
+        assert_eq!(app.agent_sessions[&surface].state, AgentState::Error);
+        assert_eq!(
+            app.agent_sessions[&surface].lifecycle.phase,
+            AgentLifecyclePhase::Running
+        );
+        assert_eq!(
+            app.agent_sessions[&surface].session_id.as_deref(),
+            Some("claude-current")
+        );
+
+        let pending = call(
+            &mut app,
+            claude_params(AgentEvent::NeedsInput {
+                message: "Pending user input".into(),
+            }),
+        );
+        assert!(pending.error.is_none(), "{:?}", pending.error);
+        assert_eq!(app.agent_sessions[&surface].pending_requests.len(), 1);
+        let snapshot = |app: &WmctermApplication| {
+            json!({
+                "session": app.agent_sessions[&surface],
+                "surface": app.state.surfaces[&surface],
+                "notifications": app.state.notifications,
+            })
+        };
+        let before = snapshot(&app);
+        assert!(error(call(&mut app, failure("claude-stale"))).contains("session"));
+        assert_eq!(snapshot(&app), before, "stale hooks must not mutate state");
+        let mut mismatch = failure("claude-current");
+        mismatch["message"] = "different event payload".into();
+        assert!(error(call(&mut app, mismatch)).contains("projected"));
+        assert_eq!(
+            snapshot(&app),
+            before,
+            "mismatched hooks must not mutate state"
+        );
+        let accepted = call(&mut app, failure("claude-current"));
+        assert!(accepted.error.is_none(), "{:?}", accepted.error);
+        assert_eq!(app.agent_sessions[&surface].pending_requests.len(), 1);
+        assert_eq!(
+            app.agent_sessions[&surface].state,
+            AgentState::WaitingForInput
+        );
+        assert_eq!(
+            app.agent_sessions[&surface].lifecycle.phase,
+            AgentLifecyclePhase::Running
+        );
     }
 
     #[test]

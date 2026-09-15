@@ -484,6 +484,9 @@ pub enum AgentEvent {
         continuing: bool,
         message: Option<String>,
     },
+    TurnFailed {
+        message: Option<String>,
+    },
     Stop {
         success: bool,
         message: Option<String>,
@@ -650,6 +653,7 @@ pub enum ClaudeHookKind {
     PermissionRequest,
     Notification,
     Stop,
+    StopFailure,
 }
 
 /// Recommended UI coordination action. `OpenSubagentStatus` means a status
@@ -686,7 +690,8 @@ impl ClaudeHookEvent {
             | ClaudeHookKind::PostToolUseFailure
             | ClaudeHookKind::PermissionRequest
             | ClaudeHookKind::Notification
-            | ClaudeHookKind::Stop => ClaudePaneAction::UpdateAgentStatus,
+            | ClaudeHookKind::Stop
+            | ClaudeHookKind::StopFailure => ClaudePaneAction::UpdateAgentStatus,
         }
     }
 
@@ -705,6 +710,15 @@ impl ClaudeHookEvent {
             },
             ClaudeHookKind::Stop => AgentEvent::TurnComplete {
                 continuing: self.stop_hook_active,
+                message: self.message.clone().or_else(|| self.reason.clone()),
+            },
+            ClaudeHookKind::StopFailure if self.agent_id.is_some() => AgentEvent::ToolUse {
+                tool: format!(
+                    "subagent turn failed: {}",
+                    self.agent_id.as_deref().unwrap()
+                ),
+            },
+            ClaudeHookKind::StopFailure => AgentEvent::TurnFailed {
                 message: self.message.clone().or_else(|| self.reason.clone()),
             },
             ClaudeHookKind::PermissionRequest => AgentEvent::PermissionRequest {
@@ -794,6 +808,7 @@ pub fn normalize_claude_hook_event(
         "permissionrequest" => ClaudeHookKind::PermissionRequest,
         "notification" => ClaudeHookKind::Notification,
         "stop" => ClaudeHookKind::Stop,
+        "stopfailure" => ClaudeHookKind::StopFailure,
         _ => {
             return Err(NormalizeHookError::UnsupportedEvent {
                 agent: AgentKind::Claude,
@@ -825,8 +840,16 @@ pub fn normalize_claude_hook_event(
         tool_name: direct_string(payload, "tool_name"),
         tool_use_id: direct_string(payload, "tool_use_id"),
         notification_type: direct_string(payload, "notification_type"),
-        message: find_string(payload, &["message", "last_assistant_message", "error"])
-            .and_then(optional_nonempty),
+        message: find_string(
+            payload,
+            &[
+                "error_details",
+                "message",
+                "last_assistant_message",
+                "error",
+            ],
+        )
+        .and_then(optional_nonempty),
         reason: direct_string(payload, "reason"),
         stop_hook_active: payload
             .get("stop_hook_active")
@@ -1006,6 +1029,13 @@ pub fn normalize_hook_event(
         })
         .ok_or(NormalizeHookError::MissingEventName)?;
     let event = canonical(&raw_event);
+
+    // This native failure hook must retain its session identity, including
+    // when a legacy adapter calls the generic normalizer.
+    if matches!(agent, AgentKind::Claude) && event == "stopfailure" {
+        return normalize_claude_hook_event(Some(&raw_event), payload)
+            .map(|event| event.to_agent_event());
+    }
 
     // Prefer Claude's strict native shape when routing identity is available.
     // The permissive rules below remain for older hook adapters that did not
@@ -1384,6 +1414,7 @@ pub fn hook_install_plan(agent: AgentKind, wmcterm_binary: impl Into<String>) ->
                     "SubagentStart",
                     "SubagentStop",
                     "Stop",
+                    "StopFailure",
                     "SessionEnd",
                 ],
                 &command,
@@ -1609,7 +1640,8 @@ pub fn reduce(event: &AgentEvent) -> AgentTransition {
             attention: AttentionState::Activity,
             notification: message.clone().or_else(|| Some("Task completed".into())),
         },
-        AgentEvent::Stop {
+        AgentEvent::TurnFailed { message }
+        | AgentEvent::Stop {
             success: false,
             message,
         } => AgentTransition {
@@ -2066,6 +2098,56 @@ mod tests {
             AgentEvent::Stop { success: true, message: Some(message) }
                 if message == "prompt_input_exit"
         ));
+    }
+
+    #[test]
+    fn claude_stop_failure_marks_only_the_turn_failed() {
+        let payload = serde_json::json!({
+            "session_id": "live-session",
+            "hook_event_name": "StopFailure",
+            "error": "rate_limit",
+            "error_details": "Rate limit reached",
+            "last_assistant_message": "Previous output",
+            "stop_hook_active": true
+        });
+        let hook = normalize_claude_hook_event(None, &payload).unwrap();
+        assert_eq!(hook.kind, ClaudeHookKind::StopFailure);
+        assert_eq!(hook.pane_action(), ClaudePaneAction::UpdateAgentStatus);
+        let event = hook.to_agent_event();
+        assert_eq!(
+            event,
+            AgentEvent::TurnFailed {
+                message: Some("Rate limit reached".into()),
+            }
+        );
+        assert_eq!(
+            normalize_hook_event(AgentKind::Claude, None, &payload).unwrap(),
+            event
+        );
+        let transition = reduce(&event);
+        assert_eq!(transition.state, AgentState::Error);
+        assert_eq!(transition.attention, AttentionState::Error);
+        assert_eq!(
+            transition.notification.as_deref(),
+            Some("Rate limit reached")
+        );
+
+        let mut child = payload.clone();
+        child["agent_id"] = serde_json::json!("worker");
+        let child = normalize_claude_hook_event(None, &child).unwrap();
+        assert_eq!(reduce(&child.to_agent_event()).state, AgentState::Running);
+        assert_eq!(child.route_key(), "claude:live-session:worker");
+
+        assert!(
+            normalize_hook_event(
+                AgentKind::Claude,
+                Some("StopFailure"),
+                &serde_json::json!({
+                    "payload": { "session_id": "spoofed" }, "error": "authentication_failed"
+                })
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -2588,6 +2670,7 @@ mod tests {
             "SubagentStart",
             "SubagentStop",
             "Stop",
+            "StopFailure",
             "SessionEnd",
         ] {
             assert!(claude_json["hooks"][event].is_array(), "missing {event}");

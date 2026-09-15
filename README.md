@@ -224,6 +224,10 @@ Hook 接收器会继承由 wmcterm 启动的终端所含的 wmcterm 上下文变
 新安装或发生变化的命令 Hook 必须先通过 `/hooks` 审核才能运行。
 Codex 0.150.0 的 `Interrupt` Hook 会在用户中断当前 turn 时立即清除运行中
 状态，但不会把仍在等待下一次输入的 Codex 进程标记为已退出。
+Claude Code 的 `StopFailure` Hook 会将 API 错误、限流或认证失败导致结束的回合
+标记为错误，并保留会话及后台子 Agent；下一次活动可继续更新状态。旧 session 的
+延迟 Hook 不会覆盖当前会话。已有安装需要显式重新执行
+`wmcterm hook install --agent claude --scope user` 才会注册此事件。
 Codex 0.151.0 的 `SubagentStart`/`SubagentStop` Hook 会按 Surface、session 和
 agent ID 跟踪后台子 Agent；只要任一子 Agent 仍活动，Workspace 就保持运行中，
 父 turn 完成不会提前显示为已完成。Stop 会留下每个 session 最近 256 个有界墓碑，
@@ -261,15 +265,23 @@ transcript 加载到监视器。它识别所有携带线程 ID 的 `thread/*` �
 自动审查能力：Codex 使用 `--approve-for-me`（该参数自身启用 `workspace-write`
 沙箱），Claude 使用 `--permission-mode auto`；它不是“自动同意所有请求”，也不会
 关闭沙箱。
+Claude Code 2.1.268 起，`-p`/`--print` 也会触发 `PermissionRequest` Hook。
+在 wmcterm 内运行的此类调用会使用相同的集中式审批，可能等待用户处理；自动审查
+不等于永不等待。接受审批结果的 9 分钟时限包含注册及轮询，超时或取消后到达的
+允许结果不会执行；正在执行的 IPC 和取消清理可能使 Hook 稍晚返回。在 wmcterm
+外运行时，Hook 不接管 Claude 的原生权限流程。
 从 GUI 首次为含 `.codex` 目录的工作区启动无人值守 Codex 时，wmcterm 会在启动前
 检查 Codex 用户配置中的精确项目路径。未信任的项目必须由用户选择“信任并启动”或
 “不信任并继续”；前者安全合并 `~/.codex/config.toml`，后者保持项目级 config、
 Hooks 和 exec policies 禁用。该人工信任入口不会暴露给 CLI、RPC 或 Agent。
 Codex 原生 `codex resume` 默认按当前 cwd 过滤（`--all` 才显示全部）。wmcterm 会把
-Workspace cwd 显式传给私有 app-server 的远程 TUI。Codex 0.149.1 会话内部的
+Workspace cwd 显式传给私有 app-server 的远程 TUI。Codex 0.149.1 至 0.154.0 会话内部的
 `/resume` 会新建一个未继承 remote cwd 的 picker 连接，因此仍可能固定显示
 `Filter: All`；这个 provider 缺陷无法由外部启动参数修复。调用者显式传入
 `-C`/`--cd` 时以该目录为准。
+已对照 Codex 0.154.0 协议核验恢复订阅：watcher 不覆盖线程保存的 cwd、权限或
+worktree 配置。子 Agent 窗格使用其线程的 cwd，保持 `focus: false`；只读线程
+仍交由原生 TUI 展示。提问由 Codex TUI 处理，不映射为允许/拒绝审批。
 对于这些托管 app-server 会话，通用 Codex `PermissionRequest` Hook 被视为重复遥测，
 不会创建第二个可操作请求。手动启动的非托管 Codex 没有审批回复通道，因此其
 `PermissionRequest` Hook 只更新等待状态并发送普通通知；用户仍需回到 Codex TUI

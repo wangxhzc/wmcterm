@@ -2002,7 +2002,7 @@ Plugin Marketplace
   该入口不属于 CLI/RPC/Agent 能力，防止无人值守进程自行提升项目 Hook 权限。
 - 原生 `codex resume` 默认按 cwd 过滤、`--all` 才展示全局会话。私有 app-server 的
   远程 TUI 无法自行推断服务端目录，因此 wmcterm 会把 Workspace cwd 作为稳定的
-  `--cd` 参数传给根 TUI。Codex 0.149.1 会话内的 `/resume` 会新建一个没有
+  `--cd` 参数传给根 TUI。Codex 0.149.1 至 0.154.0 会话内的 `/resume` 会新建一个没有
   继承 remote cwd override 的 picker 连接，因此仍可能锁定在全部会话；该
   provider 内部行为无法由 wmcterm 的外部启动参数修复。调用者显式传入
   `-C`/`--cd` 时优先使用该目录；过滤不改变线程归属或审批路由。
@@ -2024,6 +2024,10 @@ Plugin Marketplace
   `thread/resume { excludeTurns: true }` 恢复新建或由 `/resume` 选中的 thread；
   WebSocket 重连后重新建立这些订阅。`thread/read` 只能观察通知，不能让 watcher
   接收发往 thread 客户端的 app-server 审批请求，因此不能用于审批桥。
+- 已对照 Codex 0.154.0 的 `resume_running_thread` 和 thread lifecycle 实现核验
+  多客户端订阅仍受支持。订阅只传 `threadId`、`excludeTurns`，不覆盖已保存的
+  cwd、权限或 worktree 配置。回归测试覆盖只读子线程的 cwd、显式目标及
+  `focus: false`，以及交错提问不被审批桥当作权限请求回答；原生 TUI 负责提问。
 - watcher 从所有携带 thread ID 的 `thread/*` 通知发现新目标，而不是只依赖
   `thread/started`；同时周期性回查 `thread/loaded/list` 并同步确认每次
   `thread/resume` 成功，以恢复丢失或版本差异导致的 resume 通知。
@@ -2042,6 +2046,15 @@ Plugin Marketplace
 - Codex 0.150.0 `Interrupt` Hook 归一化为当前 turn 完成且不继续，使
   Workspace 从运行中恢复 Idle；该事件不是 SessionEnd，不得结束仍存活的
   Codex surface 或 PTY lifecycle。
+- Claude `StopFailure`（2.1.78 起）归一化为独立的 `TurnFailed`，显示错误和
+  attention，但保留会话 lifecycle 与后台子 Agent。结构化 Claude Hook 在写入
+  任何状态之前检查 session 归属和事件投影，防止旧 session 的迟到失败污染
+  当前会话。Hook 安装计划包含该事件，用户显式更新安装后生效。
+- Claude 2.1.268 修复 `-p`/`--print` 不触发 `PermissionRequest` 的问题；
+  本集成对交互和 headless 请求使用同一审批协议，不根据缺失的模式标记推断
+  自动授权。审批从注册开始共用 9 分钟预算，并在 RPC 返回后再次检查超时与
+  取消，拒绝过期允许结果。该预算限制接受审批的时间；进行中的 IPC 和取消清理
+  可能使 Hook 稍晚返回。用户级 Hook 在 wmcterm 外仍交回 provider 原生流程。
 - Codex 0.151.0 `SubagentStart`/`SubagentStop` 使用官方顶层
   `session_id`、`turn_id`、`agent_id`、`agent_type` 字段，并以
   `(Surface, session_id, agent_id)` 幂等跟踪。子 Agent Hook 只表示运行活动，

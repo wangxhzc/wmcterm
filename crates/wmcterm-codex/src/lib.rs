@@ -939,6 +939,8 @@ impl CodexWatcher {
         }
         let resume_id = next_rpc_id();
         let result = (|| {
+            // Attach without overriding the live thread's cwd, workspace roots,
+            // or permission profile, including parent-owned worktree children.
             send_json(
                 socket,
                 &json!({
@@ -1912,6 +1914,27 @@ mod tests {
             assert_eq!(read_server_json(&mut socket)["method"], "initialized");
             let loaded = read_server_json(&mut socket);
             assert_eq!(loaded["method"], "thread/loaded/list");
+            // Questions belong to the TUI. Answering one here would race the
+            // other subscribed client and could discard the user's response.
+            socket
+                .send(Message::Text(
+                    json!({
+                        "id": "async-question",
+                        "method": "item/tool/requestUserInput",
+                        "params": {
+                            "threadId": "existing-thread",
+                            "turnId": "turn-a",
+                            "itemId": "question-a",
+                            "questions": [{
+                                "id": "destination", "header": "Target",
+                                "question": "Which target?", "options": null
+                            }]
+                        }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .unwrap();
             socket
                 .send(Message::Text(
                     json!({
@@ -1925,8 +1948,10 @@ mod tests {
 
             let resume = read_server_json(&mut socket);
             assert_eq!(resume["method"], "thread/resume");
-            assert_eq!(resume["params"]["threadId"], "existing-thread");
-            assert_eq!(resume["params"]["excludeTurns"], true);
+            assert_eq!(
+                resume["params"],
+                json!({"threadId": "existing-thread", "excludeTurns": true})
+            );
             socket
                 .send(Message::Text(
                     json!({
@@ -2263,6 +2288,42 @@ mod tests {
         assert_eq!(watcher.depths.get("two"), Some(&1));
         assert_eq!(watcher.open_attempts.get("one"), Some(&1));
         assert_eq!(watcher.open_attempts.get("two"), Some(&1));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn worktree_child_uses_its_own_directory_without_resume_overrides() {
+        let control_path = std::env::temp_dir().join(format!(
+            "wmcterm-codex-worktree-{}-{}.sock",
+            std::process::id(),
+            next_rpc_id()
+        ));
+        let _control_server = wmcterm_ipc::UnixServer::spawn(&control_path, move |request| {
+            assert_eq!(request.method, "pane.split");
+            assert_eq!(request.params["workspace"], "workspace");
+            assert_eq!(request.params["surface"], "surface");
+            assert_eq!(request.params["focus"], false);
+            assert_eq!(request.params["cwd"], "/tmp/project-worktrees/child");
+            assert_eq!(
+                request.params["command"],
+                "codex resume --remote ws://127.0.0.1:1 worktree-child"
+            );
+            wmcterm_ipc::Response::success(request.id, json!({"surface_id": "child-surface"}))
+        })
+        .unwrap();
+        let mut config = test_config("ws://127.0.0.1:1".into());
+        config.control_socket = control_path;
+        let mut watcher = CodexWatcher::new(config);
+        watcher.observe(&json!({"id": "root"})).unwrap();
+        watcher
+            .observe(&json!({
+                "id": "worktree-child",
+                "cwd": "/tmp/project-worktrees/child",
+                "canAcceptDirectInput": false,
+                "source": {"subAgent": {"thread_spawn": {"parent_thread_id": "root"}}}
+            }))
+            .unwrap();
+        assert!(watcher.opened.contains("worktree-child"));
     }
 
     #[test]

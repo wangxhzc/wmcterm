@@ -130,6 +130,13 @@ from the currently focused UI item: the user may be viewing another workspace.
 ## Launch Claude safely
 
 - Launch a managed Claude Code process with `wmcterm agent claude`.
+- Claude `StopFailure` reports a failed turn while its session and background
+  subagents remain alive. Do not close the terminal in response to this hook.
+- Claude Code 2.1.268+ also fires `PermissionRequest` in `-p`/`--print` mode.
+  Inside wmcterm these requests use the same approval bridge and may wait for
+  a human. Registration and polling share a nine-minute approval deadline;
+  late or cancelled approvals are denied. In-flight IPC and cancellation
+  cleanup can finish later. Auto mode does not guarantee no prompts.
 - Only when the user explicitly requests unattended execution, use
   `wmcterm agent --mode unattended claude`; this selects Claude's native `auto`
   permission mode. Never pass `bypassPermissions` or dangerous-skip flags.
