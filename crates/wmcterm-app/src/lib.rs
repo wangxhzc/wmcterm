@@ -11194,6 +11194,9 @@ impl WmctermApplication {
                     "output": "merged PTY bytes, UTF-8 lossy, ANSI preserved",
                     "persistent": false,
                     "focus": false,
+                    "cli_new": "ssh HOST --new --pane UUID; creates without focus and waits for local and remote readiness",
+                    "cli_command_sources": ["--command", "--command-file", "--command-stdin"],
+                    "exec_expected_host": "optional exact host match, checked atomically with connection_id and ready state",
                     "authentication": "interactive OpenSSH; connecting includes authentication waits"
                 },
                 "methods": [

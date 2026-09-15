@@ -110,19 +110,41 @@ cargo run
 Bash 4.2.46+，本地系统 OpenSSH，以及远端 `mktemp`、`od`、`tr` 等基础工具。
 普通新建终端的默认 Shell 为 Bash 时自动启用会话集成；已运行的旧终端、显式启动
 命令和其他 Shell 不会被自动接管。Agent 自己正在运行的终端不是空闲 Shell，应先
-使用 `pane split --right --no-focus` 或 `surface new --no-focus` 创建操作终端。
+使用下面的一步连接入口创建后台操作终端，或手动创建专用终端。
 
 ```bash
+wmcterm ssh dev-server --new --pane CALLER_PANE_UUID
 wmcterm ssh dev-server --surface SURFACE_UUID --wait
-wmcterm ssh exec --surface SURFACE_UUID --connection CONNECTION_ID --command 'cd /srv/app; git status --short' --wait
+wmcterm ssh exec --surface SURFACE_UUID --connection CONNECTION_ID --host dev-server --command-file /absolute/check.sh --wait
 wmcterm ssh status --surface SURFACE_UUID
 wmcterm ssh cancel --surface SURFACE_UUID --connection CONNECTION_ID --command-id COMMAND_ID --wait
 ```
 
-新建终端后先轮询 `ssh status`，等待 `local_ready=true`（例如每 500 毫秒一次，
-最多 10 秒）；超时则检查屏幕并报告问题。连接命令的 `--wait` 不等待本地 Shell
-初始化。保存连接返回的 `connection_id`，确认 `state=ready` 后才能执行命令。
+`--new --pane UUID` 在指定 Pane 创建不切换焦点的终端，自动等待本地初始化和远端
+连接，返回 `surface_id`、`pane_id`、`workspace_id`、`host` 和 `connection_id`。
+默认总等待 30 秒，可用 `--timeout-ms N` 调整，最大 300000 毫秒。已有专用终端的
+连接命令加 `--wait` 也会等待本地 Shell 初始化，无需 Agent 单独轮询。
+本地初始化超时返回 `wait_timed_out=true`、`wait_phase=local_ready`、`requested_host`
+和已创建的 Surface ID；检查屏幕后用该 ID 继续连接，不要再次 `--new`。
+连接已提交后的超时保留连接 ID，不取消连接，应查询同一连接的状态。
+保存返回的连接信息，确认 `state=ready` 后才能执行命令。
 后续执行和取消始终传入保存的连接 ID，连接变化时停止，避免误操作另一台服务器。
+执行时同时传入保存的 `--host HOST` 和 `--connection ID`，终端 actor 会原子校验
+主机、连接 ID 和就绪状态，因此复用前无需额外查询状态。主机按原始别名精确匹配。
+
+`ssh exec` 必须选择且只能选择一种输入：`--command TEXT`、`--command-file PATH`
+或 `--command-stdin`。文件和标准输入按 UTF-8 原样读取，最大 16384 字节且不能含
+NUL；内容是远端 Bash 脚本。复杂引号和多行检查优先使用文件或标准输入，避免手工
+嵌套本地 Shell 引号。可在同一脚本合并独立只读检查，但同一连接的命令须串行执行。
+
+```bash
+wmcterm ssh exec --surface SURFACE_UUID --connection CONNECTION_ID --host dev-server --command-stdin --wait <<'REMOTE_SCRIPT'
+printf '%s\n' '--- directory ---'
+pwd
+printf '%s\n' '--- git status ---'
+git status --short
+REMOTE_SCRIPT
+```
 
 内置 Skill 指引 wmcterm 内的 Agent 默认使用托管 SSH 处理远端 Shell 任务，自动
 创建不切换焦点的终端，或复用当前任务已记录且主机和连接 ID 均匹配的专用连接。
@@ -131,7 +153,7 @@ wmcterm ssh cancel --surface SURFACE_UUID --connection CONNECTION_ID --command-i
 端口、密钥、跳板机使用 `~/.ssh/config` 中的主机别名配置。连接不会切换焦点。
 密码、主机指纹确认和 MFA 仍由 OpenSSH 在该终端交互；`connecting` 包含等待认证
 和等待远端集成就绪，不能单凭此状态区分两者。需要时读取该 Surface 的屏幕并由用户
-完成认证。没有 `--surface` 的旧 `wmcterm ssh TARGET [SSH_ARG...]` 仍创建普通 SSH
+完成认证。不带 `--surface` 或 `--new` 的旧 `wmcterm ssh TARGET [SSH_ARG...]` 仍创建普通 SSH
 工作区，`--tmux` 也保留旧行为，不提供上述结构化命令接口。
 
 远端只在 `~/.wmcterm/tmp/` 创建权限为 `0600` 的独立临时脚本；两个目录为 `0700`。

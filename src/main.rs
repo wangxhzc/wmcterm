@@ -164,8 +164,9 @@ fn print_help() {
          \x20   Managed Codex/Claude bypass options are rejected\n\
          \x20 wmcterm ssh TARGET [SSH_ARG...]\n\
          \x20 wmcterm ssh HOST --surface UUID [--wait] [--timeout-ms N]\n\
+         \x20 wmcterm ssh HOST --new --pane UUID [--timeout-ms N]\n\
          \x20 wmcterm ssh status --surface UUID\n\
-         \x20 wmcterm ssh exec --surface UUID --command TEXT [--connection ID] [--wait] [--timeout-ms N] [--max-output-bytes N]\n\
+         \x20 wmcterm ssh exec --surface UUID (--command TEXT|--command-file PATH|--command-stdin) [--connection ID] [--host HOST] [--wait] [--timeout-ms N] [--max-output-bytes N]\n\
          \x20 wmcterm ssh cancel --surface UUID --command-id ID [--connection ID] [--wait]\n\
          \x20 wmcterm docker CONTAINER [COMMAND...]\n\
          \x20 wmcterm kube POD [COMMAND...]\n\
@@ -433,14 +434,20 @@ fn run_rpc() -> Result<()> {
 
 fn rpc(method: &str, params: Value) -> Result<wmcterm_ipc::Response> {
     let path = control_socket_path()?;
-    Ok(call(
+    call(
         &path,
         &Request {
             id: "cli".into(),
             method: method.into(),
             params,
         },
-    )?)
+    )
+    .with_context(|| {
+        format!(
+            "control socket {}: check the running wmcterm instance, socket permissions and sandbox access",
+            path.display()
+        )
+    })
 }
 
 fn control_socket_path() -> Result<PathBuf> {
@@ -768,7 +775,7 @@ fn run_cli(scope: String) -> Result<()> {
                 .context("usage: wmcterm ssh TARGET [SSH_ARG...]")?;
             let rest: Vec<_> = args.collect();
             if matches!(target.as_str(), "exec" | "status" | "cancel")
-                || rest.iter().any(|arg| arg == "--surface")
+                || rest.iter().any(|arg| arg == "--surface" || arg == "--new")
             {
                 return run_managed_ssh(&target, rest);
             }
@@ -2185,6 +2192,9 @@ fn run_managed_ssh(target: &str, args: Vec<String>) -> Result<()> {
     }
     let mut wait = false;
     let mut timeout = 30000_u64;
+    let mut new = false;
+    let mut pane = None;
+    let mut command_source = None;
     let mut args = args.into_iter();
     while let Some(flag) = args.next() {
         match flag.as_str() {
@@ -2198,8 +2208,25 @@ fn run_managed_ssh(target: &str, args: Vec<String>) -> Result<()> {
                 params["command_id"] = args.next().context("--command-id requires ID")?.into()
             }
             "--command" => {
-                params["command"] = args.next().context("--command requires text")?.into()
+                set_ssh_command_source(
+                    &mut command_source,
+                    "text",
+                    args.next().context("--command requires text")?,
+                )?;
             }
+            "--command-file" => set_ssh_command_source(
+                &mut command_source,
+                "file",
+                args.next().context("--command-file requires path")?,
+            )?,
+            "--command-stdin" => {
+                set_ssh_command_source(&mut command_source, "stdin", String::new())?
+            }
+            "--host" => {
+                params["expected_host"] = args.next().context("--host requires host")?.into()
+            }
+            "--new" => new = true,
+            "--pane" => pane = Some(args.next().context("--pane requires UUID")?),
             "--max-output-bytes" => {
                 params["max_output_bytes"] = args
                     .next()
@@ -2213,11 +2240,87 @@ fn run_managed_ssh(target: &str, args: Vec<String>) -> Result<()> {
             _ => bail!("unknown managed SSH option: {flag}"),
         }
     }
-    if params["surface_id"].as_str().is_none() {
+    if new {
+        if method != "ssh.connect" || pane.is_none() || !params["surface_id"].is_null() {
+            bail!("--new requires a host and --pane UUID, and cannot be combined with --surface");
+        }
+        if target.is_empty()
+            || target.starts_with('-')
+            || target.len() > 1024
+            || target.chars().any(|c| c.is_control() || c.is_whitespace())
+        {
+            bail!("invalid SSH host; use an SSH config alias or user@host");
+        }
+    } else if pane.is_some() {
+        bail!("--pane requires --new");
+    } else if params["surface_id"].as_str().is_none() {
         bail!("managed SSH requires --surface UUID");
     }
     if timeout > 300000 {
         bail!("--timeout-ms must be at most 300000");
+    }
+    if method != "ssh.exec" && (command_source.is_some() || !params["expected_host"].is_null()) {
+        bail!("command sources and --host require ssh exec");
+    }
+    if !params["expected_host"].is_null() && params["connection_id"].as_str().is_none() {
+        bail!("--host requires the saved --connection ID");
+    }
+    if method == "ssh.exec" {
+        let (kind, value) = command_source
+            .context("ssh exec requires --command, --command-file or --command-stdin")?;
+        let command = match kind {
+            "file" => read_ssh_command(
+                fs::File::open(&value)
+                    .with_context(|| format!("reading SSH command file {value}"))?,
+            )?,
+            "stdin" => read_ssh_command(std::io::stdin().lock())?,
+            _ => read_ssh_command(value.as_bytes())?,
+        };
+        params["command"] = command.into();
+    }
+    let deadline = std::time::Instant::now() + Duration::from_millis(timeout);
+    let mut created = Value::Null;
+    if new {
+        let response = rpc(
+            "surface.new",
+            serde_json::json!({"pane": pane, "focus": false}),
+        )?;
+        if response.error.is_some() {
+            return print_response(response);
+        }
+        created = response.result.context("missing created SSH surface")?;
+        params["surface_id"] = created["surface_id"].clone();
+        wait = true;
+    }
+    let recovery = || {
+        format!(
+            "SSH target surface_id={}, host={}; retain this target and query ssh status before retrying",
+            params["surface_id"], params["host"]
+        )
+    };
+    if method == "ssh.connect" && wait {
+        loop {
+            let mut response = rpc("ssh.status", params.clone()).with_context(recovery)?;
+            if response.error.is_some() {
+                print_response(response).with_context(recovery)?;
+                unreachable!();
+            }
+            let status = response.result.as_mut().context("missing SSH status")?;
+            if status["local_ready"] == true {
+                break;
+            }
+            if status["connection_id"].as_str().is_some() && status["state"] != "disconnected" {
+                bail!("{}; existing connection must not be replaced", recovery());
+            }
+            if std::time::Instant::now() >= deadline {
+                status["wait_timed_out"] = true.into();
+                status["wait_phase"] = "local_ready".into();
+                status["requested_host"] = target.into();
+                attach_ssh_target(&mut response, &params, &created);
+                return print_response(response);
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
     }
     if matches!(method, "ssh.exec" | "ssh.cancel") && params["connection_id"].is_null() {
         let status = rpc("ssh.status", params.clone())?;
@@ -2227,8 +2330,12 @@ fn run_managed_ssh(target: &str, args: Vec<String>) -> Result<()> {
         params["connection_id"] =
             status.result.as_ref().context("missing SSH status")?["connection_id"].clone();
     }
-    let mut response = rpc(method, params.clone())?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout);
+    let mut response = rpc(method, params.clone()).with_context(|| {
+        format!(
+            "SSH surface_id={}; query status before retrying",
+            params["surface_id"]
+        )
+    })?;
     let initial = response.result.clone().unwrap_or(Value::Null);
     while wait && method != "ssh.status" && response.error.is_none() {
         let result = response.result.as_ref().context("missing SSH result")?;
@@ -2256,9 +2363,47 @@ fn run_managed_ssh(target: &str, args: Vec<String>) -> Result<()> {
             break;
         }
         std::thread::sleep(std::time::Duration::from_millis(100));
-        response = rpc("ssh.status", params.clone())?;
+        response = rpc("ssh.status", params.clone()).with_context(|| format!("SSH surface_id={}, connection_id={}, command_id={}; outcome unknown, query status before retrying", params["surface_id"], initial["connection_id"], initial["command"]["command_id"]))?;
     }
-    print_response(response)
+    attach_ssh_target(&mut response, &params, &created);
+    print_response(response).with_context(|| {
+        format!(
+            "SSH surface_id={}; query status before retrying",
+            params["surface_id"]
+        )
+    })
+}
+
+fn attach_ssh_target(response: &mut wmcterm_ipc::Response, params: &Value, created: &Value) {
+    if let Some(result) = response.result.as_mut() {
+        result["surface_id"] = params["surface_id"].clone();
+        if let Some(fields) = created.as_object() {
+            for (key, value) in fields {
+                result[key] = value.clone();
+            }
+        }
+    }
+}
+
+fn set_ssh_command_source(
+    source: &mut Option<(&'static str, String)>,
+    kind: &'static str,
+    value: String,
+) -> Result<()> {
+    if source.is_some() {
+        bail!("specify exactly one of --command, --command-file or --command-stdin");
+    }
+    *source = Some((kind, value));
+    Ok(())
+}
+
+fn read_ssh_command(reader: impl Read) -> Result<String> {
+    let mut bytes = Vec::new();
+    reader.take(16385).read_to_end(&mut bytes)?;
+    if bytes.len() > 16384 || bytes.contains(&0) {
+        bail!("command exceeds 16384 bytes or contains NUL");
+    }
+    String::from_utf8(bytes).context("SSH command must be UTF-8")
 }
 
 fn shell_arg(value: &str) -> String {
@@ -2335,6 +2480,19 @@ fn default_dump_command() -> CommandSpec {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ssh_script_input_preserves_bytes_and_rejects_invalid_payloads() {
+        let script = "printf '%s\\n' \"a'b\" \"$PWD\"\n# \u{4e2d}\u{6587}\n";
+        assert_eq!(super::read_ssh_command(script.as_bytes()).unwrap(), script);
+        assert!(super::read_ssh_command(&b"a\0b"[..]).is_err());
+        assert!(super::read_ssh_command(&b"\xff"[..]).is_err());
+        assert!(super::read_ssh_command(vec![b'x'; 16384].as_slice()).is_ok());
+        assert!(super::read_ssh_command(vec![b'x'; 16385].as_slice()).is_err());
+        let mut source = None;
+        super::set_ssh_command_source(&mut source, "text", "true".into()).unwrap();
+        assert!(super::set_ssh_command_source(&mut source, "stdin", String::new()).is_err());
+    }
+
     use super::*;
     use wmcterm_agent::AgentKind;
 

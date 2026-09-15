@@ -2417,8 +2417,18 @@ actor 首先检查本地/远端就绪状态，只发送 Readline 探测键；绑
 cancel 还要匹配 command_id。CLI 可先查询再绑定连接，但 Agent Skill 要求保存连接 ID，
 后续 exec/cancel 显式携带，发现连接变化时停止。Skill 默认将 wmcterm 内的远端 Shell
 任务路由到不切换焦点的专用终端，仅复用当前任务记录且主机、连接 ID 均匹配的连接。
-新建终端先限时轮询 local_ready，再 connect；连接达到 ready 后才执行命令。
+CLI `ssh HOST --new --pane UUID` 组合已有 surface.new(focus=false)、ssh.status 和
+ssh.connect，在一次 Agent 工具调用内完成创建和本地/远端等待。总等待默认 30 秒，
+最大 300 秒；CLI 负责限时轮询，不阻塞 UI 线程。`--surface UUID --wait` 同样等待
+local_ready。返回值包含 Surface ID；本地等待超时附带 wait_phase=local_ready 和
+requested_host，连接提交后保留 connection_id。超时不会自动创建替代终端或重连。
+exec 的 expected_host 可选参数在 actor 内与 connection_id、ready 原子校验；CLI
+`--host` 要求显式连接 ID，Skill 使用这两个参数复用已记录连接，省去单独状态查询。
+CLI 支持互斥的 --command、--command-file 和 --command-stdin；后两者有界读取
+UTF-8 脚本并拒绝 NUL/超过 16384 字节的输入，沿用同一 ssh.exec RPC 和远端转义。
+协议仍串行保留最近一次命令；100 毫秒轮询保持不变，事件等待留待单独设计。
+本地 IPC 错误附带套接字路径与权限/沙箱诊断提示，不自动扩大 Agent 权限。
 Hook 不拦截普通 ssh。SSH 正在认证与尚未收到远端握手
 均显示 connecting，由终端完成密码、MFA 和主机验证交互。应用重启后不恢复此类连接。
-旧无 --surface SSH/tmux 工作区入口保留原行为。验收脚本 `scripts/ssh-smoke.py` 在
+旧无 --surface/--new 的 SSH/tmux 工作区入口保留原行为。验收脚本 `scripts/ssh-smoke.py` 在
 Xvfb、临时用户目录、独立 IPC 和回环 sshd 下运行，不操作调用者的窗口或终端。

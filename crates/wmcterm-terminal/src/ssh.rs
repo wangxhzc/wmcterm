@@ -226,6 +226,11 @@ impl SshState {
                 {
                     return Err("stale_connection: connection_id must match ssh.status".into());
                 }
+                if let Some(host) = params.get("expected_host")
+                    && (host.as_str().is_none() || host.as_str() != self.host.as_deref())
+                {
+                    return Err("stale_host: expected_host must match the saved SSH host".into());
+                }
                 if self.state != "ready" {
                     return Err("terminal_busy: remote Bash is not ready".into());
                 }
@@ -506,6 +511,11 @@ mod tests {
         event(&mut state, "stale", "ready", "", 0);
         assert_eq!(state.state, "connecting");
         event(&mut state, &token, "ready", "", 0);
+        for host in [json!("other-host"), json!(null), json!(42)] {
+            assert!(state.request("ssh.exec", &json!({"connection_id":token, "expected_host":host, "command":"touch /bad"})).is_err());
+            assert_eq!(state.state, "ready");
+            assert!(state.execution.is_none());
+        }
         assert!(
             state
                 .request(
@@ -517,7 +527,7 @@ mod tests {
         state
             .request(
                 "ssh.exec",
-                &json!({"connection_id":token, "command":"false", "max_output_bytes":4}),
+                &json!({"connection_id":token, "expected_host":"host", "command":"false", "max_output_bytes":4}),
             )
             .unwrap();
         let id = state.execution.as_ref().unwrap().id.clone();

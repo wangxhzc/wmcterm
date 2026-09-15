@@ -39,32 +39,48 @@ from the currently focused UI item: the user may be viewing another workspace.
   terminals with `--no-focus`; the user need not request this separately.
   Ordinary system `ssh` is not intercepted or converted by Hooks.
 - Reuse only a dedicated surface recorded for this task, with its saved host and
-  connection ID. Query its status and require the host and connection ID to match
-  and `state` to be `ready` before execution. On mismatch, stop and report the
+  connection ID. Execute with both saved `--connection ID` and `--host HOST`:
+  the terminal actor atomically checks the host, connection and ready state,
+  so a separate status query is unnecessary. On mismatch, stop and report the
   changed connection; never adopt the replacement ID automatically. If no recorded
   connection exists, create a dedicated terminal rather than taking over another
   task's session.
 - Use a dedicated idle terminal, not the surface currently running the Agent.
-  Create it with `pane split --right --no-focus` or `surface new --no-focus`
-  using explicit caller IDs. The default local shell must be Bash 4.2.46+;
+  Prefer `wmcterm ssh HOST_ALIAS --new --pane CALLER_PANE_UUID` to create a
+  background tab and wait for local and remote readiness in one tool call.
+  This always preserves focus and defaults to a total 30-second wait; use
+  `--timeout-ms N` (maximum 300000) to adjust it. The default local shell must be Bash 4.2.46+;
   explicitly launched commands and older terminals may not have integration.
-- Retain the new surface UUID from the creation response. Before connecting,
-  poll `wmcterm ssh status --surface UUID` until `local_ready` is true, with a
-  bounded wait (for example, every 500 ms for up to 10 seconds). On timeout or
-  RPC failure, read that surface's screen and report the initialization problem;
-  do not send input to force readiness. Connect's `--wait` only waits after the
-  connection request is accepted; it does not wait for local Bash initialization.
+- Save `{surface_id, host, connection_id}` from the response as this task's
+  connection record, including on timeout. A local initialization timeout has
+  `wait_phase: "local_ready"`, `requested_host` and no connection ID. Keep that
+  surface; read its screen and resume with `ssh HOST --surface UUID --wait`
+  after resolving initialization. Never repeat `--new` to recover a timeout.
+  RPC failures include recovery IDs in the error where available; query that
+  surface before retrying, and never send input to force readiness.
 - Connect using `wmcterm ssh HOST_ALIAS --surface UUID --wait`. SSH config
-  supplies ports, identities and jump hosts. This never changes focus.
+  supplies ports, identities and jump hosts. This never changes focus. `--wait`
+  also waits for local Bash initialization, so manual status polling is unnecessary.
   Save the returned connection ID together with the host and surface UUID, even
   if the wait times out. Continue polling that same connection until `state` is
   `ready`; stop on a changed ID, disconnection or error. Never execute while
   authentication or bootstrap is pending.
 - Run `wmcterm ssh exec --surface UUID --connection CONNECTION_ID
-  --command 'COMMAND' --wait` using the saved connection ID, and inspect
+  --host HOST_ALIAS --command-file /absolute/script.sh --wait` using the saved
+  connection record, and inspect
   `command.state`, `command.exit_code` and `command.output`. Commands execute
   in the same remote Bash (4.2.46+), retaining cwd. A zero CLI exit status only
   means the RPC succeeded, not that the remote command succeeded.
+- Use exactly one command source: `--command TEXT`, `--command-file PATH`, or
+  `--command-stdin`. File/stdin input is UTF-8, at most 16384 bytes, without NUL;
+  it is sent as remote Bash source, not uploaded as a remote filename. Prefer
+  files or stdin for quotes, dollar signs and multiline scripts. With a process
+  API, pass an argument array and stdin directly; when a shell is necessary,
+  use a quoted heredoc delimiter to prevent local expansion. Never nest raw
+  single quotes or treat JSON encoding as shell escaping. Combine independent
+  read-only checks in one script with explicit output labels and exit handling;
+  structured commands on one connection are serial, and only the latest result
+  is retained.
 - Query `wmcterm ssh status --surface UUID`. A wait timeout does not cancel or
   rerun the command. Retain connection/command IDs, and do not retry a command
   whose outcome is unknown. Only the latest command result is retained.
@@ -82,7 +98,7 @@ from the currently focused UI item: the user may be viewing another workspace.
 - Remote scripts live temporarily in `~/.wmcterm/tmp/` and delete themselves
   when loaded. No remote Agent, daemon, or persistent shell configuration is
   installed. Protocol events coordinate terminal state, never authorize actions.
-- The legacy `ssh HOST` without `--surface` creates an ordinary SSH workspace;
+- The legacy `ssh HOST` without `--surface` or `--new` creates an ordinary SSH workspace;
   it and `--tmux` do not enable this managed command protocol.
 
 ## Launch Codex safely
