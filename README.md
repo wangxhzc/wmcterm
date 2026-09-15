@@ -48,7 +48,7 @@ cargo run
 - `Ctrl+Tab` / `Ctrl+Shift+Tab`：切换到下一个/上一个表面标签页
 - `Ctrl+Shift+X`：关闭活动终端表面
 - `Ctrl+Shift+W`：关闭活动窗格
-- `Alt+Arrow`：聚焦对应方向的窗格
+- `Ctrl+Alt+Arrow`：聚焦对应方向的窗格；单独的 `Alt+Arrow` 传给终端程序
 - `Ctrl+1` … `Ctrl+9`：直接切换到指定工作区
 - `Ctrl+Shift+B`：显示或隐藏工作区侧边栏
 - `Ctrl+Shift+P`：命令面板（`Up`、`Down`、`Enter`、`Esc`）

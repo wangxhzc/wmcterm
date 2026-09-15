@@ -3224,7 +3224,9 @@ impl WmctermApplication {
                     Key::Named(NamedKey::ArrowDown) => Some((0.0, 1.0)),
                     _ => None,
                 };
-                if let Some(direction) = direction {
+                if let Some(direction) = direction
+                    && self.modifiers.control_key()
+                {
                     self.focus_pane_direction(direction);
                     return;
                 }

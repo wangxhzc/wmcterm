@@ -798,6 +798,9 @@ wgpu Renderer
 
 快捷键必须两级路由。
 
+当前默认窗格方向聚焦使用 `Ctrl+Alt+方向键`；单独的 `Alt+方向键`
+透传给终端程序，以支持程序自身的交互快捷键。
+
 ```text
 KeyboardInput
      │

@@ -8,6 +8,9 @@ description: Control wmcterm terminals, workspaces, notifications, and agent sta
 Use `wmcterm` as the stable control interface. Start with `wmcterm capabilities`
 when the protocol is uncertain.
 
+The GUI pane-focus shortcut is `Ctrl+Alt+Arrow`; `Alt+Arrow` is passed through
+to the terminal application.
+
 ## Preserve caller identity
 
 Treat `WMCTERM_WORKSPACE_ID`, `WMCTERM_PANE_ID`, `WMCTERM_SURFACE_ID`, and
