@@ -20,13 +20,14 @@ fi
 
 wmcterm_binary="$(readlink -f "$wmcterm_binary")"
 claude_config_root="${CLAUDE_CONFIG_DIR:-$HOME/.claude}"
+codex_config_root="${CODEX_HOME:-$HOME/.codex}"
 "$wmcterm_binary" skill install --scope user --force
 "$wmcterm_binary" hook install --agent codex --scope user
 "$wmcterm_binary" hook install --agent claude --scope user
 
 for skill_file in \
     "$HOME/.agents/skills/wmcterm/SKILL.md" \
-    "$HOME/.codex/skills/wmcterm/SKILL.md" \
+    "$codex_config_root/skills/wmcterm/SKILL.md" \
     "$claude_config_root/skills/wmcterm/SKILL.md"
 do
     if ! cmp -s <("$wmcterm_binary" skill print) "$skill_file"; then
@@ -37,7 +38,7 @@ done
 
 python3 - \
     "$wmcterm_binary" \
-    "$HOME/.codex/hooks.json" \
+    "$codex_config_root/hooks.json" \
     "$claude_config_root/settings.json" <<'PY'
 import json
 import pathlib

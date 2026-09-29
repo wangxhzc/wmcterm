@@ -289,9 +289,6 @@ Agent Metadata
 
 - Claude Code
 - Codex
-- OpenCode
-- Gemini CLI
-- Aider
 
 本质上都还是运行在 PTY 中的 CLI / TUI。
 
@@ -897,8 +894,6 @@ OSC 777
 ```text
 Claude Code hook
 Codex hook
-OpenCode hook
-Gemini hook
 ```
 
 事件：
@@ -1262,9 +1257,6 @@ enum AgentResumeInfo {
         session_id: String,
     },
 
-    OpenCode {
-        session_id: String,
-    },
 }
 ```
 
@@ -1429,8 +1421,7 @@ wmcterm/
 │   │
 │   ├── wmcterm-agent/
 │   │   ├── Claude
-│   │   ├── Codex
-│   │   └── OpenCode
+│   │   └── Codex
 │   │
 │   ├── wmcterm-ipc/
 │   │   ├── Unix Socket
@@ -1996,7 +1987,7 @@ Plugin Marketplace
   允许原生低风险自动判断但保留隔离；`full-access` 关闭审批和沙箱，只能从命令面板
   的显式动作启动，并要求在危险说明弹窗中再次确认。完全访问只作用于新 Agent 进程，
   不可持久化为配置，也不接受 CLI/Agent 自动化传入危险参数。
-- GUI 为含 `.codex` 目录的 Workspace 启动无人值守 Codex 前，按规范化的精确项目根
+- GUI 为含 `.codex` 目录的 Workspace 启动自动审查模式的 Codex 前，按规范化的精确项目根
   检查用户级 Codex 信任配置。未信任时由人工选择取消、不信任并继续，或信任并启动；
   信任操作保留未知 TOML 和文件权限并原子替换配置，解析或写入失败时 fail closed。
   该入口不属于 CLI/RPC/Agent 能力，防止无人值守进程自行提升项目 Hook 权限。
@@ -2040,7 +2031,7 @@ Plugin Marketplace
   观测和普通通知处理；通知可将用户引回对应终端，但不得创建允许/拒绝审批卡。真正
   可操作的 Codex 审批只来自 app-server 的 `agent.approval.register` 路径。
 - 已实现 Claude Code Hook、Codex app-server、OSC 9/99、wmcterm OSC 777，
-  并可归一化 Claude、Codex、OpenCode、Gemini 等 Agent 生命周期事件。
+  并可归一化 Claude、Codex 的 Agent 生命周期事件。
   Claude 内部 subagent 仍属于其 Claude 进程；独立可见 Agent 通过受管命令在
   新 Pane/Surface 启动。实验性 `codex-teams` 可将 Codex 子线程映射为原生 Pane。
 - Codex 0.150.0 `Interrupt` Hook 归一化为当前 turn 完成且不继续，使
@@ -2350,7 +2341,7 @@ Rust actor、winit 事件循环、wgpu surface 和 glyphon 缓存。因此只借
 
 实现状态（2026-09-01）：会话持久化区分 wmcterm Agent 入口启动和 Shell 手动启动。
 前者在取得 provider session ID 后始终保存 resume 信息，并在重开时直接执行 Codex、
-Claude 或 OpenCode 的 resume 命令，不再重放原始启动命令。后者只有在 wmcterm 关闭时
+Claude 的 resume 命令，不再重放原始启动命令。后者只有在 wmcterm 关闭时
 生命周期仍为 `Running` 且终端前台进程仍被识别为同一种 Agent 才保存 resume；已经
 退出回到 Shell、收到 `SessionEnd`、PTY 退出或失败状态的手动 Agent 不再自动连接旧
 会话，Surface 恢复为普通终端。

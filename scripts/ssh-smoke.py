@@ -21,6 +21,10 @@ def main():
             raise RuntimeError(f"missing dependency: {tool}")
     with tempfile.TemporaryDirectory(prefix="wmcterm-ssh-smoke-") as tmp:
         root = Path(tmp)
+        help_env = dict(os.environ, WMCTERM_CONTROL_SOCKET=str(root / "absent.sock"))
+        for args in (["ssh", "--help"], ["ssh", "exec", "--help"]):
+            result = subprocess.run([binary, *args], env=help_env, capture_output=True, text=True, check=True)
+            assert "wmcterm ssh HOST" in result.stdout
         for name in ("home", "remote", "bin", "runtime", "config", "data"):
             (root / name).mkdir(mode=0o700)
         (root / "bin/bash").symlink_to(bash)
@@ -105,13 +109,16 @@ ForceCommand /bin/bash {remote}
                 cli("rpc", "ssh.connect", json.dumps({"host": "smoke"}), fail=True)
                 cli("rpc", "ssh.connect", json.dumps({"surface_id": surface, "workspace": before["active_workspace"], "host": "smoke"}), fail=True)
                 pane = cli("pane", "list")[0]["id"]
+                env["WMCTERM_PANE_ID"] = pane
+                panes_before = len(cli("pane", "list"))
                 count = len(cli("surface", "list"))
                 cli("ssh", "smoke", "--new", "--pane", pane, "--command", "true", fail=True)
                 cli("ssh", "smoke", "--new", "--pane", pane, "--surface", surface, fail=True)
                 assert len(cli("surface", "list")) == count
-                connected = cli("ssh", "smoke", "--new", "--pane", pane)
+                connected = cli("ssh", "smoke")
                 assert connected["state"] == "ready", connected
-                assert connected["pane_id"] == pane
+                assert connected["pane_id"] != pane
+                assert len(cli("pane", "list")) == panes_before + 1
                 assert connected["workspace_id"] == env["WMCTERM_WORKSPACE_ID"]
                 assert connected["surface_id"] != surface
                 assert len(cli("surface", "list")) == count + 1
@@ -119,6 +126,18 @@ ForceCommand /bin/bash {remote}
                 target = ("--surface", surface)
                 connection = connected["connection_id"]
                 saved = (*target, "--connection", connection, "--host", "smoke")
+                def manual_input(label):
+                    command = f"printf 'manual-%s-ok\\n' {label}"
+                    cli("send", *target, "--", command)
+                    wait(lambda: command in cli("screen", "read", *target)["text"])
+                    cli("send-key", "Enter", *target)
+                    wait(lambda: f"manual-{label}-ok" in cli("screen", "read", *target)["text"])
+                    wait(lambda: status()["state"] == "ready")
+
+                manual_input("connected")
+                result = cli("ssh", "exec", *saved, "--command", "stty -a", "--wait")
+                modes = result["command"]["output"].replace(";", " ").split()
+                assert "echo" in modes and "icanon" in modes and "isig" in modes, result
                 script = root / "diagnostic script.sh"
                 script.write_text("printf '%s\\n' \"a'b\" '$HOME' '\u4e2d\u6587 \U0001f600 e\u0301'\nprintf '%s' \"$((1 + 2))\"\n")
                 for source, stdin in [(("--command-file", str(script)), None), (("--command-stdin",), script.read_text())]:
@@ -144,6 +163,7 @@ ForceCommand /bin/bash {remote}
                 assert result["command"]["exit_code"] == 1, result
                 assert result["command"]["output"] == "\u4e2d\u6587 \U0001f600 e\u0301\r\n", result
                 assert result["cwd"] == "/tmp", result
+                manual_input("completed")
                 cli("rpc", "ssh.exec", json.dumps({"surface_id": surface, "connection_id": "stale", "command": "touch /bad"}), fail=True)
                 result = cli("ssh", "exec", *target, "--command", "printf 123456789", "--max-output-bytes", "4", "--wait")
                 assert result["command"]["output"] == "1234" and result["command"]["truncated"], result
@@ -159,11 +179,13 @@ ForceCommand /bin/bash {remote}
                 assert cancelled["command"]["state"] == "cancelled", cancelled
                 wait(lambda: status()["state"] == "ready")
                 assert status()["command"]["state"] == "cancelled", status()
+                manual_input("cancelled")
                 cli("ssh", "exec", *target, "--command", "exit")
                 wait(lambda: status()["state"] == "disconnected")
                 assert status()["command"]["state"] == "outcome_unknown"
                 assert status()["local_ready"]
                 cli("ssh", "smoke", *target, "--wait")
+                manual_input("reconnected")
                 cli("rpc", "ssh.exec", json.dumps({"surface_id": surface, "connection_id": connection, "command": "false"}), fail=True)
                 (root / "home/.bashrc").write_text("sleep 1\n")
                 timed = cli("ssh", "smoke", "--new", "--pane", pane, "--timeout-ms", "0")
@@ -171,13 +193,18 @@ ForceCommand /bin/bash {remote}
                 assert timed["requested_host"] == "smoke" and timed["connection_id"] is None, timed
                 assert timed["surface_id"] != surface
                 count = len(cli("surface", "list"))
+                panes_before = len(cli("pane", "list"))
                 resumed = cli("ssh", "smoke", "--surface", timed["surface_id"], "--wait")
                 assert resumed["state"] == "ready" and resumed["surface_id"] == timed["surface_id"], resumed
+                assert len(cli("pane", "list")) == panes_before
                 assert len(cli("surface", "list")) == count
                 cli("ssh", "smoke", "--surface", timed["surface_id"], "--wait", fail=True)
                 assert cli("status")["active_workspace"] == before["active_workspace"]
-                print(f"PASS: Bash {actual_version}, real SSH, isolated GUI, one-step connection, file/stdin quoting, host checks, UTF-8, exit/cwd, output limit, timeout, cancellation, reconnect, stale IDs, remote cleanup")
+                print(f"PASS: Bash {actual_version}, real SSH, isolated GUI, manual input/echo, terminal modes, one-step connection, file/stdin quoting, host checks, UTF-8, exit/cwd, output limit, timeout, cancellation, reconnect, stale IDs, remote cleanup")
             except Exception:
+                if "target" in locals():
+                    print(cli("ssh", "status", *target), file=sys.stderr)
+                    print(cli("screen", "read", *target), file=sys.stderr)
                 for name in ("sshd.log", "gui.log"):
                     print(f"{name}:\n{(root / name).read_text()[-6000:]}", file=sys.stderr)
                 raise

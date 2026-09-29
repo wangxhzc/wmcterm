@@ -1,15 +1,35 @@
 ---
 name: wmcterm
-description: Control wmcterm terminals, workspaces, notifications, and agent state. Use when an agent inside wmcterm operates its terminal UI or performs SSH and remote-server shell tasks, including tasks that do not explicitly mention wmcterm. Does not apply to ordinary shell work outside wmcterm.
+description: Control wmcterm terminals, workspaces, notifications, and agent state. Use when an agent inside wmcterm operates its terminal UI, or when the user explicitly requests wmcterm SSH for remote-server tasks. Does not apply to ordinary SSH or shell work.
 ---
 
 # wmcterm Control
 
+Managed Agent launch, detection, hooks and session resume support only Codex
+and Claude Code. Other programs can be run as ordinary terminal commands.
+The UI labels `unattended` mode as "Auto Review" and `full-access` as "Full
+Access"; default interactive mode has no mode badge. CLI mode values are unchanged.
+
+Terminal input follows negotiated TUI protocols for Codex and Claude: mouse
+hover/buttons/wheel, focus reports and enhanced keyboard release events.
+Shift forces local mouse operations. Ordinary right click follows application
+mouse reporting; Shift+right click opens the terminal menu.
+Local history search uses Ctrl+Alt+F / Ctrl+Alt+G; Ctrl+F / Ctrl+G reach the TUI
+unless explicitly overridden in user keybindings.
+
 Use `wmcterm` as the stable control interface. Start with `wmcterm capabilities`
 when the protocol is uncertain.
+Use `wmcterm diagnostics` (`app.diagnostics`) to inspect running/client binary
+paths, provider versions, observed Hook source and per-terminal input protocols.
+It does not change configuration or installation. New Hook receivers timestamp
+SessionStart at invocation; do not replay or invent these timestamps. Retired
+sessions require a fresh receiver invocation or a new terminal lifecycle.
+Approval IDs are opaque and scoped to terminal lifecycle and session generation.
 
 The GUI pane-focus shortcut is `Ctrl+Alt+Arrow`; `Alt+Arrow` is passed through
 to the terminal application.
+The workspace rename shortcut is `Ctrl+Shift+R`; F2 is passed to the terminal
+application, including when the pointer is in the sidebar.
 
 ## Preserve caller identity
 
@@ -34,10 +54,16 @@ from the currently focused UI item: the user may be viewing another workspace.
 
 ## Operate SSH from a local Agent
 
-- For remote-server shell tasks inside wmcterm, default to managed SSH below
-  unless the user explicitly chooses another connection method. Create background
-  terminals with `--no-focus`; the user need not request this separately.
+- Use managed SSH below only when the user explicitly requests `wmcterm ssh`
+  or asks to use wmcterm for the SSH connection. A generic request to SSH or work
+  on a remote server does not opt in, even when the Agent runs inside wmcterm;
+  use ordinary SSH through the Agent's shell tool by default.
   Ordinary system `ssh` is not intercepted or converted by Hooks.
+- Use the caller IDs and returned connection record directly. A successful
+  connection or `exec --wait` response supplies the state and result; do not
+  follow it with routine status, screen, pane-list, or help calls. Inspect only
+  on timeout, authentication, failure, or uncertain protocol support; older
+  builds support `wmcterm --help`, newer builds also accept `wmcterm ssh --help`.
 - Reuse only a dedicated surface recorded for this task, with its saved host and
   connection ID. Execute with both saved `--connection ID` and `--host HOST`:
   the terminal actor atomically checks the host, connection and ready state,
@@ -46,8 +72,10 @@ from the currently focused UI item: the user may be viewing another workspace.
   connection exists, create a dedicated terminal rather than taking over another
   task's session.
 - Use a dedicated idle terminal, not the surface currently running the Agent.
-  Prefer `wmcterm ssh HOST_ALIAS --new --pane CALLER_PANE_UUID` to create a
-  background tab and wait for local and remote readiness in one tool call.
+  Prefer `wmcterm ssh HOST_ALIAS --pane CALLER_PANE_UUID` to create a dedicated
+  right split, like a separate Agent pane, and wait for local and remote readiness
+  in one tool call. New connections default to a split, not a tab; `--new` is
+  optional. Without `--pane`, the CLI uses `WMCTERM_PANE_ID`, never UI focus.
   This always preserves focus and defaults to a total 30-second wait; use
   `--timeout-ms N` (maximum 300000) to adjust it. The default local shell must be Bash 4.2.46+;
   explicitly launched commands and older terminals may not have integration.
@@ -91,6 +119,10 @@ from the currently focused UI item: the user may be viewing another workspace.
 - `connecting` includes authentication and bootstrap waits. Read the target
   screen and let the user handle passwords, MFA and host-key confirmation.
   Do not bypass host verification or derive authentication decisions from text.
+  Report the saved surface ID and host when user input is needed. Keep that
+  terminal and connection while waiting; do not create another terminal or
+  reconnect merely because password authentication is required. After the user
+  authenticates, query the same connection and resume once it is ready.
 - `send`, `send-key` and `screen read` remain available for interactive programs;
   input during a tracked command makes its result unknown. Resume structured
   execution only after the Bash prompt is ready. Never clear an unknown input
@@ -98,8 +130,8 @@ from the currently focused UI item: the user may be viewing another workspace.
 - Remote scripts live temporarily in `~/.wmcterm/tmp/` and delete themselves
   when loaded. No remote Agent, daemon, or persistent shell configuration is
   installed. Protocol events coordinate terminal state, never authorize actions.
-- The legacy `ssh HOST` without `--surface` or `--new` creates an ordinary SSH workspace;
-  it and `--tmux` do not enable this managed command protocol.
+- Explicit legacy SSH arguments (such as `--tmux`) still create an ordinary SSH
+  workspace without this managed protocol. Bare `ssh HOST` creates a managed split.
 
 ## Launch Codex safely
 
@@ -129,7 +161,8 @@ from the currently focused UI item: the user may be viewing another workspace.
   tombstone so a recent out-of-order start cannot reactivate the same agent.
   Normal execution and upgrades do not change Codex configuration. Only an
   explicit `wmcterm hook install --agent codex --scope user` writes under
-  `~/.codex`; use `--scope project` for project configuration, and have the user
+  `CODEX_HOME` (default `~/.codex`); user Skill installation uses the same root.
+  Use `--scope project` for project configuration, and have the user
   review installed changes in Codex `/hooks`.
 - Manually launched Codex processes share the same turn-state tracking. wmcterm
   reports `--approve-for-me` as auto-review and
@@ -156,6 +189,21 @@ from the currently focused UI item: the user may be viewing another workspace.
 - Only when the user explicitly requests unattended execution, use
   `wmcterm agent --mode unattended claude`; this selects Claude's native `auto`
   permission mode. Never pass `bypassPermissions` or dangerous-skip flags.
+- Managed Claude interactive launches default to `--permission-mode default`;
+  an explicitly supplied safe permission mode takes precedence.
+- Claude MCP elicitation dialogs and stale quota auto-resume notifications mean
+  waiting for input. A disabled quota wait returns to idle without ending the session.
+  Input telemetry creates no actionable request; subsequent activity clears the wait.
+  Informational `notification` events preserve task state, including `agent_completed`.
+  Real approvals use `agent.approval.register` and remain pending across telemetry.
+- Native Claude permission flags set display metadata. Validated root Hook
+  `permission_mode` overrides startup flags for the current session and lifecycle;
+  child hooks and unknown modes do not change it or grant permissions.
+  Child `SessionStart` / `SessionEnd` hooks are rejected. Session changes reset
+  cached mode metadata; sequenced duplicate/stale hooks cannot overwrite it.
+- For Claude approvals, `always` applies the one displayed permission suggestion.
+  Review its operation, scope, storage destination, and rules or directories;
+  it may change a session mode rather than create a permanent allow rule.
 - `wmcterm agent PROGRAM` runs in the terminal that invokes it. When it is the
   `--command` of a new pane, it must not create another tab or depend on UI
   focus.
@@ -273,6 +321,9 @@ of falling back automatically. Enter retries an exited terminal; a native
 Managed remote `/resume` applies permissions through the server protocol, not TUI
 permission flags. `--add-dir`, an external `--remote`, and custom `permissions`
 overrides are currently unsupported by the managed permission bridge.
+Managed Codex also rejects non-null permission, reviewer, and cwd changes through
+`thread/settings/update` or `turn/settings/update`. Restart through wmcterm with
+the desired mode and workspace; ordinary model settings remain available.
 
 The sidebar displays interactive, auto-review, or dangerous full access
 independently of idle/running/waiting/completed state. Managed labels follow

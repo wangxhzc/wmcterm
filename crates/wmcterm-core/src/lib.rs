@@ -288,9 +288,8 @@ pub struct AgentMetadata {
 pub const AGENT_SESSION_SCHEMA_VERSION: u32 = 1;
 const MAX_RECENT_AGENT_EVENTS: usize = 256;
 
-/// Stable, dependency-free agent identifier (`claude`, `codex`, `opencode`, …).
-/// Keeping this open rather than using an enum lets newer adapters round-trip
-/// through older wmcterm session files.
+/// Stable, dependency-free agent identifier (`claude` or `codex`).
+/// Strings allow legacy session metadata to be loaded and discarded safely.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct AgentKindId(pub String);
@@ -364,6 +363,9 @@ pub struct AgentActionRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AgentTelemetry {
+    Notification {
+        message: String,
+    },
     Activity {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
@@ -700,6 +702,7 @@ impl AgentSession {
 
     fn apply_telemetry(&mut self, telemetry: &AgentTelemetry) {
         match telemetry {
+            AgentTelemetry::Notification { .. } => {}
             AgentTelemetry::Activity { .. } => {
                 if self.pending_requests.is_empty() {
                     self.state = AgentState::Running;
@@ -1185,7 +1188,7 @@ impl Default for ActionRegistry {
                     command: || {
                         AppCommand::Surface(SurfaceCommand::NewTerminal {
                             pane: Uuid::nil(),
-                            command: Some("claude".into()),
+                            command: Some("wmcterm agent --mode interactive claude".into()),
                         })
                     },
                 },
@@ -1201,7 +1204,7 @@ impl Default for ActionRegistry {
                 },
                 BuiltinAction {
                     id: "agent.claude.unattended",
-                    title: "New Claude Code (Unattended)",
+                    title: "New Claude Code (Auto Review)",
                     command: || {
                         AppCommand::Surface(SurfaceCommand::NewTerminal {
                             pane: Uuid::nil(),
@@ -1211,7 +1214,7 @@ impl Default for ActionRegistry {
                 },
                 BuiltinAction {
                     id: "agent.codex.unattended",
-                    title: "New Codex (Unattended)",
+                    title: "New Codex (Auto Review)",
                     command: || {
                         AppCommand::Surface(SurfaceCommand::NewTerminal {
                             pane: Uuid::nil(),
@@ -1236,26 +1239,6 @@ impl Default for ActionRegistry {
                         AppCommand::Surface(SurfaceCommand::NewTerminal {
                             pane: Uuid::nil(),
                             command: None,
-                        })
-                    },
-                },
-                BuiltinAction {
-                    id: "agent.gemini",
-                    title: "New Gemini CLI",
-                    command: || {
-                        AppCommand::Surface(SurfaceCommand::NewTerminal {
-                            pane: Uuid::nil(),
-                            command: Some("gemini".into()),
-                        })
-                    },
-                },
-                BuiltinAction {
-                    id: "agent.opencode",
-                    title: "New OpenCode",
-                    command: || {
-                        AppCommand::Surface(SurfaceCommand::NewTerminal {
-                            pane: Uuid::nil(),
-                            command: Some("opencode".into()),
                         })
                     },
                 },
@@ -1626,6 +1609,16 @@ mod tests {
     #[test]
     fn action_registry_searches_one_command_source() {
         let registry = ActionRegistry::default();
+        assert!(
+            registry
+                .actions()
+                .iter()
+                .filter(|action| action.id().starts_with("agent."))
+                .all(|action| {
+                    let provider = action.id().split('.').nth(1).unwrap();
+                    matches!(provider, "claude" | "codex")
+                })
+        );
         let matches = registry.search("split");
         assert_eq!(matches.len(), 2);
         assert!(matches.iter().all(|action| matches!(

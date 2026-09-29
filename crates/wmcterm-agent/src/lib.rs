@@ -333,36 +333,15 @@ mod platform_identity {
 pub enum AgentKind {
     Claude,
     Codex,
-    OpenCode,
-    Gemini,
-    Grok,
-    Pi,
-    Omp,
-    Amp,
 }
 
 impl AgentKind {
-    pub const ALL: [Self; 8] = [
-        Self::Claude,
-        Self::Codex,
-        Self::OpenCode,
-        Self::Gemini,
-        Self::Grok,
-        Self::Pi,
-        Self::Omp,
-        Self::Amp,
-    ];
+    pub const ALL: [Self; 2] = [Self::Claude, Self::Codex];
 
     pub const fn as_str(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
-            Self::OpenCode => "opencode",
-            Self::Gemini => "gemini",
-            Self::Grok => "grok",
-            Self::Pi => "pi",
-            Self::Omp => "omp",
-            Self::Amp => "amp",
         }
     }
 
@@ -384,18 +363,6 @@ impl AgentKind {
                 Some(Self::Codex)
             } else if matches!(stem, "claude" | "claude-code" | "@anthropic-ai") {
                 Some(Self::Claude)
-            } else if matches!(stem, "opencode" | "open-code") {
-                Some(Self::OpenCode)
-            } else if matches!(stem, "gemini" | "gemini-cli" | "@google") {
-                Some(Self::Gemini)
-            } else if matches!(stem, "grok" | "grok-cli") {
-                Some(Self::Grok)
-            } else if matches!(stem, "pi" | "pi-coding-agent") {
-                Some(Self::Pi)
-            } else if matches!(stem, "omp" | "oh-my-pi") {
-                Some(Self::Omp)
-            } else if matches!(stem, "amp" | "amp-code") {
-                Some(Self::Amp)
             } else {
                 None
             };
@@ -413,6 +380,30 @@ impl AgentKind {
             .split_ascii_whitespace()
             .map(|argument| argument.trim_matches(|character| matches!(character, '\'' | '"')))
             .collect();
+        if self == Self::Claude {
+            let mut mode = AgentRunMode::Interactive;
+            let mut arguments = arguments.iter().copied();
+            while let Some(argument) = arguments.next() {
+                match argument {
+                    "--" => break,
+                    "--dangerously-skip-permissions" => mode = AgentRunMode::FullAccess,
+                    "--permission-mode" => {
+                        if let Some(value) = arguments.next().and_then(claude_permission_run_mode) {
+                            mode = value;
+                        }
+                    }
+                    _ => {
+                        if let Some(value) = argument
+                            .strip_prefix("--permission-mode=")
+                            .and_then(claude_permission_run_mode)
+                        {
+                            mode = value;
+                        }
+                    }
+                }
+            }
+            return mode;
+        }
         match self {
             Self::Codex
                 if arguments.iter().any(|argument| {
@@ -442,6 +433,17 @@ impl fmt::Display for AgentKind {
     }
 }
 
+fn claude_permission_run_mode(value: &str) -> Option<AgentRunMode> {
+    match value {
+        "auto" => Some(AgentRunMode::Unattended),
+        "bypassPermissions" => Some(AgentRunMode::FullAccess),
+        "default" | "manual" | "plan" | "acceptEdits" | "dontAsk" => {
+            Some(AgentRunMode::Interactive)
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("unsupported agent kind: {0}")]
 pub struct ParseAgentKindError(pub String);
@@ -453,21 +455,28 @@ impl FromStr for AgentKind {
         match canonical(value).as_str() {
             "claude" | "claudecode" => Ok(Self::Claude),
             "codex" | "openaicodex" => Ok(Self::Codex),
-            "opencode" => Ok(Self::OpenCode),
-            "gemini" | "geminicli" => Ok(Self::Gemini),
-            "grok" | "grokcli" => Ok(Self::Grok),
-            "pi" | "picodingagent" => Ok(Self::Pi),
-            "omp" | "ohmypi" => Ok(Self::Omp),
-            "amp" | "ampcode" => Ok(Self::Amp),
             _ => Err(ParseAgentKindError(value.to_owned())),
         }
     }
 }
 
+fn deserialize_supported_agent<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<String, D::Error> {
+    let name = String::deserialize(deserializer)?;
+    name.parse::<AgentKind>()
+        .map_err(serde::de::Error::custom)?;
+    Ok(name)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AgentEvent {
+    Notification {
+        message: String,
+    },
     SessionStart {
+        #[serde(deserialize_with = "deserialize_supported_agent")]
         agent: String,
         session_id: Option<String>,
     },
@@ -632,6 +641,8 @@ pub struct ClaudeHookEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notification_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub permission_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
@@ -669,6 +680,11 @@ pub enum ClaudePaneAction {
 }
 
 impl ClaudeHookEvent {
+    pub fn run_mode(&self) -> Option<AgentRunMode> {
+        self.permission_mode
+            .as_deref()
+            .and_then(claude_permission_run_mode)
+    }
     /// Identity stable enough for an in-memory subagent-to-pane binding.
     /// Session IDs are deliberately included because Claude may reuse short
     /// agent IDs in a later session.
@@ -740,16 +756,34 @@ impl ClaudeHookEvent {
                             .clone()
                             .unwrap_or_else(|| "Agent is waiting for permission".into()),
                     }
-                } else if notification.contains("idle") || notification.contains("input") {
+                } else if notification.contains("idle")
+                    || notification.contains("input")
+                    || matches!(
+                        notification.as_str(),
+                        "elicitationdialog" | "elicitationurldialog" | "quotaautoresumestale"
+                    )
+                {
                     AgentEvent::NeedsInput {
                         message: self
                             .message
                             .clone()
                             .unwrap_or_else(|| "Agent is waiting for input".into()),
                     }
-                } else {
+                } else if notification == "quotaautoresumedisabled" {
+                    AgentEvent::TurnComplete {
+                        continuing: false,
+                        message: self.message.clone(),
+                    }
+                } else if notification == "quotaautoresumefired" {
                     AgentEvent::ToolUse {
                         tool: self
+                            .message
+                            .clone()
+                            .unwrap_or_else(|| "Claude notification".into()),
+                    }
+                } else {
+                    AgentEvent::Notification {
+                        message: self
                             .message
                             .clone()
                             .unwrap_or_else(|| "Claude notification".into()),
@@ -840,6 +874,7 @@ pub fn normalize_claude_hook_event(
         tool_name: direct_string(payload, "tool_name"),
         tool_use_id: direct_string(payload, "tool_use_id"),
         notification_type: direct_string(payload, "notification_type"),
+        permission_mode: direct_string(payload, "permission_mode"),
         message: find_string(
             payload,
             &[
@@ -890,6 +925,8 @@ fn direct_string(payload: &Value, key: &str) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentEventEnvelope {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_started_at_unix_ns: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub surface_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_id: Option<String>,
@@ -909,6 +946,7 @@ impl AgentEventEnvelope {
 
     pub fn new(event: AgentEvent) -> Self {
         Self {
+            hook_started_at_unix_ns: None,
             surface_id: None,
             lifecycle_id: None,
             agent_pid: None,
@@ -926,6 +964,9 @@ impl AgentEventEnvelope {
         surface_id: Option<String>,
     ) -> Self {
         let mut envelope = Self::new(event);
+        envelope.hook_started_at_unix_ns = payload
+            .get("hook_started_at_unix_ns")
+            .and_then(Value::as_u64);
         envelope.surface_id =
             surface_id.or_else(|| find_string(payload, &["surface_id", "surfaceId", "surface"]));
         envelope.lifecycle_id = find_string(
@@ -959,6 +1000,11 @@ impl AgentEventEnvelope {
         insert_optional(object, "pid_start_time", self.pid_start_time);
         insert_optional(object, "version", self.version);
         insert_optional(object, "sequence", self.sequence);
+        insert_optional(
+            object,
+            "hook_started_at_unix_ns",
+            self.hook_started_at_unix_ns,
+        );
         Ok(params)
     }
 
@@ -1087,13 +1133,13 @@ pub fn normalize_hook_event(
         });
     }
 
-    if is_permission(agent, &event, payload) {
+    if is_permission(&event, payload) {
         return Ok(AgentEvent::PermissionRequest {
             message: nonempty(message, "Agent is waiting for permission"),
         });
     }
 
-    if is_needs_input(agent, &event, payload) {
+    if is_needs_input(&event, payload) {
         return Ok(AgentEvent::NeedsInput {
             message: nonempty(message, "Agent is waiting for input"),
         });
@@ -1123,7 +1169,7 @@ pub fn normalize_hook_event(
         });
     }
 
-    if is_tool(agent, &event, payload) {
+    if is_tool(agent, &event) {
         return Ok(AgentEvent::ToolUse {
             tool: find_string(
                 payload,
@@ -1232,10 +1278,9 @@ fn is_session_start(agent: AgentKind, event: &str) -> bool {
             "agentstart",
         ],
     ) || matches!(agent, AgentKind::Codex) && event == "sessionconfigured"
-        || matches!(agent, AgentKind::OpenCode) && event == "sessioncreated"
 }
 
-fn is_permission(agent: AgentKind, event: &str, payload: &Value) -> bool {
+fn is_permission(event: &str, payload: &Value) -> bool {
     any(
         event,
         &[
@@ -1245,13 +1290,12 @@ fn is_permission(agent: AgentKind, event: &str, payload: &Value) -> bool {
             "approvalrequested",
             "beforetoolapproval",
         ],
-    ) || matches!(agent, AgentKind::OpenCode) && event == "permissionupdated"
-        || event == "notification"
-            && find_string(payload, &["notification_type", "notificationType", "kind"])
-                .is_some_and(|kind| canonical(&kind).contains("permission"))
+    ) || event == "notification"
+        && find_string(payload, &["notification_type", "notificationType", "kind"])
+            .is_some_and(|kind| canonical(&kind).contains("permission"))
 }
 
-fn is_needs_input(agent: AgentKind, event: &str, payload: &Value) -> bool {
+fn is_needs_input(event: &str, payload: &Value) -> bool {
     any(
         event,
         &[
@@ -1261,17 +1305,13 @@ fn is_needs_input(agent: AgentKind, event: &str, payload: &Value) -> bool {
             "askuser",
             "idleprompt",
         ],
-    ) || matches!(agent, AgentKind::OpenCode) && event == "sessionidle"
-        || matches!(agent, AgentKind::OpenCode)
-            && event == "sessionstatus"
-            && find_string(payload, &["status"]).is_some_and(|status| canonical(&status) == "idle")
-        || event == "notification"
-            && find_string(payload, &["notification_type", "notificationType", "kind"]).is_some_and(
-                |kind| {
-                    let kind = canonical(&kind);
-                    kind.contains("idle") || kind.contains("input")
-                },
-            )
+    ) || event == "notification"
+        && find_string(payload, &["notification_type", "notificationType", "kind"]).is_some_and(
+            |kind| {
+                let kind = canonical(&kind);
+                kind.contains("idle") || kind.contains("input")
+            },
+        )
 }
 
 fn is_failure(event: &str, payload: &Value) -> bool {
@@ -1299,10 +1339,9 @@ fn is_stop(agent: AgentKind, event: &str) -> bool {
             "threadcomplete",
         ],
     ) || matches!(agent, AgentKind::Codex) && event == "agentturncomplete"
-        || matches!(agent, AgentKind::OpenCode) && event == "sessiondeleted"
 }
 
-fn is_tool(agent: AgentKind, event: &str, payload: &Value) -> bool {
+fn is_tool(agent: AgentKind, event: &str) -> bool {
     any(
         event,
         &[
@@ -1335,11 +1374,6 @@ fn is_tool(agent: AgentKind, event: &str, payload: &Value) -> bool {
             "context",
         ],
     ) || matches!(agent, AgentKind::Claude) && event == "notification"
-        || matches!(agent, AgentKind::OpenCode)
-            && matches!(event, "toolexecutebefore" | "toolexecuteafter")
-        || matches!(agent, AgentKind::OpenCode)
-            && event == "sessionstatus"
-            && find_string(payload, &["status"]).is_some_and(|status| canonical(&status) == "busy")
 }
 
 fn payload_success(payload: &Value) -> Option<bool> {
@@ -1361,9 +1395,6 @@ fn payload_success(payload: &Value) -> Option<bool> {
 #[serde(rename_all = "snake_case")]
 pub enum HookConfigFormat {
     Json,
-    Toml,
-    JavaScript,
-    Shell,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1449,26 +1480,6 @@ pub fn hook_install_plan(agent: AgentKind, wmcterm_binary: impl Into<String>) ->
                 true,
                 &[],
             ),
-        ),
-        AgentKind::Gemini => (
-            Some("settings.json".into()),
-            HookConfigFormat::Json,
-            json_hook_fragment(
-                &["SessionStart", "BeforeTool", "Notification", "SessionEnd"],
-                &command,
-                false,
-                &[],
-            ),
-        ),
-        AgentKind::OpenCode => (
-            Some("plugins/wmcterm.js".into()),
-            HookConfigFormat::JavaScript,
-            format!("// Forward OpenCode plugin events as JSON on stdin to:\n// {command}"),
-        ),
-        _ => (
-            None,
-            HookConfigFormat::Shell,
-            format!("# Configure the agent's JSON event hook to pipe stdin to:\n{command}"),
         ),
     };
     HookInstallPlan {
@@ -1600,35 +1611,41 @@ fn windows_shell_argument(argument: &str) -> String {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentTransition {
-    pub state: AgentState,
+    /// None preserves the observed task state for informational notifications.
+    pub state: Option<AgentState>,
     pub attention: AttentionState,
     pub notification: Option<String>,
 }
 
 pub fn reduce(event: &AgentEvent) -> AgentTransition {
     match event {
+        AgentEvent::Notification { message } => AgentTransition {
+            state: None,
+            attention: AttentionState::None,
+            notification: Some(message.clone()),
+        },
         AgentEvent::SessionStart { .. } => AgentTransition {
-            state: AgentState::Idle,
+            state: Some(AgentState::Idle),
             attention: AttentionState::None,
             notification: None,
         },
         AgentEvent::ToolUse { .. } => AgentTransition {
-            state: AgentState::Running,
+            state: Some(AgentState::Running),
             attention: AttentionState::Activity,
             notification: None,
         },
         AgentEvent::PermissionRequest { message } => AgentTransition {
-            state: AgentState::WaitingForPermission,
+            state: Some(AgentState::WaitingForPermission),
             attention: AttentionState::NeedsInput,
             notification: Some(message.clone()),
         },
         AgentEvent::NeedsInput { message } => AgentTransition {
-            state: AgentState::WaitingForInput,
+            state: Some(AgentState::WaitingForInput),
             attention: AttentionState::NeedsInput,
             notification: Some(message.clone()),
         },
         AgentEvent::TurnComplete { .. } => AgentTransition {
-            state: AgentState::Idle,
+            state: Some(AgentState::Idle),
             attention: AttentionState::None,
             notification: None,
         },
@@ -1636,7 +1653,7 @@ pub fn reduce(event: &AgentEvent) -> AgentTransition {
             success: true,
             message,
         } => AgentTransition {
-            state: AgentState::Completed,
+            state: Some(AgentState::Completed),
             attention: AttentionState::Activity,
             notification: message.clone().or_else(|| Some("Task completed".into())),
         },
@@ -1645,7 +1662,7 @@ pub fn reduce(event: &AgentEvent) -> AgentTransition {
             success: false,
             message,
         } => AgentTransition {
-            state: AgentState::Error,
+            state: Some(AgentState::Error),
             attention: AttentionState::Error,
             notification: message.clone().or_else(|| Some("Task failed".into())),
         },
@@ -1838,18 +1855,102 @@ mod tests {
     use super::*;
 
     #[test]
+    fn claude_permission_modes_are_metadata_only() {
+        for (command, expected) in [
+            ("claude --permission-mode auto", AgentRunMode::Unattended),
+            ("claude --permission-mode=auto", AgentRunMode::Unattended),
+            (
+                "claude --permission-mode bypassPermissions",
+                AgentRunMode::FullAccess,
+            ),
+            (
+                "claude --dangerously-skip-permissions",
+                AgentRunMode::FullAccess,
+            ),
+            (
+                "claude --allow-dangerously-skip-permissions",
+                AgentRunMode::Interactive,
+            ),
+            (
+                "claude -- --permission-mode auto",
+                AgentRunMode::Interactive,
+            ),
+        ] {
+            assert_eq!(
+                AgentKind::Claude.run_mode_from_process_command(command),
+                expected,
+                "{command}"
+            );
+        }
+        for (mode, expected) in [
+            ("default", Some(AgentRunMode::Interactive)),
+            ("auto", Some(AgentRunMode::Unattended)),
+            ("bypassPermissions", Some(AgentRunMode::FullAccess)),
+            ("future-mode", None),
+        ] {
+            let hook = normalize_claude_hook_event(
+                Some("Notification"),
+                &serde_json::json!({
+                    "session_id": "session", "permission_mode": mode,
+                    "notification_type": "agent_completed", "message": "Completed"
+                }),
+            )
+            .unwrap();
+            assert_eq!(hook.run_mode(), expected);
+            let transition = reduce(&hook.to_agent_event());
+            assert_eq!(transition.state, None);
+            assert_eq!(transition.notification.as_deref(), Some("Completed"));
+        }
+    }
+
+    #[test]
+    fn claude_elicitation_and_quota_notifications_have_correct_wait_states() {
+        for (notification, state) in [
+            ("elicitation_dialog", AgentState::WaitingForInput),
+            ("elicitation_url_dialog", AgentState::WaitingForInput),
+            ("quota_auto_resume_stale", AgentState::WaitingForInput),
+            ("agent_needs_input", AgentState::WaitingForInput),
+            ("permission_prompt", AgentState::WaitingForPermission),
+            ("quota_auto_resume_fired", AgentState::Running),
+            ("quota_auto_resume_disabled", AgentState::Idle),
+        ] {
+            let event = normalize_claude_hook_event(
+                None,
+                &serde_json::json!({
+                    "hook_event_name": "Notification", "session_id": "session",
+                    "notification_type": notification, "message": "Provider notification"
+                }),
+            )
+            .unwrap()
+            .to_agent_event();
+            let transition = reduce(&event);
+            assert_eq!(transition.state, Some(state), "{notification}");
+            if matches!(
+                state,
+                AgentState::WaitingForInput | AgentState::WaitingForPermission
+            ) {
+                assert_eq!(transition.attention, AttentionState::NeedsInput);
+                assert_eq!(
+                    transition.notification.as_deref(),
+                    Some("Provider notification")
+                );
+            }
+        }
+    }
+
+    #[test]
     fn session_start_is_idle_until_activity_begins() {
         let started = reduce(&AgentEvent::SessionStart {
             agent: "codex".into(),
             session_id: Some("session-1".into()),
         });
-        assert_eq!(started.state, AgentState::Idle);
+        assert_eq!(started.state, Some(AgentState::Idle));
         assert_eq!(started.attention, AttentionState::None);
 
         let active = reduce(&AgentEvent::ToolUse {
             tool: "cargo test".into(),
         });
-        assert_eq!(active.state, AgentState::Running);
+        assert_eq!(active.state, Some(AgentState::Running));
         assert_eq!(active.attention, AttentionState::Activity);
     }
 
@@ -1857,7 +1958,7 @@ mod tests {
     fn permission_event_requires_attention() {
         let event = parse_osc777("wmcterm;permission;Approve shell?").unwrap();
         let transition = reduce(&event);
-        assert_eq!(transition.state, AgentState::WaitingForPermission);
+        assert_eq!(transition.state, Some(AgentState::WaitingForPermission));
         assert_eq!(transition.attention, AttentionState::NeedsInput);
     }
 
@@ -1925,8 +2026,16 @@ mod tests {
             assert_eq!(kind.to_string(), kind.as_str());
         }
         assert_eq!("Claude Code".parse(), Ok(AgentKind::Claude));
-        assert_eq!("open-code".parse(), Ok(AgentKind::OpenCode));
-        assert_eq!("Gemini CLI".parse(), Ok(AgentKind::Gemini));
+        for removed in ["open-code", "Gemini CLI", "grok", "pi", "omp", "amp"] {
+            assert!(removed.parse::<AgentKind>().is_err());
+            assert!(AgentKind::from_process_command(removed).is_none());
+            assert!(
+                serde_json::from_value::<AgentEvent>(serde_json::json!({
+                    "event": "session_start", "agent": removed, "session_id": "old"
+                }))
+                .is_err()
+            );
+        }
         assert!("unknown".parse::<AgentKind>().is_err());
     }
 
@@ -1944,7 +2053,7 @@ mod tests {
         );
         assert_eq!(
             AgentKind::from_process_command("C:\\tools\\gemini.exe"),
-            Some(AgentKind::Gemini)
+            None
         );
         assert_eq!(AgentKind::from_process_command("compile project"), None);
         assert_eq!(AgentKind::from_process_command("code src/lib.rs"), None);
@@ -2125,7 +2234,7 @@ mod tests {
             event
         );
         let transition = reduce(&event);
-        assert_eq!(transition.state, AgentState::Error);
+        assert_eq!(transition.state, Some(AgentState::Error));
         assert_eq!(transition.attention, AttentionState::Error);
         assert_eq!(
             transition.notification.as_deref(),
@@ -2135,7 +2244,10 @@ mod tests {
         let mut child = payload.clone();
         child["agent_id"] = serde_json::json!("worker");
         let child = normalize_claude_hook_event(None, &child).unwrap();
-        assert_eq!(reduce(&child.to_agent_event()).state, AgentState::Running);
+        assert_eq!(
+            reduce(&child.to_agent_event()).state,
+            Some(AgentState::Running)
+        );
         assert_eq!(child.route_key(), "claude:live-session:worker");
 
         assert!(
@@ -2170,7 +2282,10 @@ mod tests {
                 ..
             }
         ));
-        assert_eq!(reduce(&stopped.to_agent_event()).state, AgentState::Idle);
+        assert_eq!(
+            reduce(&stopped.to_agent_event()).state,
+            Some(AgentState::Idle)
+        );
 
         let continuing = normalize_claude_hook_event(
             None,
@@ -2192,7 +2307,10 @@ mod tests {
         ));
         // `stop_hook_active` records that a previous Stop hook continued the
         // turn; it does not reveal whether this Stop will be blocked again.
-        assert_eq!(reduce(&continuing.to_agent_event()).state, AgentState::Idle);
+        assert_eq!(
+            reduce(&continuing.to_agent_event()).state,
+            Some(AgentState::Idle)
+        );
     }
 
     #[test]
@@ -2221,7 +2339,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_codex_and_opencode_native_events() {
+    fn normalizes_codex_native_events() {
         let submitted = normalize_hook_json(
             AgentKind::Codex,
             None,
@@ -2229,7 +2347,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(submitted, AgentEvent::ToolUse { .. }));
-        assert_eq!(reduce(&submitted).state, AgentState::Running);
+        assert_eq!(reduce(&submitted).state, Some(AgentState::Running));
         assert_eq!(
             normalize_hook_json(
                 AgentKind::Codex,
@@ -2263,34 +2381,7 @@ mod tests {
                 message: None
             }
         ));
-        assert_eq!(reduce(&interrupted).state, AgentState::Idle);
-        assert!(matches!(
-            normalize_hook_json(
-                AgentKind::OpenCode,
-                None,
-                r#"{"event":"permission.updated","data":{"message":"Allow edit?"}}"#,
-            )
-            .unwrap(),
-            AgentEvent::PermissionRequest { message } if message == "Allow edit?"
-        ));
-        assert!(matches!(
-            normalize_hook_json(
-                AgentKind::OpenCode,
-                Some("session.idle"),
-                r#"{"payload":{"message":"Your response is needed"}}"#,
-            )
-            .unwrap(),
-            AgentEvent::NeedsInput { .. }
-        ));
-        assert!(matches!(
-            normalize_hook_json(
-                AgentKind::OpenCode,
-                None,
-                r#"{"type":"session.status","data":{"status":"busy"}}"#,
-            )
-            .unwrap(),
-            AgentEvent::ToolUse { .. }
-        ));
+        assert_eq!(reduce(&interrupted).state, Some(AgentState::Idle));
     }
 
     #[test]
@@ -2344,7 +2435,10 @@ mod tests {
             Some("Inspection complete")
         );
         assert!(matches!(stop.to_agent_event(), AgentEvent::ToolUse { .. }));
-        assert_eq!(reduce(&stop.to_agent_event()).state, AgentState::Running);
+        assert_eq!(
+            reduce(&stop.to_agent_event()).state,
+            Some(AgentState::Running)
+        );
     }
 
     #[test]
@@ -2450,22 +2544,17 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_gemini_notifications_and_generic_agent_events() {
+    fn normalizes_supported_agent_events() {
         assert!(matches!(
             normalize_hook_json(
-                AgentKind::Gemini,
+                AgentKind::Codex,
                 Some("Notification"),
                 r#"{"notification_type":"permission_prompt","prompt":"Run command?"}"#,
             )
             .unwrap(),
             AgentEvent::PermissionRequest { message } if message == "Run command?"
         ));
-        for agent in [
-            AgentKind::Grok,
-            AgentKind::Pi,
-            AgentKind::Omp,
-            AgentKind::Amp,
-        ] {
+        for agent in AgentKind::ALL {
             assert!(matches!(
                 normalize_hook_json(agent, Some("tool_call"), r#"{"tool":"read_file"}"#)
                     .unwrap(),
@@ -2488,7 +2577,7 @@ mod tests {
     fn explicit_event_wins_and_errors_are_descriptive() {
         assert!(matches!(
             normalize_hook_json(
-                AgentKind::Amp,
+                AgentKind::Codex,
                 Some("needs_input"),
                 r#"{"event":"tool_call","message":"Choose one"}"#,
             )
@@ -2496,23 +2585,23 @@ mod tests {
             AgentEvent::NeedsInput { message } if message == "Choose one"
         ));
         assert!(matches!(
-            normalize_hook_json(AgentKind::Pi, None, "{}"),
+            normalize_hook_json(AgentKind::Codex, None, "{}"),
             Err(HookJsonError::Normalize(
                 NormalizeHookError::MissingEventName
             ))
         ));
         assert!(matches!(
-            normalize_hook_json(AgentKind::Pi, Some("mystery"), "{}"),
+            normalize_hook_json(AgentKind::Codex, Some("mystery"), "{}"),
             Err(HookJsonError::Normalize(
                 NormalizeHookError::UnsupportedEvent { .. }
             ))
         ));
         assert!(matches!(
-            normalize_hook_json(AgentKind::Pi, Some("tool_call"), "[]"),
+            normalize_hook_json(AgentKind::Codex, Some("tool_call"), "[]"),
             Err(HookJsonError::Normalize(NormalizeHookError::InvalidPayload))
         ));
         assert!(matches!(
-            normalize_hook_json(AgentKind::Pi, None, "not-json"),
+            normalize_hook_json(AgentKind::Codex, None, "not-json"),
             Err(HookJsonError::Json(_))
         ));
     }
@@ -2569,6 +2658,7 @@ mod tests {
         assert_eq!(parsed.version, Some(AgentEventEnvelope::CURRENT_VERSION));
 
         let canonical = serde_json::to_value(AgentEventEnvelope {
+            hook_started_at_unix_ns: Some(100),
             surface_id: Some("surface-2".into()),
             lifecycle_id: Some("life-2".into()),
             agent_pid: Some(55),
@@ -2690,7 +2780,7 @@ mod tests {
                     .contains(&Value::String(safe_command.into()))
             );
         }
-        let quoted = hook_install_plan(AgentKind::Gemini, "/opt/wmc \"term\"/wmc'term");
+        let quoted = hook_install_plan(AgentKind::Claude, "/opt/wmc \"term\"/wmc'term");
         serde_json::from_str::<Value>(&quoted.snippets[0].content).unwrap();
         let codex = hook_install_plan(AgentKind::Codex, "wmcterm");
         assert_eq!(codex.snippets[0].format, HookConfigFormat::Json);

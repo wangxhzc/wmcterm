@@ -1,5 +1,9 @@
 # wmcterm
 
+`wmcterm diagnostics` 可检查 GUI/CLI 可执行文件路径、Codex/Claude 版本、最近
+实际收到的 Hook 来源，以及每个终端的鼠标、键盘、焦点和粘贴协议状态。
+诊断仅查询状态，不修改 Hook 安装或用户配置。
+
 基于 `libghostty-vt`、`winit`、`wgpu` 和 `glyphon` 构建的 Rust 原生 GPU
 终端工作区。每个终端表面拥有独立的 PTY/VT actor；UI 接收不可变的渲染快照，
 并合并重绘唤醒。
@@ -56,13 +60,14 @@ cargo run
 - 在通知中心上滚动鼠标滚轮：浏览更早/更新的通知
 - `Mark all read` / `全部已读`：清除普通未读标记，但不删除通知，也不处理待定的
   Agent 授权请求
-- `Ctrl+F`：搜索全部终端回滚历史（使用 `Enter`/`Shift+Enter` 导航）
+- `Ctrl+Alt+F`：搜索全部终端回滚历史（使用 `Enter`/`Shift+Enter` 导航）；`Ctrl+Alt+G` 查找下一处
 - `Ctrl+Shift+L`：筛选活动日志表面（`level:error,warn text`）
 - `Ctrl+Shift+F`：使用 `rg` 搜索活动工作区中的文件
 - `Ctrl++` / `Ctrl+-` / `Ctrl+0`：增大、减小或重置终端字号
 - `Ctrl+Shift+K`：清空终端屏幕和回滚历史
 - `Ctrl+Shift+Z`：缩放或取消缩放活动窗格
 - `Ctrl+Shift+R`：重命名活动工作区
+- `F2`：传给终端程序（如 Codex），不用于重命名工作区
 - `Ctrl+Shift+PageUp` / `Ctrl+Shift+PageDown`：调整活动工作区顺序
 - `Ctrl+Shift+U`：跳转到最新未读通知
 - `Alt+1` … `Alt+9`：直接切换到活动窗格中的指定表面
@@ -113,14 +118,16 @@ Bash 4.2.46+，本地系统 OpenSSH，以及远端 `mktemp`、`od`、`tr` 等基
 使用下面的一步连接入口创建后台操作终端，或手动创建专用终端。
 
 ```bash
-wmcterm ssh dev-server --new --pane CALLER_PANE_UUID
+wmcterm ssh dev-server --pane CALLER_PANE_UUID
 wmcterm ssh dev-server --surface SURFACE_UUID --wait
 wmcterm ssh exec --surface SURFACE_UUID --connection CONNECTION_ID --host dev-server --command-file /absolute/check.sh --wait
 wmcterm ssh status --surface SURFACE_UUID
 wmcterm ssh cancel --surface SURFACE_UUID --connection CONNECTION_ID --command-id COMMAND_ID --wait
 ```
 
-`--new --pane UUID` 在指定 Pane 创建不切换焦点的终端，自动等待本地初始化和远端
+`wmcterm ssh HOST` 默认从 `WMCTERM_PANE_ID` 指定的调用者 Pane 向右分屏；
+可用 `--pane UUID` 显式指定，`--new` 可省略。缺少调用者 ID 时要求显式指定，
+不会使用 UI 当前焦点。新分屏不切换焦点，自动等待本地初始化和远端
 连接，返回 `surface_id`、`pane_id`、`workspace_id`、`host` 和 `connection_id`。
 默认总等待 30 秒，可用 `--timeout-ms N` 调整，最大 300000 毫秒。已有专用终端的
 连接命令加 `--wait` 也会等待本地 Shell 初始化，无需 Agent 单独轮询。
@@ -146,15 +153,21 @@ git status --short
 REMOTE_SCRIPT
 ```
 
-内置 Skill 指引 wmcterm 内的 Agent 默认使用托管 SSH 处理远端 Shell 任务，自动
-创建不切换焦点的终端，或复用当前任务已记录且主机和连接 ID 均匹配的专用连接。
-用户明确指定其他连接方式时遵循用户选择；Hook 不会拦截或改写普通系统 `ssh`。
+内置 Skill 只在用户明确要求 `wmcterm ssh` 或通过 wmcterm 连接 SSH 时使用托管
+SSH；普通远端任务默认通过 Agent 的 Shell 工具使用系统 SSH。启用后默认创建
+不切换焦点的独立分屏，或复用当前任务已记录且主机和连接 ID 均匹配的专用连接。
+Hook 不会拦截或改写普通系统 `ssh`。
+正常流程一次调用完成分屏和连接，后续直接使用返回的连接信息执行命令；
+`exec --wait` 已返回状态、退出码和输出时，不再额外读取屏幕或查询状态。
 
 端口、密钥、跳板机使用 `~/.ssh/config` 中的主机别名配置。连接不会切换焦点。
+`wmcterm ssh --help`（或 `-h`）仅显示帮助，不创建工作区或连接服务器；
+`ssh exec/status/cancel --help` 同样可用。主机名必须放在 SSH 选项之前。
+兼容旧版本时可使用 `wmcterm --help`。
 密码、主机指纹确认和 MFA 仍由 OpenSSH 在该终端交互；`connecting` 包含等待认证
 和等待远端集成就绪，不能单凭此状态区分两者。需要时读取该 Surface 的屏幕并由用户
-完成认证。不带 `--surface` 或 `--new` 的旧 `wmcterm ssh TARGET [SSH_ARG...]` 仍创建普通 SSH
-工作区，`--tmux` 也保留旧行为，不提供上述结构化命令接口。
+完成认证。显式传入传统 SSH 参数的 `wmcterm ssh TARGET SSH_ARG...` 仍创建普通
+SSH 工作区，`--tmux` 也保留旧行为，不提供上述结构化命令接口。
 
 远端只在 `~/.wmcterm/tmp/` 创建权限为 `0600` 的独立临时脚本；两个目录为 `0700`。
 脚本加载时立即删除，不修改 `.bashrc` 或安装服务。集成先加载已有 `.bashrc`，保留
@@ -241,8 +254,8 @@ cargo run -- status
 Hook 接收器会继承由 wmcterm 启动的终端所含的 wmcterm 上下文变量，因此并发 Agent
 会把状态和通知报告给正确的工作区、窗格及表面。
 `hook plan` 只输出用于合并的集成片段，绝不会编辑 Agent 配置。`hook install` 会在
-项目或用户作用域安全合并 Codex、Claude Code 和 Gemini 的 JSON Hook 定义，重复安装
-会自动去重。对于插件格式无法安全合并的其他受支持 Agent，仍会提供安装计划。Codex
+项目或用户作用域安全合并 Codex、Claude Code 的 JSON Hook 定义，重复安装
+会自动去重。Agent 启动、进程识别、Hook 和会话恢复仅支持 Codex 与 Claude Code。Codex
 新安装或发生变化的命令 Hook 必须先通过 `/hooks` 审核才能运行。
 Codex 0.150.0 的 `Interrupt` Hook 会在用户中断当前 turn 时立即清除运行中
 状态，但不会把仍在等待下一次输入的 Codex 进程标记为已退出。
@@ -250,11 +263,13 @@ Claude Code 的 `StopFailure` Hook 会将 API 错误、限流或认证失败导�
 标记为错误，并保留会话及后台子 Agent；下一次活动可继续更新状态。旧 session 的
 延迟 Hook 不会覆盖当前会话。已有安装需要显式重新执行
 `wmcterm hook install --agent claude --scope user` 才会注册此事件。
+Claude 的 MCP 表单、URL 授权及额度恢复后需按 Enter 的通知会标记为等待输入；
+额度自动续跑恢复运行状态，取消自动等待则回到空闲状态，不结束会话。
 Codex 0.151.0 的 `SubagentStart`/`SubagentStop` Hook 会按 Surface、session 和
 agent ID 跟踪后台子 Agent；只要任一子 Agent 仍活动，Workspace 就保持运行中，
 父 turn 完成不会提前显示为已完成。Stop 会留下每个 session 最近 256 个有界墓碑，
 阻止乱序到达的同键 Start 重新激活。升级和普通运行不会自动修改 Codex 配置；只有用户
-显式执行 `wmcterm hook install --agent codex --scope user` 才会写入 `~/.codex`，
+显式执行 `wmcterm hook install --agent codex --scope user` 才会写入 `CODEX_HOME`（默认 `~/.codex`），
 随后仍需在 Codex `/hooks` 中审核变化。项目级安装使用 `--scope project`。
 
 CLI 也是稳定的 Agent 控制接口。在 wmcterm 终端内启动的命令会继承 `WMCTERM=1`、
@@ -284,17 +299,28 @@ transcript 加载到监视器。它识别所有携带线程 ID 的 `thread/*` �
 线程列表，因此遗漏的 resume 通知不会永久绕过审批桥。
 托管 Codex 默认以 `--ask-for-approval on-request --sandbox workspace-write` 启动：
 普通工作区操作无需提示即可进行，沙箱外请求则路由至 wmcterm 的集中式审批 UI。
-需要长时间无人干预时，可从命令面板选择“新建 Codex/Claude Code（无人值守）”，
+需要自动审查权限请求时，可从命令面板选择“新建 Codex/Claude Code（自动审查）”，
 或运行 `wmcterm agent --mode unattended codex|claude`。该模式使用 provider 原生的
 自动审查能力：Codex 使用 `--approve-for-me`（该参数自身启用 `workspace-write`
 沙箱），Claude 使用 `--permission-mode auto`；它不是“自动同意所有请求”，也不会
 关闭沙箱。
 Claude Code 2.1.268 起，`-p`/`--print` 也会触发 `PermissionRequest` Hook。
+托管 Claude 交互启动默认显式传入 `--permission-mode default`，避免新版 Claude
+默认 auto 模式改变交互入口的行为；用户显式指定的安全权限模式仍保留。
+原生 Claude 的 auto / bypass 启动参数也会显示对应模式；当前会话经过校验的
+Hook `permission_mode` 优先于启动参数，反映运行期间的切换，仅用于状态展示。
+新会话和终端重启会清理旧模式缓存；子任务不能通过 `SessionStart` / `SessionEnd`
+改变主会话，带序列号的重复或过期 Hook 也不会重写模式。
+输入等待通知不会创建审批按钮，恢复执行后会退出等待；`agent_completed`、认证成功
+等普通通知保留任务状态。真实权限请求仍由独立审批通道处理，不会被这些通知清除。
+Claude 的单条权限建议会显示为“添加规则”“切换模式”等实际操作，摘要和详情展示
+会话、项目或用户作用域、保存位置以及具体规则或目录。协议中的 `always` 仍表示
+应用这条建议，并不保证永久授权；多条建议不会提供含糊的批量应用按钮。
 在 wmcterm 内运行的此类调用会使用相同的集中式审批，可能等待用户处理；自动审查
 不等于永不等待。接受审批结果的 9 分钟时限包含注册及轮询，超时或取消后到达的
 允许结果不会执行；正在执行的 IPC 和取消清理可能使 Hook 稍晚返回。在 wmcterm
 外运行时，Hook 不接管 Claude 的原生权限流程。
-从 GUI 首次为含 `.codex` 目录的工作区启动无人值守 Codex 时，wmcterm 会在启动前
+从 GUI 首次为含 `.codex` 目录的工作区启动自动审查模式的 Codex 时，wmcterm 会在启动前
 检查 Codex 用户配置中的精确项目路径。未信任的项目必须由用户选择“信任并启动”或
 “不信任并继续”；前者安全合并 `~/.codex/config.toml`，后者保持项目级 config、
 Hooks 和 exec policies 禁用。该人工信任入口不会暴露给 CLI、RPC 或 Agent。
@@ -307,6 +333,9 @@ Workspace cwd 显式传给私有 app-server 的远程 TUI。Codex 0.149.1 至 0.
 和 fork 请求中应用所选模式，核验返回的实际权限后才允许启动 turn，因此重启恢复和
 会话内 `/resume` 不再触发远程恢复的 permission overrides 错误。当前托管入口不支持
 `--add-dir`、外部 `--remote` 及自定义 `permissions` 配置覆盖，遇到这些参数会明确报错。
+Codex 0.158.0 的 `thread/settings/update` 和 `turn/settings/update` 同样受代理约束：
+权限、审批 reviewer 和 cwd 的非空更新会在转发前被拒绝，需通过 wmcterm 以所需模式和
+工作目录重新启动。模型等普通设置仍可更新；未核验的线程不能更新设置。
 已对照 Codex 0.154.0 协议核验恢复订阅：watcher 不覆盖线程保存的 cwd、权限或
 worktree 配置。子 Agent 窗格使用其线程的 cwd，保持 `focus: false`；只读线程
 仍交由原生 TUI 展示。提问由 Codex TUI 处理，不映射为允许/拒绝审批。
@@ -315,7 +344,7 @@ worktree 配置。子 Agent 窗格使用其线程的 cwd，保持 `focus: false`
 `PermissionRequest` Hook 只更新等待状态并发送普通通知；用户仍需回到 Codex TUI
 完成原生审批，通知中心不会显示无法生效的允许/拒绝按钮。
 前台进程识别会把手动 `codex --approve-for-me` 标记为“自动审查”，把手动
-`codex --dangerously-bypass-approvals-and-sandbox` 标记为“危险全权限”；运行模式
+`codex --dangerously-bypass-approvals-and-sandbox` 标记为“完全访问”；运行模式
 与空闲、运行中、等待和完成等 turn 状态相互独立。工作区侧栏显示其中最敏感的模式，
 `UserPromptSubmit` Hook 则确认包括粘贴、RPC 输入和自动续跑在内的运行状态。
 如果根 Codex TUI 先回答同一个 app-server 请求，wmcterm 会消费 Codex 的
@@ -337,7 +366,7 @@ Codex 0.150.0 把向已运行命令发送输入表示为同一 app-server method
 标识，会安全过期，并拒绝陈旧或重复的响应。通知中心的审批卡片优先显示命令、
 工具、工作目录、原因或权限等可读摘要；详情保留格式化 JSON，并提供滚轮、方向键、
 Page Up/Down、Home/End、行数进度和可拖动滚动条。
-卡片只呈现“拒绝”“允许一次”和 provider 明确提供时的“信任规则”；“无人值守”和
+卡片只呈现“拒绝”“允许一次”和 provider 明确提供时的“信任规则”；“自动审查”和
 “完全访问”是 Agent 会话启动模式，不是某一条审批请求的升级按钮。
 
 交互式关闭操作会在终止活动进程前发出警告。明确指定工作区、窗格或表面 UUID 的
@@ -351,7 +380,8 @@ Agent 和 CLI 控制调用会直接执行，不弹出 UI 确认；显式目标�
 目录；默认使用项目作用域，并将忽略的副本写入 `.agents/skills` 和 Claude Code 的
 `.claude/skills` 发现目录。Hook 计划和 JSON 片段由 `crates/wmcterm-agent` 生成，
 而 `.codex/hooks.json` 及其他 Agent 配置文件仅作为合并目标。
-设置 `CLAUDE_CONFIG_DIR` 后，Claude 副本和用户 Hook 配置会使用该目录。除非提供
+设置 `CODEX_HOME` 或 `CLAUDE_CONFIG_DIR` 后，对应 Agent 的 Skill 副本和用户 Hook
+配置会使用该目录；更新脚本也使用同一路径，项目级安装不受影响。除非提供
 `--force`，否则会保留已有的不同内容。
 
 Claude Code 会继承 `WMCTERM_WORKSPACE_ID`、`WMCTERM_PANE_ID`、
@@ -403,7 +433,7 @@ command = "cargo test"
 ```
 
 工作区布局、表面、终端命令和受支持的 Agent 会话 ID 会从平台数据目录恢复。可见的
-回滚历史会保留；PTY 进程内存绝不会被序列化，命令以及 Claude/Codex/OpenCode 的
+回滚历史会保留；PTY 进程内存绝不会被序列化，命令以及 Claude/Codex 的
 resume 标识符会按启动来源恢复。由 wmcterm Agent 入口启动并已取得 session ID 的
 会话恢复原线程，不会重新执行初始提示词；Shell 中手动
 启动的 Agent 仅在 wmcterm 关闭时生命周期仍在运行且前台进程仍是该 Agent 才恢复；
@@ -417,7 +447,9 @@ CLI/RPC 仍不能直接选择危险全权限。子窗格连接新服务，不复
 其权限和工作目录保持独立；缺少父会话的子窗格停留在 Shell 并显示原因。
 旧会话没有托管恢复记录时仍按普通 provider resume 恢复，旧 Teams 子窗格降级为
 独立会话。Shell 手动启动的 Codex 和其他 provider 保持原来的恢复策略。
-权限标签统一显示普通交互、自动审查或危险全权限，与运行中、等待等任务状态分开。
+默认交互模式不显示权限标签，仅为其他模式显示“自动审查”或“完全访问”，与运行中、
+等待等任务状态分开。CLI 参数与会话中的 `interactive`、`unattended`、`full-access`
+值保持不变。
 托管模式以服务端核验结果为准；Shell 模式由进程识别，均不把权限模式当作运行状态。
 设计与验证说明见 [Codex 托管恢复设计](docs/rust-libghostty-vt-winit-wgpu-terminal-design.md)。
 
@@ -452,6 +484,11 @@ items = ["sidebar", "notifications"]
 bell-notifications = "background"
 bell-debounce-ms = 1000
 ```
+
+Codex、Claude 等 TUI 开启鼠标协议时，滚轮、悬停和鼠标按钮优先发送给应用；
+按住 Shift 可使用终端本地选择、滚动、右键菜单和中键粘贴。
+`Ctrl+F` / `Ctrl+G` 默认透传给应用，自定义 `[keybindings]` 仍优先。
+功能键、增强键盘的按下/重复/释放及焦点通知按终端协议处理。
 
 此响铃策略仅适用于终端 BEL 字符。权限请求、完成和错误的显式 Agent 与 OSC 通知
 不会被抑制。

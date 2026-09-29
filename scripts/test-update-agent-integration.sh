@@ -12,9 +12,10 @@ test_home="$(mktemp -d)"
 trap 'rm -rf -- "$test_home"' EXIT
 export HOME="$test_home/home"
 export CLAUDE_CONFIG_DIR="$test_home/claude-config"
-mkdir -p "$HOME/.codex" "$CLAUDE_CONFIG_DIR"
+test_codex_home="$test_home/codex config"
+mkdir -p "$HOME" "$test_codex_home" "$CLAUDE_CONFIG_DIR"
 
-cat >"$HOME/.codex/hooks.json" <<'JSON'
+cat >"$test_codex_home/hooks.json" <<'JSON'
 {
   "theme": "keep-codex",
   "hooks": {
@@ -45,33 +46,35 @@ cat >"$CLAUDE_CONFIG_DIR/settings.json" <<'JSON'
 }
 JSON
 
-"$project_root/scripts/update-agent-integration.sh" "$wmcterm_binary"
+env CODEX_HOME="$test_codex_home" "$project_root/scripts/update-agent-integration.sh" "$wmcterm_binary"
 first_digest="$(sha256sum \
-    "$HOME/.codex/hooks.json" \
+    "$test_codex_home/hooks.json" \
     "$CLAUDE_CONFIG_DIR/settings.json" \
     "$HOME/.agents/skills/wmcterm/SKILL.md" \
-    "$HOME/.codex/skills/wmcterm/SKILL.md" \
+    "$test_codex_home/skills/wmcterm/SKILL.md" \
     "$CLAUDE_CONFIG_DIR/skills/wmcterm/SKILL.md")"
-"$project_root/scripts/update-agent-integration.sh" "$wmcterm_binary"
+env CODEX_HOME="$test_codex_home" "$project_root/scripts/update-agent-integration.sh" "$wmcterm_binary"
 second_digest="$(sha256sum \
-    "$HOME/.codex/hooks.json" \
+    "$test_codex_home/hooks.json" \
     "$CLAUDE_CONFIG_DIR/settings.json" \
     "$HOME/.agents/skills/wmcterm/SKILL.md" \
-    "$HOME/.codex/skills/wmcterm/SKILL.md" \
+    "$test_codex_home/skills/wmcterm/SKILL.md" \
     "$CLAUDE_CONFIG_DIR/skills/wmcterm/SKILL.md")"
 if [ "$first_digest" != "$second_digest" ]; then
     echo "Agent integration update was not idempotent" >&2
     exit 1
 fi
 
-python3 - "$HOME" "$CLAUDE_CONFIG_DIR" <<'PY'
+python3 - "$HOME" "$CLAUDE_CONFIG_DIR" "$test_codex_home" <<'PY'
 import json
 import pathlib
 import sys
 
 home = pathlib.Path(sys.argv[1])
 claude = pathlib.Path(sys.argv[2])
-codex_hooks = json.loads((home / ".codex/hooks.json").read_text(encoding="utf-8"))
+codex = pathlib.Path(sys.argv[3])
+assert not (home / ".codex").exists(), "custom CODEX_HOME must not modify ~/.codex"
+codex_hooks = json.loads((codex / "hooks.json").read_text(encoding="utf-8"))
 claude_settings = json.loads((claude / "settings.json").read_text(encoding="utf-8"))
 
 assert codex_hooks["theme"] == "keep-codex"
@@ -108,7 +111,7 @@ assert "--event StopFailure" in failure_receivers[0]
 
 skill_paths = (
     home / ".agents/skills/wmcterm/SKILL.md",
-    home / ".codex/skills/wmcterm/SKILL.md",
+    codex / "skills/wmcterm/SKILL.md",
     claude / "skills/wmcterm/SKILL.md",
 )
 skill_contents = [path.read_text(encoding="utf-8") for path in skill_paths]

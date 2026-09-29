@@ -557,8 +557,6 @@ fn canonical_action(action: &str) -> Option<&'static str> {
         "surface.close" => "surface.close",
         "agent.claude" => "agent.claude",
         "agent.codex" => "agent.codex",
-        "agent.gemini" => "agent.gemini",
-        "agent.opencode" => "agent.opencode",
         "pane.close" => "pane.close",
         "pane.zoom" => "pane.zoom",
         "terminal.find" => "terminal.find",
@@ -1103,6 +1101,12 @@ mod tests {
 
     #[test]
     fn shortcut_normalizes_aliases_and_resolves_legacy_actions() {
+        for action in ["agent.gemini", "agent.opencode"] {
+            assert!(
+                ResolvedKeybindings::parse(&HashMap::from([("ctrl+g".into(), action.into())]))
+                    .is_err()
+            );
+        }
         let shortcut: Shortcut = "Shift+Control+Return".parse().unwrap();
         assert_eq!(shortcut.to_string(), "ctrl+shift+enter");
         let bindings = Config::default().resolved_keybindings().unwrap();

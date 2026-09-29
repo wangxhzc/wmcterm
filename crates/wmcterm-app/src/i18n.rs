@@ -455,19 +455,11 @@ impl Language {
         }
     }
 
-    pub(crate) const fn interactive(self) -> &'static str {
-        if self.is_chinese() {
-            "普通交互"
-        } else {
-            "interactive"
-        }
-    }
-
     pub(crate) const fn full_access(self) -> &'static str {
         if self.is_chinese() {
-            "危险全权限"
+            "完全访问"
         } else {
-            "dangerous full access"
+            "full access"
         }
     }
 
@@ -604,12 +596,10 @@ impl Language {
             "surface.filter_logs" => "筛选当前日志",
             "agent.claude" => "新建 Claude Code",
             "agent.codex" => "新建 Codex",
-            "agent.claude.unattended" => "新建 Claude Code（无人值守）",
-            "agent.codex.unattended" => "新建 Codex（无人值守）",
+            "agent.claude.unattended" => "新建 Claude Code（自动审查）",
+            "agent.codex.unattended" => "新建 Codex（自动审查）",
             "agent.claude.full_access" => "新建 Claude Code（完全访问…）",
             "agent.codex.full_access" => "新建 Codex（完全访问…）",
-            "agent.gemini" => "新建 Gemini CLI",
-            "agent.opencode" => "新建 OpenCode",
             "pane.close" => "关闭分区",
             "pane.zoom" => "切换分区缩放",
             "terminal.find" => "在终端中查找",

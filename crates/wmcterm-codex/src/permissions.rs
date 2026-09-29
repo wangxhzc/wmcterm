@@ -260,6 +260,7 @@ pub(super) fn control(
 
 pub(super) struct PermissionProxy {
     pub endpoint: String,
+    pub token: String,
     stop: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     config: BridgeConfig,
@@ -269,8 +270,8 @@ impl PermissionProxy {
     pub fn start(config: BridgeConfig, permissions: CodexPermissions) -> Result<Self, BridgeError> {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
-        let token = format!("/{}", uuid::Uuid::new_v4());
-        let endpoint = format!("ws://{}{token}", listener.local_addr()?);
+        let token = uuid::Uuid::new_v4().to_string();
+        let endpoint = format!("ws://{}", listener.local_addr()?);
         control(
             &config,
             "agent.codex.register",
@@ -282,6 +283,7 @@ impl PermissionProxy {
         let stop = Arc::new(AtomicBool::new(false));
         let worker_stop = Arc::clone(&stop);
         let worker_config = config.clone();
+        let worker_token = token.clone();
         let worker = std::thread::Builder::new()
             .name("wmcterm-codex-permissions".into())
             .spawn(move || {
@@ -299,7 +301,7 @@ impl PermissionProxy {
                         Ok((stream, _)) if clients.len() < 16 => {
                             let config = worker_config.clone();
                             let permissions = permissions.clone();
-                            let token = token.clone();
+                            let token = worker_token.clone();
                             let stop = Arc::clone(&worker_stop);
                             match std::thread::Builder::new()
                                 .name("wmcterm-codex-client".into())
@@ -327,6 +329,7 @@ impl PermissionProxy {
             })?;
         Ok(Self {
             endpoint,
+            token,
             stop,
             worker: Some(worker),
             config,
@@ -362,7 +365,14 @@ fn relay(
     let mut client = tungstenite::accept_hdr(
         stream,
         |request: &tungstenite::handshake::server::Request, response| {
-            if request.uri().path() == token {
+            if request.uri().path() == "/"
+                && request.uri().query().is_none()
+                && request
+                    .headers()
+                    .get("authorization")
+                    .and_then(|value| value.to_str().ok())
+                    == Some(format!("Bearer {token}").as_str())
+            {
                 Ok(response)
             } else {
                 Err(tungstenite::http::Response::builder()
@@ -397,13 +407,23 @@ fn relay(
                         permissions.apply(&mut request)?;
                         pending.insert(request["id"].to_string());
                     }
-                    Some("turn/start" | "turn/steer")
-                        if !verified.contains_key(
-                            request["params"]["threadId"].as_str().unwrap_or_default(),
-                        ) =>
+                    Some(
+                        "turn/start"
+                        | "turn/steer"
+                        | "thread/settings/update"
+                        | "turn/settings/update",
+                    ) if !verified.contains_key(
+                        request["params"]["threadId"].as_str().unwrap_or_default(),
+                    ) =>
                     {
                         client.send(Message::Text(json!({"id": request["id"], "error": {"code": -32000, "message": "Thread permissions have not been verified; resume the thread first"}}).to_string().into()))?;
                         continue;
+                    }
+                    Some("thread/settings/update" | "turn/settings/update") => {
+                        if let Err(error) = validate_settings_update(&request) {
+                            client.send(Message::Text(json!({"id": request["id"], "error": {"code": -32602, "message": error}}).to_string().into()))?;
+                            continue;
+                        }
                     }
                     Some("turn/start") => {
                         let sandbox = verified
@@ -465,16 +485,82 @@ fn relay(
     Ok(())
 }
 
+fn validate_settings_update(request: &Value) -> Result<(), &'static str> {
+    let params = request["params"]
+        .as_object()
+        .ok_or("Settings update requires object params")?;
+    // The launch profile owns permissions for the lifetime of this proxy.
+    // Changing cwd also invalidates its cached workspace sandbox roots.
+    if [
+        "approvalPolicy",
+        "approvalsReviewer",
+        "sandboxPolicy",
+        "permissions",
+        "cwd",
+    ]
+    .iter()
+    .any(|field| params.get(*field).is_some_and(|value| !value.is_null()))
+    {
+        return Err(
+            "Managed Codex permissions and cwd are fixed at launch; restart through wmcterm with the desired mode and workspace",
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn proxy_rejects_missing_wrong_and_path_tokens_before_upstream_connection() {
+        use tungstenite::client::IntoClientRequest;
+        for (path, authorization) in [
+            ("/", None),
+            ("/", Some("Bearer wrong-token")),
+            ("/test-token", None),
+            ("/?token=test-token", Some("Bearer test-token")),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let endpoint = format!("ws://{}{path}", listener.local_addr().unwrap());
+            let config = BridgeConfig {
+                endpoint: "ws://127.0.0.1:1".into(),
+                control_socket: PathBuf::new(),
+                workspace_id: "workspace".into(),
+                root_surface_id: "surface".into(),
+                codex_program: "codex".into(),
+                workspace_cwd: std::env::temp_dir(),
+                max_auto_depth: 2,
+            };
+            let worker = std::thread::spawn(move || {
+                relay(
+                    listener.accept().unwrap().0,
+                    "test-token",
+                    &config,
+                    &CodexPermissions::extract(&[]).unwrap().0,
+                    &AtomicBool::new(false),
+                )
+            });
+            let mut request = endpoint.into_client_request().unwrap();
+            if let Some(value) = authorization {
+                request
+                    .headers_mut()
+                    .insert("authorization", value.parse().unwrap());
+            }
+            match connect(request).unwrap_err() {
+                tungstenite::Error::Http(response) => assert_eq!(response.status(), 403),
+                error => panic!("unexpected handshake error: {error}"),
+            }
+            assert!(worker.join().unwrap().is_err());
+        }
+    }
 
     #[test]
     fn proxy_verifies_resumes_and_blocks_turns_until_permissions_match() {
         for mismatch in [false, true] {
             let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let endpoint = format!("ws://{}/test-token", listener.local_addr().unwrap());
+            let endpoint = format!("ws://{}", listener.local_addr().unwrap());
             let socket_path = std::env::temp_dir()
                 .join(format!("wmcterm-permission-{}.sock", uuid::Uuid::new_v4()));
             let ready_count = Arc::new(AtomicU64::new(0));
@@ -516,6 +602,22 @@ mod tests {
                 }}).to_string().into())).unwrap();
                     if !mismatch {
                         let Message::Text(text) = socket.read().unwrap() else {
+                            panic!("expected ordinary settings update")
+                        };
+                        let settings: Value = serde_json::from_str(&text).unwrap();
+                        assert_eq!(settings["method"], "thread/settings/update");
+                        assert_eq!(
+                            settings["params"],
+                            json!({"threadId": "thread", "model": "test-model"})
+                        );
+                        socket
+                            .send(Message::Text(
+                                json!({"id": settings["id"], "result": {}})
+                                    .to_string()
+                                    .into(),
+                            ))
+                            .unwrap();
+                        let Message::Text(text) = socket.read().unwrap() else {
                             panic!("expected turn")
                         };
                         let turn: Value = serde_json::from_str(&text).unwrap();
@@ -539,13 +641,18 @@ mod tests {
                     .0;
                 relay(
                     listener.accept().unwrap().0,
-                    "/test-token",
+                    "test-token",
                     &config,
                     &permissions,
                     &relay_stop,
                 )
             });
-            let (mut client, _) = connect(&endpoint).unwrap();
+            use tungstenite::client::IntoClientRequest;
+            let mut request = endpoint.into_client_request().unwrap();
+            request
+                .headers_mut()
+                .insert("authorization", "Bearer test-token".parse().unwrap());
+            let (mut client, _) = connect(request).unwrap();
             send_json(
                 &mut client,
                 &json!({"id": 1, "method": "turn/start", "params": {"threadId": "thread"}}),
@@ -562,6 +669,32 @@ mod tests {
             let response = read_json(&mut client).unwrap().unwrap();
             assert_eq!(response.get("error").is_some(), mismatch);
             if !mismatch {
+                for method in ["thread/settings/update", "turn/settings/update"] {
+                    for (field, value) in [
+                        ("approvalPolicy", json!("never")),
+                        ("approvalsReviewer", json!("user")),
+                        ("sandboxPolicy", json!({"type": "dangerFullAccess"})),
+                        ("permissions", json!("full-access")),
+                        ("cwd", json!("/other-workspace")),
+                    ] {
+                        let mut request = json!({"id": 10, "method": method, "params": {"threadId": "thread", "turnId": "turn"}});
+                        request["params"][field] = value;
+                        send_json(&mut client, &request).unwrap();
+                        let rejected = read_json(&mut client).unwrap().unwrap();
+                        assert_eq!(rejected["id"], 10);
+                        assert_eq!(rejected["error"]["code"], -32602);
+                    }
+                    send_json(&mut client, &json!({"id": 11, "method": method, "params": {"threadId": "unverified", "model": "test-model"}})).unwrap();
+                    assert_eq!(
+                        read_json(&mut client).unwrap().unwrap()["error"]["code"],
+                        -32000
+                    );
+                }
+                send_json(&mut client, &json!({"id": 12, "method": "thread/settings/update", "params": {"threadId": "thread", "model": "test-model"}})).unwrap();
+                assert_eq!(
+                    read_json(&mut client).unwrap().unwrap()["result"],
+                    json!({})
+                );
                 send_json(&mut client, &json!({"id": 3, "method": "turn/start", "params": {"threadId": "thread", "sandboxPolicy": {"type": "dangerFullAccess"}}})).unwrap();
                 assert_eq!(
                     read_json(&mut client).unwrap().unwrap()["result"]["ok"],
@@ -576,6 +709,21 @@ mod tests {
             }
             provider.join().unwrap();
             assert_eq!(ready_count.load(Ordering::Relaxed), u64::from(!mismatch));
+        }
+    }
+
+    #[test]
+    fn settings_updates_allow_nullable_noops_and_ordinary_turn_settings() {
+        for method in ["thread/settings/update", "turn/settings/update"] {
+            assert!(
+                validate_settings_update(&json!({"method": method, "params": {
+                    "threadId": "thread", "turnId": "turn", "model": "test", "effort": "high",
+                    "approvalPolicy": null, "approvalsReviewer": null,
+                    "sandboxPolicy": null, "permissions": null, "cwd": null
+                }}))
+                .is_ok()
+            );
+            assert!(validate_settings_update(&json!({"method": method, "params": []})).is_err());
         }
     }
 

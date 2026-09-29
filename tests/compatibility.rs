@@ -123,6 +123,7 @@ printf '\r\nKITTY-ROUNDTRIP-OK'
                 ..KeyModifiers::default()
             },
             repeat: false,
+            unshifted_codepoint: None,
         }))
         .unwrap();
     assert!(wait_for_text(&session, "KITTY-ROUNDTRIP-OK"));

@@ -1,5 +1,8 @@
+#[cfg(test)]
+mod claude_regression;
 mod codex_restore;
 mod i18n;
+mod session_start_guard;
 mod system_proxy;
 mod text_edit;
 mod ui;
@@ -23,6 +26,7 @@ use winit::dpi::{LogicalPosition, LogicalSize, PhysicalPosition, PhysicalSize};
 use winit::event::{ElementState, Ime, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
+use winit::platform::modifier_supplement::KeyEventExtModifierSupplement;
 #[cfg(target_os = "linux")]
 use winit::platform::startup_notify::{
     EventLoopExtStartupNotify, WindowAttributesExtStartupNotify, reset_activation_token_env,
@@ -38,11 +42,10 @@ use wmcterm_config::{
     ThemeConfig,
 };
 use wmcterm_core::{
-    Action, ActionRegistry, AgentActionRequest, AgentKindId, AgentLaunchInfo, AgentLifecycleEvent,
-    AgentLifecyclePhase, AgentRequestKind, AgentRunMode, AgentSession, AgentSessionEvent,
-    AgentSessionEventKind, AgentTelemetry, AppCommand, AppState, AttentionState, Notification,
-    Pane, PaneCommand, PaneId, PaneNode, SplitAxis, SurfaceId, SurfaceKind, TerminalId,
-    WorkspaceCommand, WorkspaceId,
+    Action, ActionRegistry, AgentKindId, AgentLaunchInfo, AgentLifecycleEvent, AgentLifecyclePhase,
+    AgentRequestKind, AgentRunMode, AgentSession, AgentSessionEvent, AgentSessionEventKind,
+    AgentTelemetry, AppCommand, AppState, AttentionState, Notification, Pane, PaneCommand, PaneId,
+    PaneNode, SplitAxis, SurfaceId, SurfaceKind, TerminalId, WorkspaceCommand, WorkspaceId,
 };
 use wmcterm_ipc::{
     AgentInteractionRequest, AgentRequestKind as IpcAgentRequestKind, AgentResolution,
@@ -1133,7 +1136,9 @@ struct WmctermApplication {
     scrollbar_drag: Option<ScrollbarDrag>,
     mouse_pressed: bool,
     text_edit_drag: Option<TextEditTarget>,
-    terminal_mouse_capture: Option<(PaneId, TerminalId)>,
+    terminal_mouse_capture: Option<(PaneId, TerminalId, MouseButtonInput)>,
+    terminal_key_presses: HashMap<PhysicalKey, (TerminalId, KeyInput)>,
+    input_focus_terminal: Option<TerminalId>,
     search_visible: bool,
     search_editor: TextEditor,
     search_result: Option<SearchResult>,
@@ -1163,6 +1168,7 @@ struct WmctermApplication {
     terminal_notices: HashMap<TerminalId, TerminalNotice>,
     terminal_processes: HashMap<TerminalId, Vec<String>>,
     foreground_agents: HashMap<TerminalId, (AgentKind, AgentRunMode)>,
+    claude_hook_modes: HashMap<TerminalId, (String, String, AgentRunMode)>,
     automatic_agent_status: HashSet<TerminalId>,
     foreground_agent_input: HashMap<TerminalId, String>,
     scene_dirty: bool,
@@ -1176,8 +1182,11 @@ struct WmctermApplication {
     window_focus_gained_at: std::time::Instant,
     last_bell_notifications: HashMap<TerminalId, std::time::Instant>,
     agent_sessions: HashMap<SurfaceId, AgentSession>,
+    session_start_guards: HashMap<TerminalId, session_start_guard::SessionStartGuard>,
+    last_hook_delivery: HashMap<TerminalId, Value>,
     pending_agent_requests: PendingAgentRequests,
     agent_approval_results: HashMap<String, AgentApprovalAction>,
+    agent_approval_bindings: HashMap<String, (SurfaceId, String, Option<u64>)>,
     agent_approval_result_order: VecDeque<String>,
     claude_subagents: HashMap<String, ClaudeSubagentStatus>,
     codex_subagents: CodexSubagentTracker,
@@ -1343,6 +1352,8 @@ impl WmctermApplication {
             mouse_pressed: false,
             text_edit_drag: None,
             terminal_mouse_capture: None,
+            terminal_key_presses: HashMap::new(),
+            input_focus_terminal: None,
             search_visible: false,
             search_editor: TextEditor::default(),
             search_result: None,
@@ -1372,6 +1383,7 @@ impl WmctermApplication {
             terminal_notices: HashMap::new(),
             terminal_processes: HashMap::new(),
             foreground_agents: HashMap::new(),
+            claude_hook_modes: HashMap::new(),
             automatic_agent_status: HashSet::new(),
             foreground_agent_input: HashMap::new(),
             scene_dirty: true,
@@ -1385,9 +1397,12 @@ impl WmctermApplication {
             window_focus_gained_at: std::time::Instant::now(),
             last_bell_notifications: HashMap::new(),
             agent_sessions: restored_agent_sessions,
+            session_start_guards: HashMap::new(),
+            last_hook_delivery: HashMap::new(),
             pending_agent_requests: PendingAgentRequests::new(256)
                 .expect("pending Agent request capacity is non-zero"),
             agent_approval_results: HashMap::new(),
+            agent_approval_bindings: HashMap::new(),
             agent_approval_result_order: VecDeque::new(),
             claude_subagents: HashMap::new(),
             codex_subagents: CodexSubagentTracker::default(),
@@ -1596,6 +1611,20 @@ impl WmctermApplication {
         self.terminal_processes.remove(&id);
         self.last_bell_notifications.remove(&id);
         self.foreground_agents.remove(&id);
+        self.claude_hook_modes.remove(&id);
+        self.session_start_guards.remove(&id);
+        self.last_hook_delivery.remove(&id);
+        self.terminal_key_presses
+            .retain(|_, (terminal, _)| *terminal != id);
+        if self.input_focus_terminal == Some(id) {
+            self.input_focus_terminal = None;
+        }
+        if self
+            .terminal_mouse_capture
+            .is_some_and(|(_, terminal, _)| terminal == id)
+        {
+            self.terminal_mouse_capture = None;
+        }
         self.automatic_agent_status.remove(&id);
         spawn_event_bridge(
             id,
@@ -1615,6 +1644,9 @@ impl WmctermApplication {
                     cells: vec![],
                     cursor: None,
                     mouse_tracking: false,
+                    keyboard_flags: 0,
+                    focus_reporting: false,
+                    bracketed_paste: false,
                     scrollback_rows: 0,
                     viewport_offset: 0,
                     screen_row_origin: 0,
@@ -2046,14 +2078,19 @@ impl WmctermApplication {
         terminal: TerminalId,
         event: AgentEvent,
     ) -> wmcterm_core::AgentState {
-        self.automatic_agent_status.remove(&terminal);
-        let run_mode = self
+        if !matches!(event, AgentEvent::Notification { .. }) {
+            self.automatic_agent_status.remove(&terminal);
+        }
+        let metadata = self
             .surface_for_terminal(terminal)
             .and_then(|surface| self.state.surfaces.get(&surface))
-            .and_then(|surface| surface.agent.as_ref())
+            .and_then(|surface| surface.agent.as_ref());
+        // Only Codex's automatic reviewer suppresses permission-wait telemetry.
+        let transition_mode = metadata
+            .filter(|agent| agent.name.eq_ignore_ascii_case("codex"))
             .map(|agent| agent.run_mode)
             .unwrap_or_default();
-        let transition = agent_transition_for_run_mode(&event, run_mode);
+        let transition = agent_transition_for_run_mode(&event, transition_mode);
         let suppress_notification = non_actionable_agent_exit(&event);
         let announced = match &event {
             AgentEvent::SessionStart { agent, session_id } => {
@@ -2061,6 +2098,7 @@ impl WmctermApplication {
             }
             _ => None,
         };
+        let mut observed_state = wmcterm_core::AgentState::Idle;
         if let Some(surface) = self
             .state
             .surfaces
@@ -2079,13 +2117,22 @@ impl WmctermApplication {
                     .map(|agent| (agent.name.clone(), agent.session_id.clone()))
                     .unwrap_or_else(|| ("agent".into(), None))
             });
+            observed_state = transition.state.unwrap_or_else(|| {
+                surface
+                    .agent
+                    .as_ref()
+                    .map(|agent| agent.state)
+                    .unwrap_or_default()
+            });
             surface.agent = Some(wmcterm_core::AgentMetadata {
                 name,
-                state: transition.state,
+                state: observed_state,
                 session_id,
                 run_mode,
             });
-            surface.attention = transition.attention;
+            if transition.state.is_some() {
+                surface.attention = transition.attention;
+            }
         }
         if let Some(message) = transition.notification
             && !suppress_notification
@@ -2098,7 +2145,7 @@ impl WmctermApplication {
         if let Some(surface) = self.surface_for_terminal(terminal) {
             self.sync_surface_agent_request_state(surface);
         }
-        transition.state
+        observed_state
     }
 
     fn record_agent_event(
@@ -2108,6 +2155,30 @@ impl WmctermApplication {
         event: &AgentEvent,
     ) -> Result<bool, String> {
         let (surface, effective_lifecycle) = self.validate_agent_event_route(terminal, params)?;
+        let mut start_guard = None;
+        if let AgentEvent::SessionStart {
+            agent,
+            session_id: Some(id),
+        } = event
+        {
+            let mut guard = self
+                .session_start_guards
+                .get(&terminal)
+                .cloned()
+                .unwrap_or_default();
+            let emitted = params
+                .get("hook_started_at_unix_ns")
+                .map(|value| {
+                    value
+                        .as_u64()
+                        .ok_or_else(|| "invalid hook timestamp".to_owned())
+                })
+                .transpose()?;
+            if !guard.observe(&format!("{agent}:{id}"), emitted)? {
+                return Ok(false);
+            }
+            start_guard = Some(guard);
+        }
         let sequence = params.get("sequence").and_then(Value::as_u64);
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2125,7 +2196,9 @@ impl WmctermApplication {
             _ => "agent".into(),
         };
         let must_start = session.lifecycle.phase != AgentLifecyclePhase::Running
-            || session.lifecycle.external_id.as_deref() != Some(effective_lifecycle.as_str());
+            || session.lifecycle.external_id.as_deref() != Some(effective_lifecycle.as_str())
+            || matches!(event, AgentEvent::SessionStart { session_id: Some(id), .. }
+                if session.session_id.as_ref() != Some(id));
         if must_start {
             let generation = session
                 .next_lifecycle_generation()
@@ -2164,6 +2237,36 @@ impl WmctermApplication {
                 .map_err(|error| error.to_string())?;
         }
         if matches!(event, AgentEvent::SessionStart { .. }) {
+            if let (
+                Some(sequence),
+                AgentEvent::SessionStart {
+                    session_id: Some(id),
+                    ..
+                },
+            ) = (sequence, event)
+            {
+                let outcome = session
+                    .apply_event(&AgentSessionEvent {
+                        event_id: format!(
+                            "{effective_lifecycle}:start:{}:{sequence}",
+                            session.lifecycle.generation
+                        ),
+                        lifecycle_generation: session.lifecycle.generation,
+                        lifecycle_id: Some(effective_lifecycle.clone()),
+                        sequence: Some(sequence),
+                        occurred_at_unix_ms: now,
+                        kind: AgentSessionEventKind::Telemetry(AgentTelemetry::SessionObserved {
+                            session_id: id.clone(),
+                        }),
+                    })
+                    .map_err(|error| error.to_string())?;
+                if !matches!(
+                    outcome,
+                    wmcterm_core::AgentEventApplyOutcome::Applied { .. }
+                ) {
+                    return Ok(false);
+                }
+            }
             if let AgentEvent::SessionStart {
                 agent,
                 session_id: Some(session_id),
@@ -2176,6 +2279,27 @@ impl WmctermApplication {
                     session_id,
                 );
             }
+            if let Some(guard) = start_guard {
+                self.session_start_guards.insert(terminal, guard);
+            }
+            if must_start {
+                for request in self
+                    .pending_agent_request_list()
+                    .into_iter()
+                    .filter(|request| request.surface_id == surface.to_string())
+                {
+                    let _ = self.pending_agent_requests.cancel(
+                        &request.request_id,
+                        "Agent session replaced",
+                        now,
+                    );
+                    self.remember_agent_approval_result(
+                        request.request_id.clone(),
+                        AgentApprovalAction::Deny,
+                    );
+                    self.conclude_agent_request_state(&request);
+                }
+            }
             return Ok(true);
         }
         let generation = session.lifecycle.generation;
@@ -2187,6 +2311,7 @@ impl WmctermApplication {
             .surfaces
             .get(&surface)
             .and_then(|surface| surface.agent.as_ref())
+            .filter(|agent| agent.name.eq_ignore_ascii_case("codex"))
             .map(|agent| agent.run_mode)
             .unwrap_or_default();
         let kind = agent_session_event_kind(event, &suffix, run_mode)
@@ -2350,6 +2475,51 @@ impl WmctermApplication {
     ) -> Result<(), String> {
         let surface = self.validate_claude_hook(terminal, hook)?;
         apply_claude_subagent_status(&mut self.claude_subagents, surface, hook);
+        if hook.kind == ClaudeHookKind::SessionEnd {
+            self.claude_hook_modes.remove(&terminal);
+        } else if hook.agent_id.is_none() {
+            if hook.kind == ClaudeHookKind::SessionStart {
+                self.claude_hook_modes.remove(&terminal);
+                if hook.run_mode().is_none() {
+                    let mode = self
+                        .terminal_processes
+                        .get(&terminal)
+                        .and_then(|commands| {
+                            commands.iter().find(|command| {
+                                AgentKind::from_process_command(command) == Some(AgentKind::Claude)
+                            })
+                        })
+                        .map(|command| AgentKind::Claude.run_mode_from_process_command(command))
+                        .unwrap_or_default();
+                    if let Some(metadata) = self
+                        .state
+                        .surfaces
+                        .get_mut(&surface)
+                        .and_then(|surface| surface.agent.as_mut())
+                    {
+                        metadata.run_mode = mode;
+                    }
+                }
+            }
+            if let Some(mode) = hook.run_mode() {
+                self.claude_hook_modes.insert(
+                    terminal,
+                    (
+                        self.terminals[&terminal].lifecycle_id.clone(),
+                        hook.session_id.clone(),
+                        mode,
+                    ),
+                );
+                if let Some(metadata) = self
+                    .state
+                    .surfaces
+                    .get_mut(&surface)
+                    .and_then(|surface| surface.agent.as_mut())
+                {
+                    metadata.run_mode = mode;
+                }
+            }
+        }
         Ok(())
     }
 
@@ -2543,6 +2713,21 @@ impl WmctermApplication {
     }
 
     fn update_foreground_agent(&mut self, terminal: TerminalId, commands: &[String]) -> bool {
+        self.claude_hook_modes.retain(|id, (lifecycle, _, _)| {
+            self.terminals
+                .get(id)
+                .is_some_and(|runtime| runtime.lifecycle_id == *lifecycle)
+        });
+        let hook_mode = self
+            .claude_hook_modes
+            .get(&terminal)
+            .and_then(|(_, session, mode)| {
+                self.surface_for_terminal(terminal)
+                    .and_then(|surface| self.state.surfaces.get(&surface))
+                    .and_then(|surface| surface.agent.as_ref())
+                    .filter(|metadata| metadata.session_id.as_ref() == Some(session))
+                    .map(|_| *mode)
+            });
         let detected = commands.iter().find_map(|command| {
             AgentKind::from_process_command(command).map(|agent| {
                 (
@@ -2551,6 +2736,7 @@ impl WmctermApplication {
                         .get(&terminal)
                         .filter(|_| agent == AgentKind::Codex)
                         .map(|codex| codex.saved.mode)
+                        .or_else(|| (agent == AgentKind::Claude).then_some(hook_mode).flatten())
                         .unwrap_or_else(|| agent.run_mode_from_process_command(command)),
                 )
             })
@@ -2738,7 +2924,15 @@ impl WmctermApplication {
         ) {
             self.physical_alt_pressed = event.state == ElementState::Pressed;
         }
-        if self.should_quarantine_focus_input() || event.state != ElementState::Pressed {
+        if event.state == ElementState::Released {
+            if let Some((terminal, input)) = self.terminal_key_presses.remove(&event.physical_key)
+                && let Some(runtime) = self.terminals.get(&terminal)
+            {
+                let _ = runtime.session.send(SessionCommand::KeyRelease(input));
+            }
+            return;
+        }
+        if self.should_quarantine_focus_input() {
             return;
         }
         self.reset_cursor_blink();
@@ -3280,14 +3474,6 @@ impl WmctermApplication {
             return;
         }
         if self.config.ui.legacy_shortcuts {
-            if matches!(event.logical_key, Key::Named(NamedKey::F2))
-                && !self.modifiers.control_key()
-                && !self.modifiers.alt_key()
-                && !self.modifiers.super_key()
-            {
-                self.open_workspace_prompt(PromptKind::RenameWorkspace);
-                return;
-            }
             if self.modifiers.control_key() && self.modifiers.shift_key() {
                 match physical_ascii_character(event.physical_key) {
                     Some('d') => {
@@ -3383,14 +3569,18 @@ impl WmctermApplication {
             }
             if self.modifiers.control_key() && !self.modifiers.shift_key() {
                 match &event.logical_key {
-                    Key::Character(value) if value.eq_ignore_ascii_case("f") => {
+                    Key::Character(value)
+                        if value.eq_ignore_ascii_case("f") && self.modifiers.alt_key() =>
+                    {
                         self.search_visible = true;
                         self.search_editor = TextEditor::default();
                         self.search_result = None;
                         self.rebuild_scene();
                         return;
                     }
-                    Key::Character(value) if value.eq_ignore_ascii_case("g") => {
+                    Key::Character(value)
+                        if value.eq_ignore_ascii_case("g") && self.modifiers.alt_key() =>
+                    {
                         if !self.search_editor.text().is_empty() {
                             self.search_active(1);
                         }
@@ -3458,17 +3648,17 @@ impl WmctermApplication {
         if let (Some(id), Some(key)) = (self.active_terminal_id(), key) {
             let notifications_changed = self.mark_terminal_notifications_read(id);
             let control_c = is_agent_interrupt(event.physical_key, self.modifiers);
-            if control_c && self.foreground_agents.contains_key(&id) {
+            let infer_status = self
+                .surface_for_terminal(id)
+                .is_none_or(|surface| !self.agent_sessions.contains_key(&surface))
+                || self.automatic_agent_status.contains(&id);
+            if control_c && infer_status && self.foreground_agents.contains_key(&id) {
                 self.foreground_agent_input.remove(&id);
                 self.mark_foreground_agent_idle(id);
                 self.rebuild_scene();
-            } else if matches!(key, InputKey::Enter)
-                && !self.modifiers.control_key()
-                && !self.modifiers.alt_key()
-                && !self.modifiers.super_key()
-            {
+            } else if agent_submission_key(key, self.modifiers) {
                 let input = self.foreground_agent_input.remove(&id).unwrap_or_default();
-                if agent_submission_starts_turn(&input) {
+                if infer_status && agent_submission_starts_turn(&input) {
                     self.mark_foreground_agent_running(id);
                     self.rebuild_scene();
                 } else if notifications_changed {
@@ -3483,6 +3673,12 @@ impl WmctermApplication {
                 && !self.modifiers.super_key()
             {
                 match key {
+                    InputKey::Enter if self.modifiers.shift_key() => {
+                        self.foreground_agent_input
+                            .entry(id)
+                            .or_default()
+                            .push('\n');
+                    }
                     InputKey::Character(character) => {
                         self.foreground_agent_input
                             .entry(id)
@@ -3515,17 +3711,29 @@ impl WmctermApplication {
                     Key::Named(NamedKey::Space) => Some(" ".into()),
                     _ => physical_character.map(|character| character.to_string()),
                 });
+            let alt_graph_text = self.modifiers.control_key()
+                && self.modifiers.alt_key()
+                && event
+                    .text_with_all_modifiers()
+                    .is_some_and(|text| !text.is_empty() && !text.chars().any(char::is_control));
             let input = KeyInput {
                 key,
+                unshifted_codepoint: match event.key_without_modifiers() {
+                    Key::Character(text) => text.chars().next(),
+                    Key::Named(NamedKey::Space) => Some(' '),
+                    _ => None,
+                },
                 text,
                 modifiers: KeyModifiers {
                     shift: self.modifiers.shift_key(),
-                    alt: self.modifiers.alt_key(),
-                    control: self.modifiers.control_key(),
+                    alt: self.modifiers.alt_key() && !alt_graph_text,
+                    control: self.modifiers.control_key() && !alt_graph_text,
                     super_key: self.modifiers.super_key(),
                 },
                 repeat: event.repeat,
             };
+            self.terminal_key_presses
+                .insert(event.physical_key, (id, input.clone()));
             let _ = runtime.session.send(SessionCommand::Key(input));
         }
     }
@@ -3660,14 +3868,14 @@ impl WmctermApplication {
                 "surface.close" => "Ctrl+Shift+X",
                 "surface.new" => "Ctrl+Shift+T",
                 "workspace.new" => "Ctrl+Shift+A",
-                "workspace.rename" => "F2",
+                "workspace.rename" => "Ctrl+Shift+R",
                 "sidebar.toggle" => "Ctrl+Shift+B",
                 "notifications.toggle" => "Ctrl+Shift+N",
                 "notifications.latest_unread" => "Ctrl+Shift+U",
                 "surface.filter_logs" => "Ctrl+Shift+L",
                 "terminal.clear_scrollback" => "Ctrl+Shift+K",
                 "pane.zoom" => "Ctrl+Shift+Z",
-                "terminal.find" => "Ctrl+F",
+                "terminal.find" => "Ctrl+Alt+F",
                 "terminal.font_increase" => "Ctrl++",
                 "terminal.font_decrease" => "Ctrl+-",
                 "terminal.font_reset" => "Ctrl+0",
@@ -3727,12 +3935,6 @@ impl WmctermApplication {
             }
             "agent.codex.full_access" => {
                 self.open_full_access_prompt(ManagedAgent::Codex);
-            }
-            "agent.gemini" => {
-                self.new_surface_command(Some("gemini".into()));
-            }
-            "agent.opencode" => {
-                self.new_surface_command(Some("opencode".into()));
             }
             "pane.close" => self.close_active_pane(),
             "pane.zoom" => self.toggle_pane_zoom(),
@@ -4394,6 +4596,10 @@ impl WmctermApplication {
             action,
             512,
         );
+        self.agent_approval_bindings.retain(|id, _| {
+            self.agent_approval_results.contains_key(id)
+                || self.pending_agent_requests.get(id).ok().flatten().is_some()
+        });
     }
 
     fn notification_range(&self) -> std::ops::Range<usize> {
@@ -6751,7 +6957,9 @@ impl WmctermApplication {
         if !self.modifiers.shift_key()
             && self.send_terminal_mouse(MouseActionInput::Press, Some(MouseButtonInput::Left))
         {
-            self.terminal_mouse_capture = self.terminal_at_cursor();
+            self.terminal_mouse_capture = self
+                .terminal_at_cursor()
+                .map(|(pane, terminal)| (pane, terminal, MouseButtonInput::Left));
             self.selection = None;
             return;
         }
@@ -7874,11 +8082,8 @@ impl WmctermApplication {
         if self.update_workspace_drag() {
             return;
         }
-        if self.terminal_mouse_capture.is_some() {
-            self.send_captured_terminal_mouse(
-                MouseActionInput::Motion,
-                Some(MouseButtonInput::Left),
-            );
+        if let Some((_, _, button)) = self.terminal_mouse_capture {
+            self.send_captured_terminal_mouse(MouseActionInput::Motion, Some(button));
             return;
         }
         if let Some(drag) = self.split_drag.clone() {
@@ -8174,7 +8379,10 @@ impl WmctermApplication {
             self.rebuild_scene();
             return;
         }
-        if self.terminal_mouse_capture.is_some() {
+        if self
+            .terminal_mouse_capture
+            .is_some_and(|(_, _, button)| button == MouseButtonInput::Left)
+        {
             self.send_captured_terminal_mouse(
                 MouseActionInput::Release,
                 Some(MouseButtonInput::Left),
@@ -8393,7 +8601,7 @@ impl WmctermApplication {
         action: MouseActionInput,
         button: Option<MouseButtonInput>,
     ) {
-        let Some((pane, terminal)) = self.terminal_mouse_capture else {
+        let Some((pane, terminal, _)) = self.terminal_mouse_capture else {
             return;
         };
         let Some((_, rect)) = self.pane_rects().into_iter().find(|(id, _)| *id == pane) else {
@@ -8543,7 +8751,37 @@ impl WmctermApplication {
     }
 
     fn rebuild_scene(&mut self) {
+        self.session_start_guards
+            .retain(|terminal, _| self.terminals.contains_key(terminal));
+        self.last_hook_delivery
+            .retain(|terminal, _| self.terminals.contains_key(terminal));
+        let focused = self
+            .terminal_accepts_keyboard()
+            .then(|| self.active_terminal_id())
+            .flatten();
+        if focused != self.input_focus_terminal {
+            for (terminal, gained) in [(self.input_focus_terminal, false), (focused, true)] {
+                if let Some(runtime) = terminal.and_then(|id| self.terminals.get(&id)) {
+                    let _ = runtime.session.send(SessionCommand::Focus(gained));
+                }
+            }
+            self.input_focus_terminal = focused;
+        }
         self.scene_dirty = true;
+    }
+
+    fn terminal_accepts_keyboard(&self) -> bool {
+        self.window_focused
+            && !self.text_editor_active()
+            && self.agent_request_detail.is_none()
+            && self.close_confirmation.is_none()
+            && self.codex_trust_confirmation.is_none()
+            && self.tab_context_menu.is_none()
+            && self.workspace_context_menu.is_none()
+            && self.sidebar_context_menu.is_none()
+            && self.terminal_context_menu.is_none()
+            && self.notification_context_menu.is_none()
+            && self.tab_overflow_menu.is_none()
     }
 
     fn rebuild_scene_if_due(&mut self, now: std::time::Instant) -> bool {
@@ -8782,10 +9020,7 @@ impl WmctermApplication {
                     )
                 };
                 match self.workspace_agent_run_mode(row.index) {
-                    AgentRunMode::Interactive => {
-                        agent_state.push_str(" · ");
-                        agent_state.push_str(self.language.interactive());
-                    }
+                    AgentRunMode::Interactive => {}
                     AgentRunMode::Unattended => {
                         agent_state.push_str(" · ");
                         agent_state.push_str(self.language.unattended());
@@ -10366,7 +10601,7 @@ impl WmctermApplication {
                                 theme_hover
                             },
                         });
-                        let label = agent_approval_action_label(self.language, *action);
+                        let label = agent_approval_action_label(self.language, *action, request);
                         let font_size = 12.0;
                         let (label, left) =
                             ui::centered_truncated_text_left(*button, label, font_size);
@@ -11234,6 +11469,19 @@ impl WmctermApplication {
             ) {
                 return Err("Claude approval does not match the active Agent lifecycle".into());
             }
+            if surface
+                .agent
+                .as_ref()
+                .and_then(|agent| agent.session_id.as_deref())
+                != Some(thread_id)
+                || self
+                    .agent_sessions
+                    .get(&surface_id)
+                    .and_then(|session| session.session_id.as_deref())
+                    != Some(thread_id)
+            {
+                return Err("Claude approval does not match the active Agent session".into());
+            }
             Some(lifecycle_id.to_owned())
         } else {
             None
@@ -11260,20 +11508,30 @@ impl WmctermApplication {
         if !modes.contains(&"deny") || !modes.contains(&"once") {
             return Err("params.decisions must include `deny` and `once`".into());
         }
-        let approval_id = format!(
-            "approval:{source}:{surface_id}:{thread_id}:{turn_id}:{item_id}:{}",
-            jsonrpc_id
-        );
-        if let Some(result) = self.agent_approval_results.get(&approval_id).copied() {
-            return Ok(agent_approval_resolved_json(result));
-        }
         let lifecycle_id = verified_claude_lifecycle.unwrap_or_else(|| {
             self.agent_sessions
                 .get(&surface_id)
                 .and_then(|session| session.lifecycle.external_id.clone())
                 .unwrap_or_else(|| format!("{source}:{thread_id}"))
         });
+        let generation = self
+            .agent_sessions
+            .get(&surface_id)
+            .map(|session| session.lifecycle.generation);
+        let approval_id = format!(
+            "approval:{source}:{}",
+            json!([
+                surface_id,
+                lifecycle_id,
+                generation,
+                thread_id,
+                turn_id,
+                item_id,
+                jsonrpc_id
+            ])
+        );
         let summary = agent_approval_message(self.language, source, kind, method, request_params);
+        let binding = (surface_id, lifecycle_id.clone(), generation);
         let interaction = AgentInteractionRequest {
             request_id: approval_id.clone(),
             surface_id: surface_id.to_string(),
@@ -11286,16 +11544,22 @@ impl WmctermApplication {
                 .into_iter()
                 .map(|mode| wmcterm_ipc::AgentChoice {
                     id: mode.into(),
-                    label: mode.into(),
+                    label: if source == "claude_hook" && mode == "always" {
+                        claude_permission_change_label(self.language, request_params).into()
+                    } else {
+                        mode.into()
+                    },
                 })
                 .collect(),
             deadline_unix_ms: params.get("deadline_unix_ms").and_then(Value::as_u64),
         };
-        match self
+        let outcome = self
             .pending_agent_requests
             .register(interaction)
-            .map_err(|error| error.to_string())?
-        {
+            .map_err(|error| error.to_string())?;
+        self.agent_approval_bindings
+            .insert(approval_id.clone(), binding);
+        match outcome {
             wmcterm_ipc::RegisterOutcome::AlreadyCompleted(reply) => {
                 let mode = completed_approval_action(&reply).unwrap_or(AgentApprovalAction::Deny);
                 self.remember_agent_approval_result(approval_id, mode);
@@ -11340,6 +11604,28 @@ impl WmctermApplication {
 
     fn poll_agent_approval(&self, params: &Value) -> Result<Value, String> {
         let approval_id = required_string(params, "approval_id")?;
+        if let Some((surface, lifecycle, generation)) =
+            self.agent_approval_bindings.get(approval_id)
+        {
+            let current = self.agent_sessions.get(surface);
+            let runtime = self
+                .state
+                .surfaces
+                .get(surface)
+                .and_then(|surface| match surface.kind {
+                    SurfaceKind::Terminal(id) => self.terminals.get(&id),
+                    _ => None,
+                });
+            if current.map(|session| session.lifecycle.generation) != *generation
+                || (approval_id.starts_with("approval:claude_hook:")
+                    && runtime.is_none_or(|runtime| runtime.lifecycle_id != *lifecycle))
+                || current
+                    .and_then(|session| session.lifecycle.external_id.as_ref())
+                    .is_some_and(|id| id != lifecycle)
+            {
+                return Ok(agent_approval_resolved_json(AgentApprovalAction::Deny));
+            }
+        }
         if let Some(action) = self.agent_approval_results.get(approval_id).copied() {
             return Ok(agent_approval_resolved_json(action));
         }
@@ -11359,6 +11645,24 @@ impl WmctermApplication {
         let id = request.id.clone();
         let result: Result<Value, String> = (|| {
             match request.method.as_str() {
+            "app.diagnostics" => Ok(json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "server_executable": env::current_exe().ok(),
+                "client_executable": request.params.get("client_executable"),
+                "provider_versions": request.params.get("provider_versions"),
+                "config_path": wmcterm_config::config_path(),
+                "terminals": self.terminals.iter().map(|(id, runtime)| json!({
+                    "terminal_id": id, "surface_id": self.surface_for_terminal(*id),
+                    "lifecycle_id": runtime.lifecycle_id,
+                    "agent": self.surface_for_terminal(*id).and_then(|surface| self.state.surfaces.get(&surface)).and_then(|surface| surface.agent.as_ref()),
+                    "last_hook": self.last_hook_delivery.get(id),
+                    "input_focused": self.input_focus_terminal == Some(*id),
+                    "mouse_tracking": runtime.snapshot.mouse_tracking,
+                    "keyboard_flags": runtime.snapshot.keyboard_flags,
+                    "focus_reporting": runtime.snapshot.focus_reporting,
+                    "bracketed_paste": runtime.snapshot.bracketed_paste
+                })).collect::<Vec<_>>()
+            })),
             "app.status" => Ok(json!({
                 "product": "wmcterm",
                 "version": env!("CARGO_PKG_VERSION"),
@@ -11373,6 +11677,7 @@ impl WmctermApplication {
             "app.capabilities" => Ok(json!({
                 "protocol_version": 4,
                 "product": "wmcterm",
+                "supported_agents": AgentKind::ALL,
                 "version": env!("CARGO_PKG_VERSION"),
                 "context": {
                     "marker_env": "WMCTERM",
@@ -11402,6 +11707,7 @@ impl WmctermApplication {
                     "poll_method": "agent.approval.poll",
                     "sources": ["codex_app_server", "claude_hook"],
                     "decision_modes": ["deny", "once", "always", "all"],
+                    "claude_permission_changes": "always applies the single displayed suggestion; its label describes the operation, and the message shows scope and storage",
                     "fail_closed": true
                 },
                 "codex_restore": {
@@ -11409,14 +11715,20 @@ impl WmctermApplication {
                     "preserves_mode": true,
                     "rebuilds_teams_bridge": true,
                     "permission_verification": "server response before turn/start",
+                    "settings_updates": "verified threads only; non-null permission, reviewer and cwd updates rejected; restart to change the launch profile",
                     "full_access": "GUI confirmation or persisted managed session; not a CLI/RPC launch option",
                     "failure": "no automatic permission downgrade; Enter retries an exited terminal",
                     "legacy": "missing managed restore record uses interactive provider resume"
                 },
                 "agent_events": [
                     "session_start", "tool_use", "permission_request", "needs_input",
-                    "turn_complete", "turn_failed", "stop"
+                    "turn_complete", "turn_failed", "notification", "stop"
                 ],
+                "terminal_input": {
+                    "local_search": "Ctrl+Alt+F; next match Ctrl+Alt+G",
+                    "mouse_override": "Shift forces local selection, scroll, menu and primary paste",
+                    "protocols": ["SGR mouse including hover", "focus reporting", "Kitty keyboard press/repeat/release"]
+                },
                 "ssh": {
                     "shell": "bash >= 4.2.46",
                     "target": "explicit surface_id UUID; integrated idle local Bash",
@@ -11426,14 +11738,15 @@ impl WmctermApplication {
                     "output": "merged PTY bytes, UTF-8 lossy, ANSI preserved",
                     "persistent": false,
                     "focus": false,
-                    "cli_new": "ssh HOST --new --pane UUID; creates without focus and waits for local and remote readiness",
+                    "cli_new": "ssh HOST [--new] [--pane UUID]; defaults to WMCTERM_PANE_ID, splits right without focus and waits for local and remote readiness",
+                    "agent_usage": "only when the user explicitly requests wmcterm SSH",
                     "cli_command_sources": ["--command", "--command-file", "--command-stdin"],
                     "exec_expected_host": "optional exact host match, checked atomically with connection_id and ready state",
                     "authentication": "interactive OpenSSH; connecting includes authentication waits"
                 },
                 "methods": [
                     "ssh.connect", "ssh.status", "ssh.exec", "ssh.cancel",
-                    "app.status", "workspace.list", "workspace.create", "workspace.activate",
+                    "app.status", "app.diagnostics", "workspace.list", "workspace.create", "workspace.activate",
                     "workspace.rename", "workspace.describe", "workspace.move",
                     "workspace.cwd",
                     "workspace.close", "pane.list", "pane.split", "pane.focus", "pane.zoom",
@@ -12041,6 +12354,9 @@ impl WmctermApplication {
                         self.validate_codex_session(terminal, session_id)?;
                     }
                     if let Some(hook) = claude_hook.as_ref() {
+                        if hook.agent_id.is_some() && matches!(hook.kind, ClaudeHookKind::SessionStart | ClaudeHookKind::SessionEnd) {
+                            return Err("Claude child hooks cannot start or end the root session".into());
+                        }
                         if hook.to_agent_event() != event {
                             return Err("Claude hook does not match its projected Agent event".into());
                         }
@@ -12053,6 +12369,14 @@ impl WmctermApplication {
                             self.end_codex_subagent_session(terminal, session_id)?;
                         }
                         return Ok(json!({"ignored": true}));
+                    }
+                    if request.params.get("hook_executable").is_some() {
+                        self.last_hook_delivery.insert(terminal, json!({
+                            "executable": request.params.get("hook_executable"),
+                            "started_at_unix_ns": request.params.get("hook_started_at_unix_ns"),
+                            "received_at_unix_ms": unix_time_ms(),
+                            "event": request.params.get("event")
+                        }));
                     }
                     let state = self.apply_agent_event(terminal, event);
                     if let Some(hook) = claude_hook.as_ref() {
@@ -12292,11 +12616,13 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                     self.workspace_drag = None;
                     self.scrollbar_drag = None;
                     self.text_edit_drag = None;
-                    if self.terminal_mouse_capture.is_some() {
-                        self.send_captured_terminal_mouse(
-                            MouseActionInput::Release,
-                            Some(MouseButtonInput::Left),
-                        );
+                    for (_, (terminal, input)) in self.terminal_key_presses.drain() {
+                        if let Some(runtime) = self.terminals.get(&terminal) {
+                            let _ = runtime.session.send(SessionCommand::KeyRelease(input));
+                        }
+                    }
+                    if let Some((_, _, button)) = self.terminal_mouse_capture {
+                        self.send_captured_terminal_mouse(MouseActionInput::Release, Some(button));
                         self.terminal_mouse_capture = None;
                     }
                     self.mouse_pressed = false;
@@ -12310,6 +12636,10 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                 self.update_navigation_hover();
                 if self.mouse_pressed {
                     self.update_mouse_action();
+                } else if let Some((_, _, button)) = self.terminal_mouse_capture {
+                    self.send_captured_terminal_mouse(MouseActionInput::Motion, Some(button));
+                } else if !self.modifiers.shift_key() && !self.pointer_over_overlay() {
+                    self.send_terminal_mouse(MouseActionInput::Motion, None);
                 }
                 self.update_cursor_icon();
             }
@@ -12367,10 +12697,9 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                 }
                 if self.send_terminal_mouse(MouseActionInput::Press, Some(MouseButtonInput::Right))
                 {
-                    self.send_terminal_mouse(
-                        MouseActionInput::Release,
-                        Some(MouseButtonInput::Right),
-                    );
+                    self.terminal_mouse_capture = self
+                        .terminal_at_cursor()
+                        .map(|(pane, terminal)| (pane, terminal, MouseButtonInput::Right));
                 } else {
                     self.open_terminal_context_menu();
                 }
@@ -12388,8 +12717,34 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                 if self.pointer_over_overlay() || self.scrollbar_at_cursor().is_some() {
                     return;
                 }
-                if !self.focus_at_cursor() && self.terminal_at_cursor().is_some() {
+                let changed_focus = self.focus_at_cursor();
+                if !self.modifiers.shift_key()
+                    && self.send_terminal_mouse(
+                        MouseActionInput::Press,
+                        Some(MouseButtonInput::Middle),
+                    )
+                {
+                    self.terminal_mouse_capture = self
+                        .terminal_at_cursor()
+                        .map(|(pane, terminal)| (pane, terminal, MouseButtonInput::Middle));
+                } else if !changed_focus && self.terminal_at_cursor().is_some() {
                     self.paste_clipboard(ClipboardTarget::Primary);
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Released,
+                button: released @ (MouseButton::Right | MouseButton::Middle),
+                ..
+            } => {
+                if let Some((_, _, button)) = self.terminal_mouse_capture
+                    && matches!(
+                        (released, button),
+                        (MouseButton::Right, MouseButtonInput::Right)
+                            | (MouseButton::Middle, MouseButtonInput::Middle)
+                    )
+                {
+                    self.send_captured_terminal_mouse(MouseActionInput::Release, Some(button));
+                    self.terminal_mouse_capture = None;
                 }
             }
             WindowEvent::MouseWheel { delta, .. } => {
@@ -12485,15 +12840,14 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                     } else {
                         MouseButtonInput::WheelDown
                     };
-                    let has_local_scrollback = self
-                        .terminal_at_cursor()
-                        .and_then(|(_, terminal)| self.terminals.get(&terminal))
-                        .is_some_and(|runtime| runtime.snapshot.scrollback_rows > 0);
                     if self.modifiers.shift_key()
-                        || has_local_scrollback
                         || !self.send_terminal_mouse(MouseActionInput::Press, Some(button))
                     {
                         self.scroll_surface_at_cursor(lines);
+                    } else {
+                        for _ in 1..lines.unsigned_abs().min(256) {
+                            self.send_terminal_mouse(MouseActionInput::Press, Some(button));
+                        }
                     }
                 }
             }
@@ -13844,6 +14198,38 @@ fn physical_ascii_character(key: PhysicalKey) -> Option<char> {
 }
 
 fn terminal_input_key(logical_key: &Key, physical_character: Option<char>) -> Option<InputKey> {
+    if let Key::Named(named) = logical_key
+        && let Some(index) = [
+            NamedKey::F1,
+            NamedKey::F2,
+            NamedKey::F3,
+            NamedKey::F4,
+            NamedKey::F5,
+            NamedKey::F6,
+            NamedKey::F7,
+            NamedKey::F8,
+            NamedKey::F9,
+            NamedKey::F10,
+            NamedKey::F11,
+            NamedKey::F12,
+            NamedKey::F13,
+            NamedKey::F14,
+            NamedKey::F15,
+            NamedKey::F16,
+            NamedKey::F17,
+            NamedKey::F18,
+            NamedKey::F19,
+            NamedKey::F20,
+            NamedKey::F21,
+            NamedKey::F22,
+            NamedKey::F23,
+            NamedKey::F24,
+        ]
+        .iter()
+        .position(|key| key == named)
+    {
+        return Some(InputKey::Function(index as u8 + 1));
+    }
     match logical_key {
         Key::Character(value) => value
             .chars()
@@ -14119,6 +14505,10 @@ fn append_bounded_agent_input(input: &mut String, pasted: &str) {
         end -= 1;
     }
     input.push_str(&pasted[..end]);
+}
+
+fn agent_submission_key(key: InputKey, modifiers: ModifiersState) -> bool {
+    key == InputKey::Enter && modifiers.is_empty()
 }
 
 fn agent_submission_starts_turn(input: &str) -> bool {
@@ -14619,11 +15009,16 @@ fn effective_agent_lifecycle(
 
 fn agent_session_event_kind(
     event: &AgentEvent,
-    request_suffix: &str,
+    _request_suffix: &str,
     run_mode: AgentRunMode,
 ) -> Option<AgentSessionEventKind> {
     match event {
         AgentEvent::SessionStart { .. } => None,
+        AgentEvent::Notification { message } => Some(AgentSessionEventKind::Telemetry(
+            AgentTelemetry::Notification {
+                message: message.clone(),
+            },
+        )),
         AgentEvent::ToolUse { tool } => {
             Some(AgentSessionEventKind::Telemetry(AgentTelemetry::Activity {
                 summary: Some(tool.clone()),
@@ -14648,14 +15043,11 @@ fn agent_session_event_kind(
                 },
             },
         )),
-        AgentEvent::NeedsInput { message } => {
-            Some(AgentSessionEventKind::ActionRequired(AgentActionRequest {
-                request_id: format!("input:{request_suffix}"),
-                kind: AgentRequestKind::Input,
-                message: message.clone(),
-                choices: Vec::new(),
-            }))
-        }
+        AgentEvent::NeedsInput { .. } => Some(AgentSessionEventKind::Telemetry(
+            AgentTelemetry::StateObserved {
+                state: wmcterm_core::AgentState::WaitingForInput,
+            },
+        )),
         AgentEvent::TurnComplete { .. } => Some(AgentSessionEventKind::Telemetry(
             AgentTelemetry::StateObserved {
                 state: wmcterm_core::AgentState::Idle,
@@ -14689,7 +15081,7 @@ fn agent_transition_for_run_mode(
         && matches!(event, AgentEvent::PermissionRequest { .. })
     {
         return wmcterm_agent::AgentTransition {
-            state: wmcterm_core::AgentState::Running,
+            state: Some(wmcterm_core::AgentState::Running),
             attention: AttentionState::None,
             notification: None,
         };
@@ -14731,7 +15123,6 @@ fn resume_info(
     let agent = match metadata.name.to_ascii_lowercase().as_str() {
         "claude" | "claude code" => Some(AgentResumeInfo::Claude { session_id }),
         "codex" => Some(AgentResumeInfo::Codex { session_id }),
-        "opencode" => Some(AgentResumeInfo::OpenCode { session_id }),
         _ => None,
     }?;
     Some(PersistedAgentResume { agent, managed })
@@ -14993,6 +15384,64 @@ fn agent_approval_message(
         }),
     }
 
+    if source == "claude_hook"
+        && let Some(suggestion) = claude_permission_suggestion(params)
+    {
+        let destination = suggestion["destination"].as_str().unwrap_or("unknown");
+        let scope = match (chinese, destination) {
+            (false, "session") => "session only (not saved)",
+            (true, "session") => "仅当前会话（不保存）",
+            (false, "localSettings") => "project local settings: .claude/settings.local.json",
+            (true, "localSettings") => "项目本地设置：.claude/settings.local.json",
+            (false, "projectSettings") => "shared project settings: .claude/settings.json",
+            (true, "projectSettings") => "项目共享设置：.claude/settings.json",
+            (false, "userSettings") => {
+                "user settings: $CLAUDE_CONFIG_DIR/settings.json (default ~/.claude/settings.json)"
+            }
+            (true, "userSettings") => {
+                "用户设置：$CLAUDE_CONFIG_DIR/settings.json（默认 ~/.claude/settings.json）"
+            }
+            _ => destination,
+        };
+        lines.push(format!(
+            "{}: {} ({scope})",
+            if chinese {
+                "权限变更"
+            } else {
+                "Permission change"
+            },
+            claude_permission_change_label(language, params)
+        ));
+        if let Some(mode) = suggestion["mode"].as_str() {
+            lines.push(format!(
+                "{}: {mode}",
+                if chinese {
+                    "目标模式"
+                } else {
+                    "Target mode"
+                }
+            ));
+        }
+        if let Some(rules) = suggestion["rules"].as_array() {
+            let behavior = suggestion["behavior"].as_str().unwrap_or("unknown");
+            for rule in rules {
+                lines.push(format!(
+                    "{}: {behavior} {}({})",
+                    if chinese { "规则" } else { "Rule" },
+                    rule["toolName"].as_str().unwrap_or("unknown"),
+                    rule["ruleContent"].as_str().unwrap_or("*")
+                ));
+            }
+        }
+        if let Some(directories) = suggestion["directories"].as_array() {
+            for directory in directories.iter().filter_map(Value::as_str) {
+                lines.push(format!(
+                    "{}: {directory}",
+                    if chinese { "目录" } else { "Directory" }
+                ));
+            }
+        }
+    }
     let tool_input = params.get("tool_input").or_else(|| params.get("toolInput"));
     let command = approval_text_field(params, &["command", "cmd"])
         .or_else(|| tool_input.and_then(|input| approval_text_field(input, &["command", "cmd"])));
@@ -15326,11 +15775,45 @@ fn agent_approval_resolution(
     }
 }
 
-fn agent_approval_action_label(language: Language, action: AgentApprovalAction) -> &'static str {
+fn claude_permission_suggestion(params: &Value) -> Option<&Value> {
+    let suggestions = params["permission_suggestions"].as_array()?;
+    (suggestions.len() == 1).then(|| &suggestions[0])
+}
+
+fn claude_permission_change_label(language: Language, params: &Value) -> &'static str {
+    let kind = claude_permission_suggestion(params).and_then(|value| value["type"].as_str());
+    match (language.is_chinese(), kind) {
+        (false, Some("addRules")) => "Add rules",
+        (true, Some("addRules")) => "添加规则",
+        (false, Some("replaceRules")) => "Replace rules",
+        (true, Some("replaceRules")) => "替换规则",
+        (false, Some("removeRules")) => "Remove rules",
+        (true, Some("removeRules")) => "删除规则",
+        (false, Some("setMode")) => "Set mode",
+        (true, Some("setMode")) => "切换模式",
+        (false, Some("addDirectories")) => "Add folders",
+        (true, Some("addDirectories")) => "添加目录",
+        (false, Some("removeDirectories")) => "Remove folders",
+        (true, Some("removeDirectories")) => "移除目录",
+        (false, _) => "Apply change",
+        (true, _) => "应用变更",
+    }
+}
+
+fn agent_approval_action_label(
+    language: Language,
+    action: AgentApprovalAction,
+    request: &AgentInteractionRequest,
+) -> &str {
     match action {
         AgentApprovalAction::Deny => language.deny(),
         AgentApprovalAction::AllowOnce => language.allow_once(),
-        AgentApprovalAction::AlwaysAllow => language.always_allow(),
+        AgentApprovalAction::AlwaysAllow => request
+            .choices
+            .iter()
+            .find(|choice| choice.id == "always" && choice.label != "always")
+            .map(|choice| choice.label.as_str())
+            .unwrap_or_else(|| language.always_allow()),
     }
 }
 
@@ -16314,7 +16797,7 @@ mod tests {
 
     #[test]
     fn agent_approval_only_exposes_supported_decisions_and_maps_wire_modes() {
-        let request = AgentInteractionRequest {
+        let mut request = AgentInteractionRequest {
             request_id: "approval:test".into(),
             surface_id: uuid::Uuid::new_v4().to_string(),
             lifecycle_id: "lifecycle".into(),
@@ -16342,6 +16825,34 @@ mod tests {
         let resolution = agent_approval_resolution(&request, AgentApprovalAction::AlwaysAllow);
         assert_eq!(resolution.choice_id.as_deref(), Some("always"));
         assert_eq!(resolution.approved, Some(true));
+        assert_eq!(
+            agent_approval_action_label(
+                Language::English,
+                AgentApprovalAction::AlwaysAllow,
+                &request
+            ),
+            Language::English.always_allow()
+        );
+        request
+            .choices
+            .iter_mut()
+            .find(|choice| choice.id == "always")
+            .unwrap()
+            .label = "Set mode".into();
+        assert_eq!(
+            agent_approval_action_label(
+                Language::English,
+                AgentApprovalAction::AlwaysAllow,
+                &request
+            ),
+            "Set mode"
+        );
+        assert_eq!(
+            agent_approval_resolution(&request, AgentApprovalAction::AlwaysAllow)
+                .choice_id
+                .as_deref(),
+            Some("always")
+        );
         assert_eq!(
             agent_approval_resolved_json(AgentApprovalAction::Deny),
             json!({"status":"resolved","decision":{"mode":"deny"}})
@@ -16392,6 +16903,65 @@ mod tests {
         assert_eq!(
             agent_approval_resolution(&request, AgentApprovalAction::AlwaysAllow).choice_id,
             Some("always".into())
+        );
+    }
+
+    #[test]
+    fn claude_permission_changes_show_operation_scope_and_exact_rules() {
+        for (destination, en, zh) in [
+            (
+                "session",
+                "session only (not saved)",
+                "仅当前会话（不保存）",
+            ),
+            ("localSettings", "project local settings", "项目本地设置"),
+            ("projectSettings", "shared project settings", "项目共享设置"),
+            ("userSettings", "user settings", "用户设置"),
+        ] {
+            let params = json!({"tool_name": "Bash", "permission_suggestions": [{
+                "type": "replaceRules", "destination": destination, "behavior": "allow",
+                "rules": [{"toolName": "Bash", "ruleContent": "git status"}]
+            }]});
+            for (language, scope, operation) in [
+                (Language::English, en, "Replace rules"),
+                (Language::SimplifiedChinese, zh, "替换规则"),
+            ] {
+                let message = agent_approval_message(
+                    language,
+                    "claude_hook",
+                    "permission",
+                    "PermissionRequest",
+                    &params,
+                );
+                assert!(message.lines().nth(1).unwrap().contains(scope));
+                assert!(message.contains("allow Bash(git status)"));
+                assert_eq!(claude_permission_change_label(language, &params), operation);
+            }
+        }
+        let mode = json!({"permission_suggestions": [{"type": "setMode", "mode": "auto", "destination": "session"}]});
+        assert!(
+            agent_approval_message(
+                Language::English,
+                "claude_hook",
+                "permission",
+                "PermissionRequest",
+                &mode
+            )
+            .contains("Target mode: auto")
+        );
+        let folders = json!({"permission_suggestions": [{"type": "addDirectories", "directories": ["/work/中文"], "destination": "session"}]});
+        assert!(
+            agent_approval_message(
+                Language::English,
+                "claude_hook",
+                "permission",
+                "PermissionRequest",
+                &folders
+            )
+            .contains("Directory: /work/中文")
+        );
+        assert!(
+            claude_permission_suggestion(&json!({"permission_suggestions": [{}, {}]})).is_none()
         );
     }
 
@@ -16783,7 +17353,7 @@ mod tests {
             ))
             .unwrap();
         assert_eq!(session.state, AgentState::Running);
-        let approval = AgentActionRequest {
+        let approval = wmcterm_core::AgentActionRequest {
             request_id: "pending".into(),
             kind: AgentRequestKind::Permission,
             message: "Approve command".into(),
@@ -17528,6 +18098,23 @@ mod tests {
     }
 
     #[test]
+    fn terminal_function_keys_reach_the_encoder() {
+        for (named, number) in [
+            (NamedKey::F1, 1),
+            (NamedKey::F2, 2),
+            (NamedKey::F3, 3),
+            (NamedKey::F4, 4),
+            (NamedKey::F12, 12),
+            (NamedKey::F24, 24),
+        ] {
+            assert_eq!(
+                terminal_input_key(&Key::Named(named), None),
+                Some(InputKey::Function(number))
+            );
+        }
+    }
+
+    #[test]
     fn background_opacity_scales_alpha_without_dimming_rgb() {
         assert_eq!(
             background_opacity([10, 20, 30, 200], 0.5),
@@ -17667,6 +18254,9 @@ mod tests {
             ],
             cursor: None,
             mouse_tracking: false,
+            keyboard_flags: 0,
+            focus_reporting: false,
+            bracketed_paste: false,
             scrollback_rows: 4,
             viewport_offset: 0,
             screen_row_origin: 4,
@@ -18066,7 +18656,7 @@ mod tests {
             },
             AgentRunMode::Unattended,
         );
-        assert_eq!(unattended_transition.state, AgentState::Running);
+        assert_eq!(unattended_transition.state, Some(AgentState::Running));
         assert_eq!(unattended_transition.attention, AttentionState::None);
         assert_eq!(unattended_transition.notification, None);
         assert!(matches!(
@@ -18094,11 +18684,9 @@ mod tests {
         .unwrap();
         assert!(matches!(
             input,
-            AgentSessionEventKind::ActionRequired(AgentActionRequest {
-                request_id,
-                kind: AgentRequestKind::Input,
-                ..
-            }) if request_id == "input:18"
+            AgentSessionEventKind::Telemetry(AgentTelemetry::StateObserved {
+                state: AgentState::WaitingForInput
+            })
         ));
 
         assert!(matches!(
@@ -18562,7 +19150,7 @@ mod tests {
             }),
         );
         assert!(pending.error.is_none(), "{:?}", pending.error);
-        assert_eq!(app.agent_sessions[&surface].pending_requests.len(), 1);
+        assert!(app.agent_sessions[&surface].pending_requests.is_empty());
         let snapshot = |app: &WmctermApplication| {
             json!({
                 "session": app.agent_sessions[&surface],
@@ -18583,15 +19171,136 @@ mod tests {
         );
         let accepted = call(&mut app, failure("claude-current"));
         assert!(accepted.error.is_none(), "{:?}", accepted.error);
-        assert_eq!(app.agent_sessions[&surface].pending_requests.len(), 1);
-        assert_eq!(
-            app.agent_sessions[&surface].state,
-            AgentState::WaitingForInput
-        );
+        assert!(app.agent_sessions[&surface].pending_requests.is_empty());
+        assert_eq!(app.agent_sessions[&surface].state, AgentState::Error);
         assert_eq!(
             app.agent_sessions[&surface].lifecycle.phase,
             AgentLifecyclePhase::Running
         );
+
+        let notification = |kind: &str, mode: &str| {
+            let hook = wmcterm_agent::normalize_claude_hook_event(
+                Some("Notification"),
+                &json!({"session_id": "claude-current", "notification_type": kind,
+                    "permission_mode": mode, "message": "Provider notification"}),
+            )
+            .unwrap();
+            let mut params = claude_params(hook.to_agent_event());
+            params["claude_hook"] = serde_json::to_value(hook).unwrap();
+            params
+        };
+        for kind in [
+            "elicitation_dialog",
+            "elicitation_url_dialog",
+            "quota_auto_resume_stale",
+        ] {
+            assert!(call(&mut app, notification(kind, "auto")).error.is_none());
+            assert_eq!(
+                app.agent_sessions[&surface].state,
+                AgentState::WaitingForInput
+            );
+            assert!(app.agent_sessions[&surface].pending_requests.is_empty());
+            assert!(app.pending_agent_requests.is_empty().unwrap());
+            assert!(
+                call(&mut app, notification("agent_completed", "auto"))
+                    .error
+                    .is_none()
+            );
+            assert_eq!(
+                app.agent_sessions[&surface].state,
+                AgentState::WaitingForInput
+            );
+            assert!(
+                call(&mut app, notification("quota_auto_resume_fired", "auto"))
+                    .error
+                    .is_none()
+            );
+            assert_eq!(app.agent_sessions[&surface].state, AgentState::Running);
+            assert_eq!(
+                app.state.surfaces[&surface].agent.as_ref().unwrap().state,
+                AgentState::Running
+            );
+        }
+        app.update_foreground_agent(terminal, &["claude --permission-mode default".into()]);
+        assert_eq!(
+            app.state.surfaces[&surface]
+                .agent
+                .as_ref()
+                .unwrap()
+                .run_mode,
+            AgentRunMode::Unattended
+        );
+        assert!(
+            call(
+                &mut app,
+                claude_params(AgentEvent::TurnComplete {
+                    continuing: false,
+                    message: None
+                })
+            )
+            .error
+            .is_none()
+        );
+        for (kind, mode, expected) in [
+            (
+                "agent_completed",
+                "bypassPermissions",
+                AgentRunMode::FullAccess,
+            ),
+            ("auth_success", "unknown-mode", AgentRunMode::FullAccess),
+            ("future_notification", "default", AgentRunMode::Interactive),
+        ] {
+            assert!(call(&mut app, notification(kind, mode)).error.is_none());
+            assert_eq!(app.agent_sessions[&surface].state, AgentState::Idle);
+            let metadata = app.state.surfaces[&surface].agent.as_ref().unwrap();
+            assert_eq!(metadata.state, AgentState::Idle);
+            assert_eq!(metadata.run_mode, expected);
+        }
+        let mut stale_mode = notification("auth_success", "auto");
+        stale_mode["claude_hook"]["session_id"] = "claude-stale".into();
+        assert!(error(call(&mut app, stale_mode)).contains("session"));
+        let mut stale_lifecycle = notification("auth_success", "auto");
+        stale_lifecycle["lifecycle_id"] = "stale-lifecycle".into();
+        assert!(call(&mut app, stale_lifecycle).error.is_some());
+        let mut child_mode = notification("auth_success", "auto");
+        child_mode["claude_hook"]["agent_id"] = "child".into();
+        assert!(call(&mut app, child_mode).error.is_none());
+        assert_eq!(
+            app.state.surfaces[&surface]
+                .agent
+                .as_ref()
+                .unwrap()
+                .run_mode,
+            AgentRunMode::Interactive
+        );
+
+        assert!(
+            call(&mut app, notification("auth_success", "auto"))
+                .error
+                .is_none()
+        );
+        app.register_agent_approval(&json!({
+            "source": "claude_hook", "workspace_id": app.state.workspaces[0].id,
+            "surface_id": surface, "lifecycle_id": lifecycle,
+            "request": {"jsonrpc_id": "real-approval", "method": "PermissionRequest",
+                "kind": "permission", "thread_id": "claude-current", "turn_id": "hook",
+                "item_id": "real-approval", "params": {"tool_name": "Bash", "tool_input": {"command": "pwd"}}},
+            "decisions": ["deny", "once"]
+        })).unwrap();
+        assert!(
+            call(&mut app, notification("quota_auto_resume_fired", "auto"))
+                .error
+                .is_none()
+        );
+        assert_eq!(app.pending_agent_requests.len().unwrap(), 1);
+        assert_eq!(
+            app.state.surfaces[&surface].agent.as_ref().unwrap().state,
+            AgentState::WaitingForPermission
+        );
+        for request in app.pending_agent_request_list() {
+            app.resolve_agent_request_from_ui(request.request_id, AgentApprovalAction::Deny);
+        }
+        crate::claude_regression::check(&mut app, terminal, surface);
     }
 
     #[test]
@@ -18645,4 +19354,24 @@ mod tests {
             );
         }
     }
+}
+#[test]
+fn only_plain_enter_predicts_submission() {
+    assert!(agent_submission_key(
+        InputKey::Enter,
+        ModifiersState::empty()
+    ));
+    for modifiers in [
+        ModifiersState::SHIFT,
+        ModifiersState::CONTROL,
+        ModifiersState::ALT,
+        ModifiersState::SUPER,
+    ] {
+        assert!(!agent_submission_key(InputKey::Enter, modifiers));
+    }
+    assert!(!agent_submission_key(
+        InputKey::Character('x'),
+        ModifiersState::empty()
+    ));
+    assert!(agent_submission_starts_turn("first line\nsecond line"));
 }

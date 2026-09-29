@@ -4,7 +4,12 @@ import { appendFileSync } from 'node:fs';
 
 const args = process.argv.slice(2);
 assert(!args.some(arg => ['--approve-for-me', '--sandbox', '--ask-for-approval', '--dangerously-bypass-approvals-and-sandbox'].includes(arg)));
-const socket = new WebSocket(args[args.indexOf('--remote') + 1]);
+const endpoint = new URL(args[args.indexOf('--remote') + 1]);
+assert.equal(endpoint.pathname, '/');
+assert.equal(endpoint.search, '');
+const token = process.env[args[args.indexOf('--remote-auth-token-env') + 1]];
+assert(token);
+const socket = new WebSocket(endpoint, { headers: { Authorization: `Bearer ${token}` } });
 const pending = new Map();
 let sequence = 0;
 const timeout = setTimeout(() => { console.error('managed Codex smoke timed out'); process.exit(1); }, 20000);
@@ -31,6 +36,13 @@ socket.addEventListener('open', async () => {
       ? await request('thread/resume', { threadId: args[resume + 1] })
       : await request('thread/start', { cwd: process.cwd() });
     const threadId = result.thread.id;
+    for (const method of ['thread/settings/update', 'turn/settings/update']) {
+      await assert.rejects(request(method, { threadId, turnId: 'no-active-turn', approvalsReviewer: 'user' }), /fixed at launch/);
+      await assert.rejects(request(method, { threadId: 'unverified-thread', model: 'test-model' }), /not been verified/);
+    }
+    await assert.rejects(request('thread/settings/update', { threadId, permissions: 'full-access' }), /fixed at launch/);
+    await assert.rejects(request('thread/settings/update', { threadId, cwd: '/different-workspace' }), /fixed at launch/);
+    await request('thread/settings/update', { threadId, effort: 'high' });
     await request('thread/inject_items', { threadId, items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'wmcterm restore smoke fixture; no model turn.' }] }] });
     // The same RPC used by the in-session /resume path.
     const resumed = await request('thread/resume', { threadId });

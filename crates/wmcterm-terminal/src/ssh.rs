@@ -26,11 +26,20 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && (BASH_VERSINFO[1] < 2 ||
 fi
 __wmcterm_token={token}
 __wmcterm_command=
+# bind -x runs with Readline's no-echo terminal modes, not shell command modes.
+__wmcterm_shell_tty=$(command stty -g)
+__wmcterm_readline_tty=
 __wmcterm_emit() {{
     builtin printf '\033]777;wmcterm;%s;%s;%s;%s;%s\007' "$__wmcterm_token" "$1" "$2" "$3" "$(builtin printf %s "$PWD" | od -An -v -tx1 | tr -d ' \n')"
 }}
 __wmcterm_prompt() {{
     local status=$?
+    # Ctrl+C can unwind the callback; PROMPT_COMMAND must restore Readline too.
+    if [[ -n $__wmcterm_readline_tty ]]; then
+        __wmcterm_shell_tty=$(command stty -g)
+        command stty "$__wmcterm_readline_tty"
+        __wmcterm_readline_tty=
+    fi
     if [[ -n $__wmcterm_command ]]; then
         __wmcterm_emit done "$__wmcterm_command" "$status"
         __wmcterm_command=
@@ -61,6 +70,11 @@ __wmcterm_dispatch() {{
         return
     fi
     builtin printf -v __wmcterm_line %b "$__wmcterm_payload"
+    __wmcterm_readline_tty=$(command stty -g)
+    if ! command stty "$__wmcterm_shell_tty"; then
+        __wmcterm_emit rejected '' 1
+        return
+    fi
     builtin eval -- "$__wmcterm_line"
     __wmcterm_prompt
 }}

@@ -72,6 +72,7 @@ fn main() -> Result<()> {
                 | "window"
                 | "agent"
                 | "capabilities"
+                | "diagnostics"
                 | "status"
         )
     ) {
@@ -159,17 +160,20 @@ fn print_help() {
          \x20 wmcterm hook receive|plan|install --agent KIND [--event NAME]\n\
          \x20   Claude StopFailure reports a failed turn without ending the session\n\
          \x20 wmcterm skill print|install [--scope project|user] [--force]\n\
-         \x20 wmcterm agent [--mode interactive|unattended|full-access] claude|codex|gemini|opencode [ARG...]\n\
+         \x20   User hook/skill directories honor CODEX_HOME and CLAUDE_CONFIG_DIR\n\
+         \x20 wmcterm agent [--mode interactive|unattended|full-access] claude|codex [ARG...]\n\
          \x20 wmcterm codex-teams [CODEX_ARG...]\n\
          \x20   Codex defaults: --ask-for-approval on-request --sandbox workspace-write\n\
-         \x20   Unattended: Codex --approve-for-me/workspace-write; Claude --permission-mode auto\n\
+         \x20   Claude interactive defaults: --permission-mode default (explicit modes are preserved)\n\
+         \x20   Auto review (--mode unattended): Codex --approve-for-me/workspace-write; Claude --permission-mode auto\n\
          \x20   --mode full-access is blocked in CLI and requires UI-authorized flow\n\
          \x20   Managed Codex/Claude bypass options are rejected\n\
          \x20   Managed Codex restores its saved mode and Teams bridge after restart\n\
          \x20   Remote /resume permissions are applied and verified server-side; failures do not downgrade\n\
+         \x20   Managed Codex rejects in-session permission/cwd settings updates; restart with the desired profile\n\
          \x20 wmcterm ssh TARGET [SSH_ARG...]\n\
          \x20 wmcterm ssh HOST --surface UUID [--wait] [--timeout-ms N]\n\
-         \x20 wmcterm ssh HOST --new --pane UUID [--timeout-ms N]\n\
+         \x20 wmcterm ssh HOST [--new] [--pane UUID] [--timeout-ms N] (right split, no focus; defaults to WMCTERM_PANE_ID)\n\
          \x20 wmcterm ssh status --surface UUID\n\
          \x20 wmcterm ssh exec --surface UUID (--command TEXT|--command-file PATH|--command-stdin) [--connection ID] [--host HOST] [--wait] [--timeout-ms N] [--max-output-bytes N]\n\
          \x20 wmcterm ssh cancel --surface UUID --command-id ID [--connection ID] [--wait]\n\
@@ -178,6 +182,7 @@ fn print_help() {
          \x20 wmcterm config path|show|validate|init|import-ghostty [PATH]\n\
          \x20 wmcterm window new [PROJECT_DIR]\n\
          \x20 wmcterm capabilities\n\
+         \x20 wmcterm diagnostics\n\
          \x20 wmcterm status\n\
          \x20 wmcterm rpc METHOD [PARAMS_JSON]"
     );
@@ -460,6 +465,40 @@ fn run_rpc() -> Result<()> {
         None => Value::Null,
     };
     print_response(rpc(&method, params)?)
+}
+
+fn provider_version(program: &str) -> Value {
+    let mut child = match std::process::Command::new(program)
+        .arg("--version")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(error) => return serde_json::json!({"error": error.to_string()}),
+    };
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return match child.wait_with_output() {
+                    Ok(output) => {
+                        serde_json::json!({"success": output.status.success(), "version": String::from_utf8_lossy(&output.stdout).trim()})
+                    }
+                    Err(error) => serde_json::json!({"error": error.to_string()}),
+                };
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(20))
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return serde_json::json!({"error": "version probe timed out or failed"});
+            }
+        }
+    }
 }
 
 fn rpc(method: &str, params: Value) -> Result<wmcterm_ipc::Response> {
@@ -788,6 +827,13 @@ fn run_cli(scope: String) -> Result<()> {
         }
         "status" => rpc("app.status", Value::Null)?,
         "capabilities" => rpc("app.capabilities", Value::Null)?,
+        "diagnostics" => rpc(
+            "app.diagnostics",
+            serde_json::json!({
+                "client_executable": env::current_exe()?.display().to_string(),
+                "provider_versions": {"codex": provider_version("codex"), "claude": provider_version("claude")}
+            }),
+        )?,
         "config" => return run_config(args),
         "window" if args.next().as_deref() == Some("new") => {
             let mut command = std::process::Command::new(env::current_exe()?);
@@ -804,8 +850,26 @@ fn run_cli(scope: String) -> Result<()> {
                 .next()
                 .context("usage: wmcterm ssh TARGET [SSH_ARG...]")?;
             let rest: Vec<_> = args.collect();
+            if matches!(target.as_str(), "-h" | "--help")
+                || (matches!(target.as_str(), "exec" | "status" | "cancel")
+                    && rest
+                        .first()
+                        .is_some_and(|arg| matches!(arg.as_str(), "-h" | "--help")))
+            {
+                print_help();
+                return Ok(());
+            }
+            if target.starts_with('-') {
+                bail!("SSH target must precede options; usage: wmcterm ssh TARGET [SSH_ARG...]");
+            }
             if matches!(target.as_str(), "exec" | "status" | "cancel")
-                || rest.iter().any(|arg| arg == "--surface" || arg == "--new")
+                || rest.is_empty()
+                || rest.iter().any(|arg| {
+                    matches!(
+                        arg.as_str(),
+                        "--surface" | "--new" | "--pane" | "--wait" | "--timeout-ms" | "--no-focus"
+                    )
+                })
             {
                 return run_managed_ssh(&target, rest);
             }
@@ -1172,10 +1236,8 @@ fn plan_agent_process(
             PathBuf::from(program),
             plan_claude_launch_args(mode, supplied)?,
         )
-    } else if mode == AgentRunMode::Interactive {
-        (PathBuf::from(program), supplied.to_vec())
     } else {
-        bail!("Agent `{program}` does not define a safe `{mode}` launch profile")
+        bail!("unsupported Agent `{program}`; supported Agents: codex, claude")
     };
     Ok((executable, child_args))
 }
@@ -1220,8 +1282,13 @@ fn plan_claude_launch_args(mode: AgentRunMode, args: &[String]) -> Result<Vec<St
     }
 
     let mut planned = Vec::with_capacity(args.len() + 2);
-    if mode == AgentRunMode::Unattended && !permission_mode_is_explicit {
-        planned.extend(["--permission-mode".into(), "auto".into()]);
+    if !permission_mode_is_explicit {
+        let permission_mode = if mode == AgentRunMode::Unattended {
+            "auto"
+        } else {
+            "default"
+        };
+        planned.extend(["--permission-mode".into(), permission_mode.into()]);
     }
     planned.extend_from_slice(args);
     Ok(planned)
@@ -1513,8 +1580,8 @@ fn encode_control_key(key: &str) -> Result<String> {
 
 fn run_hook(mut args: impl Iterator<Item = String>) -> Result<()> {
     use wmcterm_agent::{
-        AgentEventEnvelope, AgentKind, HookConfigFormat, hook_install_plan,
-        normalize_claude_hook_event, normalize_hook_event, read_agent_process_identity,
+        AgentEventEnvelope, AgentKind, hook_install_plan, normalize_claude_hook_event,
+        normalize_hook_event, read_agent_process_identity,
     };
     let operation = args
         .next()
@@ -1550,6 +1617,11 @@ fn run_hook(mut args: impl Iterator<Item = String>) -> Result<()> {
             ))?
         ),
         "receive" => {
+            let hook_started_at_unix_ns = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+                .min(u64::MAX as u128) as u64;
             let inside_wmcterm = env::var_os("WMCTERM").is_some();
             let explicitly_permission = agent == AgentKind::Claude
                 && event
@@ -1566,7 +1638,7 @@ fn run_hook(mut args: impl Iterator<Item = String>) -> Result<()> {
                 }
                 return Ok(());
             }
-            let Ok(payload) = serde_json::from_str::<Value>(&input) else {
+            let Ok(mut payload) = serde_json::from_str::<Value>(&input) else {
                 if explicitly_permission && inside_wmcterm {
                     print_claude_permission_result(wmcterm_claude::deny_response(
                         "wmcterm received invalid permission JSON",
@@ -1576,6 +1648,12 @@ fn run_hook(mut args: impl Iterator<Item = String>) -> Result<()> {
                 }
                 return Ok(());
             };
+            if let Some(object) = payload.as_object_mut() {
+                object.insert(
+                    "hook_started_at_unix_ns".into(),
+                    hook_started_at_unix_ns.into(),
+                );
+            }
             let is_claude_permission =
                 agent == AgentKind::Claude && claude_permission_event(event.as_deref(), &payload);
             let bridged_codex_permission = suppress_bridged_codex_permission_hook(
@@ -1686,11 +1764,6 @@ fn run_hook(mut args: impl Iterator<Item = String>) -> Result<()> {
                 .snippets
                 .first()
                 .context("agent does not provide a hook configuration")?;
-            if snippet.format != HookConfigFormat::Json {
-                bail!(
-                    "automatic hook installation is not available for {agent}; use `wmcterm hook plan --agent {agent}`"
-                );
-            }
             let relative = snippet
                 .relative_path
                 .as_deref()
@@ -1813,6 +1886,10 @@ fn deliver_hook_bounded(
     let Ok(mut params) = envelope.to_legacy_rpc_params() else {
         return;
     };
+    params["hook_executable"] = env::current_exe()
+        .ok()
+        .map(|path| path.display().to_string())
+        .into();
     if let (Some(hook), Some(object)) = (claude_hook, params.as_object_mut())
         && let Ok(hook) = serde_json::to_value(hook)
     {
@@ -1859,10 +1936,6 @@ fn agent_config_root(agent: wmcterm_agent::AgentKind, scope: InstallScope) -> Re
     let name = match agent {
         wmcterm_agent::AgentKind::Claude => ".claude",
         wmcterm_agent::AgentKind::Codex => ".codex",
-        wmcterm_agent::AgentKind::Gemini => ".gemini",
-        _ => bail!(
-            "automatic hook installation is not available for {agent}; use `wmcterm hook plan --agent {agent}`"
-        ),
     };
     match scope {
         InstallScope::Project => Ok(env::current_dir()?.join(name)),
@@ -1875,6 +1948,7 @@ fn agent_config_root(agent: wmcterm_agent::AgentKind, scope: InstallScope) -> Re
                 agent,
                 &home,
                 nonempty_env("CLAUDE_CONFIG_DIR").as_deref().map(Path::new),
+                nonempty_env("CODEX_HOME").as_deref().map(Path::new),
             ))
         }
     }
@@ -1884,17 +1958,16 @@ fn user_agent_config_root(
     agent: wmcterm_agent::AgentKind,
     home: &Path,
     claude_config_dir: Option<&Path>,
+    codex_home: Option<&Path>,
 ) -> PathBuf {
     if agent == wmcterm_agent::AgentKind::Claude {
         claude_config_dir
             .map(Path::to_path_buf)
             .unwrap_or_else(|| home.join(".claude"))
     } else {
-        home.join(match agent {
-            wmcterm_agent::AgentKind::Codex => ".codex",
-            wmcterm_agent::AgentKind::Gemini => ".gemini",
-            _ => ".config",
-        })
+        codex_home
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| home.join(".codex"))
     }
 }
 
@@ -2090,7 +2163,7 @@ fn run_skill(mut args: impl Iterator<Item = String>) -> Result<()> {
         "install" => {
             let targets = match scope {
                 InstallScope::Project => {
-                    skill_install_targets(scope, &env::current_dir()?, Path::new(""), None)
+                    skill_install_targets(scope, &env::current_dir()?, Path::new(""), None, None)
                 }
                 InstallScope::User => {
                     let home = directories::BaseDirs::new()
@@ -2098,7 +2171,14 @@ fn run_skill(mut args: impl Iterator<Item = String>) -> Result<()> {
                         .home_dir()
                         .to_path_buf();
                     let claude_config_dir = nonempty_env("CLAUDE_CONFIG_DIR").map(PathBuf::from);
-                    skill_install_targets(scope, Path::new(""), &home, claude_config_dir.as_deref())
+                    let codex_home = nonempty_env("CODEX_HOME").map(PathBuf::from);
+                    skill_install_targets(
+                        scope,
+                        Path::new(""),
+                        &home,
+                        claude_config_dir.as_deref(),
+                        codex_home.as_deref(),
+                    )
                 }
             };
             for target in targets {
@@ -2131,6 +2211,7 @@ fn skill_install_targets(
     project: &Path,
     home: &Path,
     claude_config_dir: Option<&Path>,
+    codex_home: Option<&Path>,
 ) -> Vec<PathBuf> {
     match scope {
         InstallScope::Project => vec![
@@ -2139,7 +2220,13 @@ fn skill_install_targets(
         ],
         InstallScope::User => vec![
             home.join(".agents/skills/wmcterm/SKILL.md"),
-            home.join(".codex/skills/wmcterm/SKILL.md"),
+            user_agent_config_root(
+                wmcterm_agent::AgentKind::Codex,
+                home,
+                claude_config_dir,
+                codex_home,
+            )
+            .join("skills/wmcterm/SKILL.md"),
             claude_config_dir
                 .map(Path::to_path_buf)
                 .unwrap_or_else(|| home.join(".claude"))
@@ -2270,10 +2357,18 @@ fn run_managed_ssh(target: &str, args: Vec<String>) -> Result<()> {
             _ => bail!("unknown managed SSH option: {flag}"),
         }
     }
+    if method == "ssh.connect" && params["surface_id"].is_null() {
+        new = true;
+        pane = pane.or_else(originating_pane);
+    }
     if new {
         if method != "ssh.connect" || pane.is_none() || !params["surface_id"].is_null() {
-            bail!("--new requires a host and --pane UUID, and cannot be combined with --surface");
+            bail!(
+                "new SSH splits require a host and --pane UUID or WMCTERM_PANE_ID, and cannot be combined with --surface"
+            );
         }
+        wmcterm_core::PaneId::parse_str(pane.as_deref().expect("checked pane"))
+            .context("invalid SSH pane UUID")?;
         if target.is_empty()
             || target.starts_with('-')
             || target.len() > 1024
@@ -2282,7 +2377,7 @@ fn run_managed_ssh(target: &str, args: Vec<String>) -> Result<()> {
             bail!("invalid SSH host; use an SSH config alias or user@host");
         }
     } else if pane.is_some() {
-        bail!("--pane requires --new");
+        bail!("--pane is only valid when creating a new SSH split");
     } else if params["surface_id"].as_str().is_none() {
         bail!("managed SSH requires --surface UUID");
     }
@@ -2312,8 +2407,8 @@ fn run_managed_ssh(target: &str, args: Vec<String>) -> Result<()> {
     let mut created = Value::Null;
     if new {
         let response = rpc(
-            "surface.new",
-            serde_json::json!({"pane": pane, "focus": false}),
+            "pane.split",
+            serde_json::json!({"pane": pane, "direction": "right", "focus": false}),
         )?;
         if response.error.is_some() {
             return print_response(response);
@@ -2679,7 +2774,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(program, PathBuf::from("claude"));
-        assert_eq!(args, ["--model", "sonnet"]);
+        assert_eq!(args, ["--permission-mode", "default", "--model", "sonnet"]);
 
         let (program, args) = plan_agent_process(AgentRunMode::Interactive, "codex", &[]).unwrap();
         assert_eq!(program, env::current_exe().unwrap());
@@ -2894,6 +2989,7 @@ mod tests {
                 Path::new("/project"),
                 Path::new("/home/user"),
                 None,
+                None,
             ),
             vec![
                 PathBuf::from("/home/user/.agents/skills/wmcterm/SKILL.md"),
@@ -2907,6 +3003,7 @@ mod tests {
                 Path::new("/project"),
                 Path::new("/home/user"),
                 None,
+                Some(Path::new("/ignored-for-project")),
             ),
             vec![
                 PathBuf::from("/project/.agents/skills/wmcterm/SKILL.md"),
@@ -2916,19 +3013,41 @@ mod tests {
     }
 
     #[test]
+    fn codex_home_override_controls_user_hook_and_skill_roots() {
+        let home = Path::new("/home/user");
+        let codex = Path::new("/custom/codex config");
+        assert_eq!(
+            user_agent_config_root(wmcterm_agent::AgentKind::Codex, home, None, Some(codex)),
+            codex
+        );
+        assert_eq!(
+            user_agent_config_root(wmcterm_agent::AgentKind::Claude, home, None, Some(codex)),
+            home.join(".claude")
+        );
+        assert_eq!(
+            skill_install_targets(InstallScope::User, Path::new(""), home, None, Some(codex)),
+            vec![
+                home.join(".agents/skills/wmcterm/SKILL.md"),
+                codex.join("skills/wmcterm/SKILL.md"),
+                home.join(".claude/skills/wmcterm/SKILL.md"),
+            ]
+        );
+    }
+
+    #[test]
     fn claude_config_override_controls_user_hook_and_skill_roots() {
         let home = Path::new("/home/user");
         let claude = Path::new("/custom/claude");
         assert_eq!(
-            user_agent_config_root(wmcterm_agent::AgentKind::Claude, home, Some(claude)),
+            user_agent_config_root(wmcterm_agent::AgentKind::Claude, home, Some(claude), None),
             claude
         );
         assert_eq!(
-            user_agent_config_root(wmcterm_agent::AgentKind::Codex, home, Some(claude)),
+            user_agent_config_root(wmcterm_agent::AgentKind::Codex, home, Some(claude), None),
             PathBuf::from("/home/user/.codex")
         );
         assert_eq!(
-            skill_install_targets(InstallScope::User, Path::new(""), home, Some(claude)),
+            skill_install_targets(InstallScope::User, Path::new(""), home, Some(claude), None),
             vec![
                 PathBuf::from("/home/user/.agents/skills/wmcterm/SKILL.md"),
                 PathBuf::from("/home/user/.codex/skills/wmcterm/SKILL.md"),
@@ -2952,6 +3071,7 @@ mod tests {
     #[test]
     fn canonical_agent_envelope_adapts_to_existing_rpc_shape() {
         let envelope = wmcterm_agent::AgentEventEnvelope {
+            hook_started_at_unix_ns: Some(100),
             surface_id: Some("surface-a".into()),
             lifecycle_id: Some("life-a".into()),
             agent_pid: Some(123),
@@ -3146,6 +3266,36 @@ mod tests {
     }
 
     #[test]
+    fn claude_interactive_pins_manual_permissions_and_preserves_explicit_modes() {
+        assert_eq!(
+            plan_claude_launch_args(AgentRunMode::Interactive, &[]).unwrap(),
+            ["--permission-mode", "default"]
+        );
+        for args in [
+            vec!["--permission-mode=plan".into()],
+            vec!["--permission-mode".into(), "manual".into()],
+        ] {
+            assert_eq!(
+                plan_claude_launch_args(AgentRunMode::Interactive, &args).unwrap(),
+                args
+            );
+        }
+        assert_eq!(
+            plan_claude_launch_args(
+                AgentRunMode::Interactive,
+                &["--".into(), "--permission-mode=auto".into()]
+            )
+            .unwrap(),
+            [
+                "--permission-mode",
+                "default",
+                "--",
+                "--permission-mode=auto"
+            ]
+        );
+    }
+
+    #[test]
     fn claude_unattended_uses_native_auto_mode_and_rejects_bypass() {
         assert_eq!(
             plan_claude_launch_args(
@@ -3185,8 +3335,12 @@ mod tests {
     }
 
     #[test]
-    fn noninteractive_modes_are_limited_to_supported_managed_agents() {
-        assert!(plan_agent_process(AgentRunMode::Unattended, "gemini", &[]).is_err());
+    fn launch_modes_are_limited_to_supported_managed_agents() {
+        for program in ["gemini", "opencode", "grok", "pi", "omp", "amp", "bash"] {
+            for mode in [AgentRunMode::Interactive, AgentRunMode::Unattended] {
+                assert!(plan_agent_process(mode, program, &[]).is_err());
+            }
+        }
         assert!(plan_agent_process(AgentRunMode::FullAccess, "codex", &[]).is_err());
         assert!(plan_agent_process(AgentRunMode::FullAccess, "claude", &[]).is_err());
     }

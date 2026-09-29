@@ -1483,6 +1483,8 @@ pub fn launch_codex_teams(
     };
 
     let status = managed_codex_command(&config.codex_program)
+        .args(["--remote-auth-token-env", "WMCTERM_CODEX_PROXY_TOKEN"])
+        .env("WMCTERM_CODEX_PROXY_TOKEN", &permission_proxy.token)
         .args(&plan.root_args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
@@ -1501,6 +1503,7 @@ fn managed_codex_command(program: &Path) -> Command {
     let mut command = Command::new(program);
     command.env(APPROVAL_BRIDGE_ENV, APPROVAL_BRIDGE_ENV_VALUE);
     command.env_remove("WMCTERM_CODEX_LAUNCH_TOKEN");
+    command.env_remove("WMCTERM_CODEX_PROXY_TOKEN");
     command
 }
 

@@ -62,6 +62,9 @@ pub struct ScreenSnapshot {
     pub cells: Vec<Vec<CellSnapshot>>,
     pub cursor: Option<CursorSnapshot>,
     pub mouse_tracking: bool,
+    pub keyboard_flags: u8,
+    pub focus_reporting: bool,
+    pub bracketed_paste: bool,
     pub scrollback_rows: usize,
     pub viewport_offset: usize,
     /// Absolute first row represented by `cells` in libghostty's full screen.
@@ -426,6 +429,9 @@ impl TerminalEngine {
             cells: all_cells,
             cursor,
             mouse_tracking: self.terminal.is_mouse_tracking()?,
+            keyboard_flags: self.terminal.kitty_keyboard_flags()?.bits(),
+            focus_reporting: self.terminal.mode(Mode::FOCUS_EVENT)?,
+            bracketed_paste: self.terminal.mode(Mode::BRACKETED_PASTE)?,
             scrollback_rows: actual_scrollback_rows.min(self.max_scrollback_rows),
             viewport_offset: self.viewport_offset,
             screen_row_origin: actual_scrollback_rows.saturating_sub(self.viewport_offset),
@@ -655,11 +661,44 @@ impl TerminalEngine {
     }
 
     pub fn encode_key(&mut self, input: &KeyInput) -> Result<Vec<u8>, TerminalError> {
-        // Conventional terminal controls must remain raw bytes even when a TUI
-        // enables an enhanced keyboard protocol. Platform keyboard events may
-        // expose the unmodified printable text (for example, "t" for Ctrl+T),
-        // which would otherwise take precedence and insert that text literally.
-        if input.modifiers.control
+        self.encode_key_action(
+            input,
+            if input.repeat {
+                KeyAction::Repeat
+            } else {
+                KeyAction::Press
+            },
+        )
+    }
+
+    pub fn encode_key_release(&mut self, input: &KeyInput) -> Result<Vec<u8>, TerminalError> {
+        self.encode_key_action(input, KeyAction::Release)
+    }
+
+    pub fn encode_focus(&self, focused: bool) -> Result<Vec<u8>, TerminalError> {
+        if !self.terminal.mode(Mode::FOCUS_EVENT)? {
+            return Ok(Vec::new());
+        }
+        let event = if focused {
+            libghostty_vt::focus::Event::Gained
+        } else {
+            libghostty_vt::focus::Event::Lost
+        };
+        let mut bytes = [0; 8];
+        let len = event.encode(&mut bytes)?;
+        Ok(bytes[..len].to_vec())
+    }
+
+    fn encode_key_action(
+        &mut self,
+        input: &KeyInput,
+        action: KeyAction,
+    ) -> Result<Vec<u8>, TerminalError> {
+        // Preserve legacy control bytes only without keyboard negotiation.
+        // Platform printable text must not override Control in either protocol.
+        if self.terminal.kitty_keyboard_flags()?.is_empty()
+            && action != KeyAction::Release
+            && input.modifiers.control
             && !input.modifiers.shift
             && !input.modifiers.alt
             && !input.modifiers.super_key
@@ -669,14 +708,25 @@ impl TerminalEngine {
         }
         let mut event = KeyEvent::new()?;
         event
-            .set_action(if input.repeat {
-                KeyAction::Repeat
-            } else {
-                KeyAction::Press
-            })
+            .set_action(action)
             .set_key(input.key.into())
             .set_mods(input.modifiers.into());
-        if let Some(text) = input.text.as_ref().filter(|text| valid_key_text(text)) {
+        if let Some(character) = input.unshifted_codepoint {
+            event.set_unshifted_codepoint(character);
+        } else {
+            match input.key {
+                InputKey::Character(character) => {
+                    event.set_unshifted_codepoint(character.to_ascii_lowercase());
+                }
+                InputKey::Space => {
+                    event.set_unshifted_codepoint(' ');
+                }
+                _ => {}
+            }
+        }
+        if let Some(text) = input.text.as_ref().filter(|text| {
+            valid_key_text(text) && !input.modifiers.control && action != KeyAction::Release
+        }) {
             event.set_utf8(Some(text.clone()));
         }
         self.key_encoder.set_options_from_terminal(&self.terminal);
@@ -719,6 +769,7 @@ const fn ghostty_rgb(color: Rgb) -> RgbColor {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputKey {
+    Function(u8),
     Character(char),
     Enter,
     Backspace,
@@ -740,6 +791,35 @@ pub enum InputKey {
 impl From<InputKey> for Key {
     fn from(value: InputKey) -> Self {
         match value {
+            InputKey::Function(number) => [
+                Key::F1,
+                Key::F2,
+                Key::F3,
+                Key::F4,
+                Key::F5,
+                Key::F6,
+                Key::F7,
+                Key::F8,
+                Key::F9,
+                Key::F10,
+                Key::F11,
+                Key::F12,
+                Key::F13,
+                Key::F14,
+                Key::F15,
+                Key::F16,
+                Key::F17,
+                Key::F18,
+                Key::F19,
+                Key::F20,
+                Key::F21,
+                Key::F22,
+                Key::F23,
+                Key::F24,
+            ]
+            .get(number.wrapping_sub(1) as usize)
+            .copied()
+            .unwrap_or(Key::Unidentified),
             InputKey::Character(c) => match c.to_ascii_lowercase() {
                 'a' => Key::A,
                 'b' => Key::B,
@@ -818,6 +898,7 @@ impl From<KeyModifiers> for Mods {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyInput {
     pub key: InputKey,
+    pub unshifted_codepoint: Option<char>,
     pub text: Option<String>,
     pub modifiers: KeyModifiers,
     pub repeat: bool,
@@ -841,6 +922,8 @@ pub enum SessionCommand {
     },
     Input(Vec<u8>),
     Key(KeyInput),
+    KeyRelease(KeyInput),
+    Focus(bool),
     Paste(String),
     PasteLine(String),
     CopyAll,
@@ -1349,6 +1432,20 @@ fn run_terminal_actor(
                     let _ = pty.send(PtyCommand::Input(bytes));
                 }
             }
+            Incoming::Command(SessionCommand::KeyRelease(input)) => {
+                if let Ok(bytes) = engine.encode_key_release(&input)
+                    && !bytes.is_empty()
+                {
+                    let _ = pty.send(PtyCommand::Input(bytes));
+                }
+            }
+            Incoming::Command(SessionCommand::Focus(focused)) => {
+                if let Ok(bytes) = engine.encode_focus(focused)
+                    && !bytes.is_empty()
+                {
+                    let _ = pty.send(PtyCommand::Input(bytes));
+                }
+            }
             Incoming::Command(SessionCommand::Paste(text)) => {
                 if !text.is_empty() {
                     ssh.user_input();
@@ -1581,6 +1678,7 @@ mod tests {
             text: None,
             modifiers: KeyModifiers::default(),
             repeat: false,
+            unshifted_codepoint: None,
         };
         assert_eq!(terminal.encode_key(&input).unwrap(), b"\x1b[A");
         terminal.feed(b"\x1b[?1h");
@@ -1595,6 +1693,7 @@ mod tests {
             text: Some(" ".into()),
             modifiers: KeyModifiers::default(),
             repeat: false,
+            unshifted_codepoint: None,
         };
         assert_eq!(terminal.encode_key(&input).unwrap(), b" ");
     }
@@ -1630,10 +1729,20 @@ mod tests {
                         ..KeyModifiers::default()
                     },
                     repeat: false,
+                    unshifted_codepoint: None,
                 };
                 assert_eq!(
                     terminal.encode_key(&input).unwrap(),
-                    [expected],
+                    if enhanced_keyboard {
+                        let code = match key {
+                            InputKey::Character(c) => c as u32,
+                            InputKey::Space => 32,
+                            _ => unreachable!(),
+                        };
+                        format!("\x1b[{code};5u").into_bytes()
+                    } else {
+                        vec![expected]
+                    },
                     "enhanced_keyboard={enhanced_keyboard}, key={key:?}"
                 );
             }
@@ -1724,6 +1833,115 @@ mod tests {
             })
             .unwrap();
         assert_eq!(bytes, b"\x1b[<0;2;2M");
+    }
+
+    #[test]
+    fn focus_and_key_release_follow_negotiated_modes() {
+        let mut terminal = TerminalEngine::new(TerminalSize::new(10, 2).unwrap()).unwrap();
+        let input = KeyInput {
+            key: InputKey::Character('g'),
+            text: Some("g".into()),
+            modifiers: KeyModifiers {
+                control: true,
+                ..Default::default()
+            },
+            repeat: false,
+            unshifted_codepoint: None,
+        };
+        assert!(terminal.encode_focus(true).unwrap().is_empty());
+        assert!(terminal.encode_key_release(&input).unwrap().is_empty());
+        terminal.feed(b"\x1b[?1004h\x1b[>7u");
+        assert_eq!(terminal.encode_focus(true).unwrap(), b"\x1b[I");
+        assert_eq!(terminal.encode_focus(false).unwrap(), b"\x1b[O");
+        assert_eq!(terminal.encode_key(&input).unwrap(), b"\x1b[103;5u");
+        assert_eq!(
+            terminal.encode_key_release(&input).unwrap(),
+            b"\x1b[103;5:3u"
+        );
+        let repeat = KeyInput {
+            repeat: true,
+            ..input.clone()
+        };
+        assert_eq!(terminal.encode_key(&repeat).unwrap(), b"\x1b[103;5:2u");
+        terminal.feed(b"\x1b[?1004l\x1b[<u");
+        assert!(terminal.encode_focus(false).unwrap().is_empty());
+        assert!(terminal.encode_key_release(&input).unwrap().is_empty());
+        assert_eq!(terminal.encode_key(&input).unwrap(), [7]);
+        terminal.feed(b"\x1b[>1u");
+        for number in 1..=24 {
+            let input = KeyInput {
+                key: InputKey::Function(number),
+                text: None,
+                modifiers: Default::default(),
+                repeat: false,
+                unshifted_codepoint: None,
+            };
+            assert!(
+                !terminal.encode_key(&input).unwrap().is_empty(),
+                "F{number}"
+            );
+        }
+    }
+
+    #[test]
+    fn shifted_punctuation_uses_the_layout_base_character() {
+        let mut terminal = TerminalEngine::new(TerminalSize::new(10, 2).unwrap()).unwrap();
+        terminal.feed(b"\x1b[>7u");
+        let input = KeyInput {
+            key: InputKey::Character('?'),
+            unshifted_codepoint: Some('/'),
+            text: Some("?".into()),
+            modifiers: KeyModifiers {
+                shift: true,
+                ..Default::default()
+            },
+            repeat: false,
+        };
+        assert_eq!(terminal.encode_key(&input).unwrap(), b"\x1b[47:63;2u");
+        let controlled = KeyInput {
+            modifiers: KeyModifiers {
+                control: true,
+                shift: true,
+                ..Default::default()
+            },
+            ..input
+        };
+        assert_eq!(terminal.encode_key(&controlled).unwrap(), b"\x1b[47;6u");
+    }
+
+    #[test]
+    fn mouse_hover_and_button_release_follow_application_modes() {
+        let mut terminal = TerminalEngine::new(TerminalSize::new(10, 2).unwrap()).unwrap();
+        let mut input = MouseInput {
+            action: MouseActionInput::Motion,
+            button: None,
+            x: 8.0,
+            y: 16.0,
+            cell_width: 8,
+            cell_height: 16,
+            modifiers: Default::default(),
+            any_button_pressed: false,
+        };
+        terminal.feed(b"\x1b[?1002h\x1b[?1006h");
+        assert!(terminal.encode_mouse(input).unwrap().is_empty());
+        terminal.feed(b"\x1b[?1003h");
+        input.x = 16.0;
+        assert_eq!(terminal.encode_mouse(input).unwrap(), b"\x1b[<35;3;2M");
+        for (button, code) in [(MouseButtonInput::Right, 2), (MouseButtonInput::Middle, 1)] {
+            input.button = Some(button);
+            input.action = MouseActionInput::Press;
+            input.any_button_pressed = true;
+            assert_eq!(
+                terminal.encode_mouse(input).unwrap(),
+                format!("\x1b[<{code};3;2M").into_bytes()
+            );
+            input.action = MouseActionInput::Release;
+            input.any_button_pressed = false;
+            assert_eq!(
+                terminal.encode_mouse(input).unwrap(),
+                format!("\x1b[<{code};3;2m").into_bytes()
+            );
+        }
     }
 
     #[test]
@@ -2099,6 +2317,7 @@ mod tests {
                 text: None,
                 modifiers: KeyModifiers::default(),
                 repeat: false,
+                unshifted_codepoint: None,
             }))
             .unwrap();
 

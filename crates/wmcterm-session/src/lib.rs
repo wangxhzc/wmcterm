@@ -54,7 +54,6 @@ pub struct ManagedCodexResume {
 pub enum AgentResumeInfo {
     Claude { session_id: String },
     Codex { session_id: String },
-    OpenCode { session_id: String },
 }
 
 impl AgentResumeInfo {
@@ -62,7 +61,6 @@ impl AgentResumeInfo {
         match self {
             Self::Claude { session_id } => format!("claude --resume {session_id}"),
             Self::Codex { session_id } => format!("codex resume {session_id}"),
-            Self::OpenCode { session_id } => format!("opencode --session {session_id}"),
         }
     }
 }
@@ -95,9 +93,40 @@ pub fn save(path: &Path, session: &Session) -> Result<(), SessionError> {
 }
 
 pub fn load(path: &Path) -> Result<Session, SessionError> {
-    let session: Session = serde_json::from_reader(fs::File::open(path)?)?;
+    let mut document: serde_json::Value = serde_json::from_reader(fs::File::open(path)?)?;
+    // Retired adapters must not prevent the rest of an older workspace loading.
+    if let Some(terminals) = document
+        .get_mut("terminals")
+        .and_then(|value| value.as_array_mut())
+    {
+        for terminal in terminals {
+            if let Some(kind) = terminal
+                .pointer("/agent/agent")
+                .and_then(|value| value.as_str())
+                && !matches!(kind, "claude" | "codex")
+            {
+                terminal["agent"] = serde_json::Value::Null;
+                terminal["command"] = serde_json::Value::Null;
+            }
+        }
+    }
+    let mut session: Session = serde_json::from_value(document)?;
     if session.version != SESSION_VERSION {
         return Err(SessionError::UnsupportedVersion(session.version));
+    }
+    session
+        .agent_sessions
+        .retain(|session| matches!(session.agent_kind.as_str(), "claude" | "codex"));
+    for surface in session.app.surfaces.values_mut() {
+        if surface.agent.as_ref().is_some_and(|agent| {
+            !matches!(
+                agent.name.to_ascii_lowercase().as_str(),
+                "claude" | "claude code" | "codex"
+            )
+        }) {
+            surface.agent = None;
+            surface.attention = wmcterm_core::AttentionState::None;
+        }
     }
     Ok(session)
 }
@@ -106,6 +135,54 @@ pub fn load(path: &Path) -> Result<Session, SessionError> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn loads_retired_agents_as_plain_terminals_without_losing_the_workspace() {
+        let mut app = AppState::default();
+        let mut surface = wmcterm_core::Surface::terminal("Legacy terminal");
+        surface.agent = Some(wmcterm_core::AgentMetadata {
+            name: "opencode".into(),
+            state: wmcterm_core::AgentState::Running,
+            session_id: Some("old-thread".into()),
+            run_mode: AgentRunMode::Interactive,
+        });
+        let surface_id = surface.id;
+        app.surfaces.insert(surface_id, surface);
+        let mut retired = AgentSession::new(surface_id);
+        retired.agent_kind = wmcterm_core::AgentKindId::new("opencode");
+        let mut supported = AgentSession::new(SurfaceId::new_v4());
+        supported.agent_kind = wmcterm_core::AgentKindId::new("codex");
+        let document = serde_json::json!({
+            "version": SESSION_VERSION, "app": app, "agent_sessions": [retired, supported],
+            "terminals": [{
+                "terminal_id": TerminalId::new_v4(), "cwd": "/tmp",
+                "command": "opencode --session old-thread",
+                "agent": {"agent": "open_code", "session_id": "old-thread"},
+                "scrollback": "retained history"
+            }, {
+                "terminal_id": TerminalId::new_v4(), "cwd": "/tmp",
+                "command": "codex", "agent": {"agent": "codex", "session_id": "current"}
+            }]
+        });
+        let path =
+            std::env::temp_dir().join(format!("wmcterm-retired-{}.json", TerminalId::new_v4()));
+        fs::write(&path, serde_json::to_vec(&document).unwrap()).unwrap();
+        let loaded = load(&path).unwrap();
+        fs::remove_file(path).unwrap();
+        assert_eq!(loaded.terminals.len(), 2);
+        assert!(loaded.terminals[0].agent.is_none());
+        assert!(loaded.terminals[0].command.is_none());
+        assert_eq!(
+            loaded.terminals[0].scrollback.as_deref(),
+            Some("retained history")
+        );
+        assert!(
+            matches!(&loaded.terminals[1].agent, Some(AgentResumeInfo::Codex { session_id }) if session_id == "current")
+        );
+        assert_eq!(loaded.agent_sessions.len(), 1);
+        assert_eq!(loaded.agent_sessions[0].agent_kind.as_str(), "codex");
+        assert!(loaded.app.surfaces[&surface_id].agent.is_none());
+    }
 
     #[test]
     fn managed_codex_restore_round_trips_modes_and_keeps_legacy_defaults() {
