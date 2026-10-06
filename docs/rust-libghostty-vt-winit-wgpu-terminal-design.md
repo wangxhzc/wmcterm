@@ -35,6 +35,11 @@ configured keybindings retain precedence.
 
 ## Persisted State
 
+Foreground Agent detection matches executable names and Node/Bun CLI scripts,
+and excludes management commands (updates, authentication, help, diagnostics,
+and MCP/plugin administration). Session, resume, and execution commands remain
+eligible; prompt arguments and unrelated filenames do not establish identity.
+
 `TerminalResume.managed_codex` records the thread ID, mode, permission overrides,
 and optional parent surface. `TerminalResume.cwd` retains the working directory.
 Only registered managed launches populate this record; foreground process

@@ -343,6 +343,8 @@ worktree 配置。子 Agent 窗格使用其线程的 cwd，保持 `focus: false`
 不会创建第二个可操作请求。手动启动的非托管 Codex 没有审批回复通道，因此其
 `PermissionRequest` Hook 只更新等待状态并发送普通通知；用户仍需回到 Codex TUI
 完成原生审批，通知中心不会显示无法生效的允许/拒绝按钮。
+`codex update/login/logout`、帮助、版本查询及 Claude 的更新、认证、诊断、
+MCP/插件管理命令不会被标记为空闲 Agent；普通会话、resume 和 exec 仍参与识别。
 前台进程识别会把手动 `codex --approve-for-me` 标记为“自动审查”，把手动
 `codex --dangerously-bypass-approvals-and-sandbox` 标记为“完全访问”；运行模式
 与空闲、运行中、等待和完成等 turn 状态相互独立。工作区侧栏显示其中最敏感的模式，

@@ -328,6 +328,8 @@ the desired mode and workspace; ordinary model settings remain available.
 The sidebar displays interactive, auto-review, or dangerous full access
 independently of idle/running/waiting/completed state. Managed labels follow
 verified server settings; manual labels follow foreground process detection.
+Management commands such as `codex update`, login/logout, help/version queries,
+and Claude update/auth/doctor/MCP/plugin commands do not create Agent status.
 
 A Codex session ID alone is not sufficient for automatic resume. On save/load,
 wmcterm checks for a nonempty matching rollout in the current Codex home; absent

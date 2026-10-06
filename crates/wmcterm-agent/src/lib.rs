@@ -349,25 +349,60 @@ impl AgentKind {
     /// name without matching arbitrary substrings.
     pub fn from_process_command(command: &str) -> Option<Self> {
         let normalized = command.to_ascii_lowercase().replace('\\', "/");
-        for word in normalized
-            .split(|character: char| {
-                character.is_ascii_whitespace() || matches!(character, '/' | ':' | '=')
-            })
-            .filter(|word| !word.is_empty())
+        let words: Vec<_> = normalized
+            .split_ascii_whitespace()
+            .map(|word| word.trim_matches(['\'', '"']))
+            .collect();
+        if matches!(
+            words.first().and_then(|word| word.rsplit('/').next()),
+            Some("wmcterm" | "wmcterm.exe")
+        ) && words.get(1) == Some(&"agent")
         {
+            let mut arguments = words.iter().copied().skip(2);
+            while let Some(argument) = arguments.next() {
+                match argument {
+                    "--mode" => {
+                        arguments.next();
+                    }
+                    value if value.starts_with('-') => {}
+                    "codex" => return Some(Self::Codex),
+                    "claude" => return Some(Self::Claude),
+                    _ => return None,
+                }
+            }
+            return None;
+        }
+        for (index, word) in words.iter().enumerate().take(2) {
+            // Node launchers put the CLI script in argv[1]. Other arguments
+            // (prompts, filenames and option values) are not executable names.
+            if index == 1
+                && !matches!(
+                    words[0].rsplit('/').next(),
+                    Some("node" | "node.exe" | "bun" | "bun.exe")
+                )
+            {
+                break;
+            }
             let stem = word
-                .strip_suffix(".exe")
+                .rsplit('/')
+                .next()
                 .unwrap_or(word)
-                .trim_matches(|character: char| matches!(character, '\'' | '"'));
-            let kind = if stem == "codex" || stem.starts_with("codex-") {
+                .strip_suffix(".exe")
+                .unwrap_or_else(|| word.rsplit('/').next().unwrap_or(word));
+            let kind = if stem == "codex"
+                || stem.starts_with("codex-")
+                || (index == 1 && word.ends_with("/codex/bin/codex.js"))
+            {
                 Some(Self::Codex)
-            } else if matches!(stem, "claude" | "claude-code" | "@anthropic-ai") {
+            } else if matches!(stem, "claude" | "claude-code")
+                || (index == 1 && word.contains("/@anthropic-ai/claude-code/"))
+            {
                 Some(Self::Claude)
             } else {
                 None
             };
-            if kind.is_some() {
-                return kind;
+            if let Some(kind) = kind {
+                return (!agent_management_command(kind, &words[index + 1..])).then_some(kind);
             }
         }
         None
@@ -425,6 +460,83 @@ impl AgentKind {
             _ => AgentRunMode::Interactive,
         }
     }
+}
+
+fn agent_management_command(kind: AgentKind, arguments: &[&str]) -> bool {
+    let mut arguments = arguments.iter().copied();
+    while let Some(argument) = arguments.next() {
+        match argument {
+            "--" => return false,
+            "--help" | "-h" | "--version" | "-v" => return true,
+            "--model"
+            | "-m"
+            | "--config"
+            | "-c"
+            | "--profile"
+            | "-p"
+            | "--cd"
+            | "--sandbox"
+            | "-s"
+            | "--ask-for-approval"
+            | "-a"
+            | "--add-dir"
+            | "--image"
+            | "-i"
+            | "--enable"
+            | "--disable"
+            | "--permission-mode"
+            | "--settings"
+            | "--setting-sources"
+            | "--allowed-tools"
+            | "--allowedtools"
+            | "--disallowed-tools"
+            | "--disallowedtools"
+            | "--system-prompt"
+            | "--append-system-prompt" => {
+                arguments.next();
+            }
+            value if value.starts_with('-') => {}
+            command => {
+                return match kind {
+                    AgentKind::Codex => matches!(
+                        command,
+                        "update"
+                            | "upgrade"
+                            | "login"
+                            | "logout"
+                            | "help"
+                            | "completion"
+                            | "completions"
+                            | "mcp"
+                            | "mcp-server"
+                            | "app-server"
+                            | "app"
+                            | "debug"
+                            | "sandbox"
+                            | "apply"
+                            | "features"
+                    ),
+                    AgentKind::Claude => matches!(
+                        command,
+                        "update"
+                            | "upgrade"
+                            | "install"
+                            | "uninstall"
+                            | "doctor"
+                            | "auth"
+                            | "login"
+                            | "logout"
+                            | "help"
+                            | "mcp"
+                            | "plugin"
+                            | "plugins"
+                            | "setup-token"
+                    ),
+                };
+            }
+        }
+    }
+    false
 }
 
 impl fmt::Display for AgentKind {
@@ -2070,6 +2182,58 @@ mod tests {
             AgentKind::Codex.run_mode_from_process_command("codex --model gpt-test"),
             AgentRunMode::Interactive
         );
+    }
+
+    #[test]
+    fn management_commands_are_not_agent_sessions() {
+        for command in [
+            "codex update",
+            "codex login",
+            "codex logout",
+            "codex --help",
+            "codex --version",
+            "codex mcp list",
+            "codex app-server",
+            "codex --model gpt-test update",
+            "codex -c model=codex login",
+            "node /opt/codex/bin/codex.js update",
+            "claude update",
+            "claude doctor",
+            "claude auth login",
+            "claude plugin list",
+            "claude setup-token",
+            "node /opt/node_modules/@anthropic-ai/claude-code/cli.js update",
+            "echo codex",
+            "cat /tmp/codex",
+            "vim codex",
+        ] {
+            assert_eq!(AgentKind::from_process_command(command), None, "{command}");
+        }
+        for command in [
+            "codex",
+            "codex resume",
+            "codex fork",
+            "codex exec review",
+            "codex review",
+            "codex --model update",
+            "codex -- update",
+            "codex 'please update dependencies'",
+            "wmcterm agent --mode interactive codex",
+            "node /opt/node_modules/@openai/codex/bin/codex.js resume",
+        ] {
+            assert_eq!(
+                AgentKind::from_process_command(command),
+                Some(AgentKind::Codex),
+                "{command}"
+            );
+        }
+        for command in ["claude", "claude --resume", "claude -p update"] {
+            assert_eq!(
+                AgentKind::from_process_command(command),
+                Some(AgentKind::Claude),
+                "{command}"
+            );
+        }
     }
 
     #[test]
