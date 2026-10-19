@@ -584,6 +584,9 @@ fn deserialize_supported_agent<'de, D: serde::Deserializer<'de>>(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AgentEvent {
+    StateObserved {
+        state: AgentState,
+    },
     Notification {
         message: String,
     },
@@ -767,6 +770,7 @@ pub struct ClaudeHookEvent {
 #[serde(rename_all = "snake_case")]
 pub enum ClaudeHookKind {
     SessionStart,
+    UserPromptSubmit,
     SessionEnd,
     SubagentStart,
     SubagentStop,
@@ -814,6 +818,7 @@ impl ClaudeHookEvent {
             ClaudeHookKind::SubagentStart => ClaudePaneAction::OpenSubagentStatus,
             ClaudeHookKind::SubagentStop => ClaudePaneAction::CloseSubagentStatus,
             ClaudeHookKind::PreToolUse
+            | ClaudeHookKind::UserPromptSubmit
             | ClaudeHookKind::PostToolUse
             | ClaudeHookKind::PostToolUseFailure
             | ClaudeHookKind::PermissionRequest
@@ -828,6 +833,9 @@ impl ClaudeHookEvent {
     /// Stop would incorrectly mark every agent in the terminal as completed.
     pub fn to_agent_event(&self) -> AgentEvent {
         match self.kind {
+            ClaudeHookKind::UserPromptSubmit => AgentEvent::ToolUse {
+                tool: "Claude prompt submitted".into(),
+            },
             ClaudeHookKind::SessionStart => AgentEvent::SessionStart {
                 agent: AgentKind::Claude.to_string(),
                 session_id: Some(self.session_id.clone()),
@@ -945,6 +953,7 @@ pub fn normalize_claude_hook_event(
     let canonical_event = canonical(&raw_event);
     let kind = match canonical_event.as_str() {
         "sessionstart" => ClaudeHookKind::SessionStart,
+        "userpromptsubmit" => ClaudeHookKind::UserPromptSubmit,
         "sessionend" => ClaudeHookKind::SessionEnd,
         "subagentstart" => ClaudeHookKind::SubagentStart,
         "subagentstop" => ClaudeHookKind::SubagentStop,
@@ -1549,6 +1558,7 @@ pub fn hook_install_plan(agent: AgentKind, wmcterm_binary: impl Into<String>) ->
             json_hook_fragment(
                 &[
                     "SessionStart",
+                    "UserPromptSubmit",
                     "PreToolUse",
                     "PostToolUse",
                     "PostToolUseFailure",
@@ -1572,6 +1582,7 @@ pub fn hook_install_plan(agent: AgentKind, wmcterm_binary: impl Into<String>) ->
                     "Bash(wmcterm screen read)",
                     "Bash(wmcterm agent-request list)",
                 ],
+                true,
             ),
         ),
         AgentKind::Codex => (
@@ -1591,6 +1602,7 @@ pub fn hook_install_plan(agent: AgentKind, wmcterm_binary: impl Into<String>) ->
                 &command,
                 true,
                 &[],
+                false,
             ),
         ),
     };
@@ -1622,10 +1634,14 @@ fn json_hook_fragment(
     command: &str,
     nested_hooks: bool,
     permission_allow: &[&str],
+    block_permission_failure: bool,
 ) -> String {
     let hooks = events.iter().map(|event| {
         let event_command = format!("{command} --event {event}");
-        let command_hook = serde_json::json!({ "type": "command", "command": event_command });
+        let mut command_hook = serde_json::json!({ "type": "command", "command": event_command });
+        if *event == "PermissionRequest" && block_permission_failure {
+            command_hook["onFailure"] = serde_json::json!("block");
+        }
         let entries = if nested_hooks {
             serde_json::json!([{ "hooks": [command_hook] }])
         } else {
@@ -1731,6 +1747,18 @@ pub struct AgentTransition {
 
 pub fn reduce(event: &AgentEvent) -> AgentTransition {
     match event {
+        AgentEvent::StateObserved { state } => AgentTransition {
+            state: Some(*state),
+            attention: match state {
+                AgentState::WaitingForInput | AgentState::WaitingForPermission => {
+                    AttentionState::NeedsInput
+                }
+                AgentState::Error => AttentionState::Error,
+                AgentState::Completed => AttentionState::Activity,
+                _ => AttentionState::None,
+            },
+            notification: None,
+        },
         AgentEvent::Notification { message } => AgentTransition {
             state: None,
             attention: AttentionState::None,
@@ -1807,6 +1835,7 @@ pub fn parse_osc777(payload: &str) -> Option<AgentEvent> {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OscEvent {
+    ProgramStatus(AgentState),
     Agent(AgentEvent),
     Notification(String),
     PtyWrite(Vec<u8>),
@@ -1819,6 +1848,9 @@ pub struct OscScanner {
     escape: bool,
     overflow: bool,
     notifications: HashMap<String, PendingNotification>,
+    program_status: HashMap<String, AgentState>,
+    program_status_order: std::collections::VecDeque<String>,
+    last_program_state: Option<AgentState>,
 }
 
 #[derive(Debug, Default)]
@@ -1834,6 +1866,13 @@ impl OscScanner {
         let mut events = Vec::new();
         for &byte in bytes {
             if !self.in_osc {
+                if self.escape && byte == b'c' {
+                    self.program_status.clear();
+                    self.program_status_order.clear();
+                    if let Some(state) = self.changed_program_state() {
+                        events.push(OscEvent::ProgramStatus(state));
+                    }
+                }
                 if self.escape && byte == b']' {
                     self.in_osc = true;
                     self.payload.clear();
@@ -1852,7 +1891,28 @@ impl OscScanner {
                     .then(|| std::str::from_utf8(&self.payload).ok().map(str::to_owned))
                     .flatten();
                 if let Some(payload) = payload {
-                    if let Some(value) = payload.strip_prefix("777;") {
+                    if let Some(value) = payload.strip_prefix("7501;") {
+                        if value == "?" {
+                            events.push(OscEvent::PtyWrite(b"\x1b]7501;?\x1b\\".to_vec()));
+                        } else if let Some(state) = self.parse_program_status(value) {
+                            events.push(OscEvent::ProgramStatus(state));
+                        }
+                    } else if payload == "133;A" || payload.starts_with("133;A;") {
+                        self.program_status.retain(|_, state| {
+                            !matches!(
+                                state,
+                                AgentState::Running
+                                    | AgentState::WaitingForInput
+                                    | AgentState::WaitingForPermission
+                                    | AgentState::Idle
+                            )
+                        });
+                        self.program_status_order
+                            .retain(|id| self.program_status.contains_key(id));
+                        if let Some(state) = self.changed_program_state() {
+                            events.push(OscEvent::ProgramStatus(state));
+                        }
+                    } else if let Some(value) = payload.strip_prefix("777;") {
                         if let Some(agent) = parse_osc777(value) {
                             events.push(OscEvent::Agent(agent));
                         } else if let Some(notification) = parse_osc777_notification(value) {
@@ -1883,6 +1943,113 @@ impl OscScanner {
             self.escape = byte == 0x1b;
         }
         events
+    }
+
+    fn changed_program_state(&mut self) -> Option<AgentState> {
+        let state = self
+            .program_status
+            .values()
+            .copied()
+            .max_by_key(|state| match state {
+                AgentState::WaitingForPermission => 6,
+                AgentState::WaitingForInput => 5,
+                AgentState::Error => 4,
+                AgentState::Running => 3,
+                AgentState::Completed => 2,
+                _ => 1,
+            })
+            .unwrap_or(AgentState::Idle);
+        if self.last_program_state == Some(state) {
+            return None;
+        }
+        self.last_program_state = Some(state);
+        Some(state)
+    }
+
+    fn parse_program_status(&mut self, value: &str) -> Option<AgentState> {
+        if value.len() > 4086 {
+            return None;
+        }
+        let fields = value
+            .split(':')
+            .filter_map(|field| {
+                let (key, value) = field.split_once('=')?;
+                let (key, value) = (key.trim(), value.trim());
+                (key.len() <= 16
+                    && !key.is_empty()
+                    && key.bytes().all(|byte| byte.is_ascii_lowercase())
+                    && value
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || b"_.,+/=-".contains(&byte)))
+                .then_some((key, value))
+            })
+            .collect::<HashMap<_, _>>();
+        for (key, encoded_limit, decoded_limit) in [("msg", 2732, 2048), ("title", 256, 192)] {
+            if let Some(value) = fields.get(key) {
+                if value.len() > encoded_limit {
+                    return None;
+                }
+                let bytes = BASE64
+                    .decode(value)
+                    .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(value))
+                    .ok()?;
+                let text = std::str::from_utf8(&bytes).ok()?;
+                if bytes.len() > decoded_limit || text.chars().any(char::is_control) {
+                    return None;
+                }
+            }
+        }
+        if fields.get("app").is_some_and(|app| app.len() > 32) {
+            return None;
+        }
+        let id = fields.get("id").copied().unwrap_or("");
+        if id.len() > 128
+            || (fields.contains_key("id")
+                && (id.is_empty()
+                    || id.split('/').count() > 8
+                    || id.split('/').any(|part| {
+                        part.is_empty()
+                            || part.len() > 32
+                            || !part
+                                .bytes()
+                                .all(|byte| byte.is_ascii_alphanumeric() || b"_.+-".contains(&byte))
+                    })))
+        {
+            return None;
+        }
+        let state = match fields.get("state").copied()? {
+            "idle" => AgentState::Idle,
+            "working" => AgentState::Running,
+            "done" => AgentState::Completed,
+            "error" => AgentState::Error,
+            "blocked" if fields.get("kind") == Some(&"permission") => {
+                AgentState::WaitingForPermission
+            }
+            "blocked" => AgentState::WaitingForInput,
+            "clear" => {
+                self.program_status.retain(|key, _| {
+                    !(id.is_empty()
+                        || key == id
+                        || key
+                            .strip_prefix(id)
+                            .is_some_and(|suffix| suffix.starts_with('/')))
+                });
+                self.program_status_order
+                    .retain(|key| self.program_status.contains_key(key));
+                return self.changed_program_state();
+            }
+            _ => return None,
+        };
+        if self.program_status.len() >= 64
+            && !self.program_status.contains_key(id)
+            && let Some(oldest) = self.program_status_order.pop_front()
+        {
+            self.program_status.remove(&oldest);
+        }
+        self.program_status_order.retain(|key| key != id);
+        self.program_status_order.push_back(id.to_owned());
+        self.program_status.insert(id.to_owned(), state);
+        self.changed_program_state()
     }
 
     fn parse_osc99(&mut self, value: &str) -> Option<String> {
@@ -2917,6 +3084,7 @@ mod tests {
         let claude_json: Value = serde_json::from_str(&claude.snippets[0].content).unwrap();
         for event in [
             "SessionStart",
+            "UserPromptSubmit",
             "PostToolUse",
             "PostToolUseFailure",
             "PermissionRequest",
@@ -2929,6 +3097,15 @@ mod tests {
         ] {
             assert!(claude_json["hooks"][event].is_array(), "missing {event}");
         }
+        assert_eq!(
+            claude_json["hooks"]["PermissionRequest"][0]["hooks"][0]["onFailure"],
+            "block"
+        );
+        assert!(
+            claude_json["hooks"]["Notification"][0]["hooks"][0]
+                .get("onFailure")
+                .is_none()
+        );
         for safe_command in [
             "Bash(wmcterm capabilities)",
             "Bash(wmcterm status)",
@@ -2954,10 +3131,98 @@ mod tests {
         );
         let codex_json: Value = serde_json::from_str(&codex.snippets[0].content).unwrap();
         assert!(codex_json["hooks"]["PermissionRequest"].is_array());
+        assert!(
+            codex_json["hooks"]["PermissionRequest"][0]["hooks"][0]
+                .get("onFailure")
+                .is_none()
+        );
         assert!(codex_json["hooks"]["Interrupt"].is_array());
         assert!(codex_json["hooks"]["SubagentStart"].is_array());
         assert!(codex_json["hooks"]["SubagentStop"].is_array());
         assert!(codex_json["hooks"]["Stop"].is_array());
+    }
+
+    #[test]
+    fn claude_prompt_submission_updates_activity_without_retaining_prompt_text() {
+        let hook = normalize_claude_hook_event(None, &serde_json::json!({"hook_event_name":"UserPromptSubmit","session_id":"session","prompt":"private prompt"})).unwrap();
+        assert_eq!(
+            reduce(&hook.to_agent_event()).state,
+            Some(AgentState::Running)
+        );
+        assert!(
+            !serde_json::to_string(&hook)
+                .unwrap()
+                .contains("private prompt")
+        );
+    }
+
+    #[test]
+    fn program_status_handles_queries_chunks_duplicates_and_hierarchical_clear() {
+        let mut scanner = OscScanner::default();
+        assert!(
+            matches!(scanner.feed(b"\x1b]7501;?\x1b\\").as_slice(), [OscEvent::PtyWrite(reply)] if reply == b"\x1b]7501;?\x1b\\")
+        );
+        assert!(scanner.feed(b"\x1b]7501;state=work").is_empty());
+        assert!(matches!(
+            scanner.feed(b"ing:app=claude\x07").as_slice(),
+            [OscEvent::ProgramStatus(AgentState::Running)]
+        ));
+        assert!(scanner.feed(b"\x1b]7501;state=working\x07").is_empty());
+        assert!(matches!(
+            scanner
+                .feed(b"\x1b]7501;state=blocked:kind=question:id=worker/a\x07")
+                .as_slice(),
+            [OscEvent::ProgramStatus(AgentState::WaitingForInput)]
+        ));
+        assert!(matches!(
+            scanner
+                .feed(b"\x1b]7501;state=clear:id=worker\x07")
+                .as_slice(),
+            [OscEvent::ProgramStatus(AgentState::Running)]
+        ));
+        assert!(matches!(
+            scanner.feed(b"\x1b]133;A\x07").as_slice(),
+            [OscEvent::ProgramStatus(AgentState::Idle)]
+        ));
+        scanner.feed(b"\x1b]7501;state=done\x07");
+        assert!(scanner.feed(b"\x1b]133;A\x07").is_empty());
+        assert!(matches!(
+            scanner.feed(b"\x1bc").as_slice(),
+            [OscEvent::ProgramStatus(AgentState::Idle)]
+        ));
+    }
+
+    #[test]
+    fn program_status_rejects_invalid_text_ids_and_oversized_reports_atomically() {
+        let mut scanner = OscScanner::default();
+        scanner.feed(b"\x1b]7501;state=working\x07");
+        for report in [
+            "state=done:msg=AA==",
+            "state=done:msg=A",
+            "state=done:id=a//b",
+            "state=done:id=",
+            "state=unknown",
+        ] {
+            assert!(
+                scanner
+                    .feed(format!("\x1b]7501;{report}\x07").as_bytes())
+                    .is_empty(),
+                "{report}"
+            );
+        }
+        assert!(
+            scanner
+                .feed(format!("\x1b]7501;state=done:msg={}\x07", "A".repeat(4096)).as_bytes())
+                .is_empty()
+        );
+        assert_eq!(scanner.program_status.get(""), Some(&AgentState::Running));
+        for index in 0..80 {
+            scanner.feed(format!("\x1b]7501;state=working:id=w{index}\x07").as_bytes());
+        }
+        assert_eq!(scanner.program_status.len(), 64);
+        scanner.feed(b"\x1b]133;A\x07");
+        assert!(scanner.program_status.is_empty());
+        assert!(scanner.program_status_order.is_empty());
     }
 
     #[test]

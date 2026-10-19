@@ -3,7 +3,9 @@
 //! Protocol parsing intentionally lives outside the terminal core because the
 //! app-server command is experimental and may evolve independently.
 
+mod input;
 mod permissions;
+pub use input::{InputField, InputRequest};
 pub use permissions::CodexPermissions;
 
 use std::collections::{HashMap, HashSet};
@@ -221,6 +223,7 @@ pub enum ApprovalDecision {
     Deny,
     Once,
     Always,
+    Strict,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -726,6 +729,7 @@ pub struct CodexWatcher {
     open_attempts: HashMap<String, usize>,
     last_surface: Option<String>,
     approvals: ApprovalBridge,
+    inputs: input::InputBridge,
     client_endpoint: Option<String>,
 }
 
@@ -743,6 +747,7 @@ impl CodexWatcher {
             open_attempts: HashMap::new(),
             last_surface: None,
             approvals: ApprovalBridge::default(),
+            inputs: input::InputBridge::default(),
             client_endpoint: None,
         }
     }
@@ -789,6 +794,7 @@ impl CodexWatcher {
             path: self.config.control_socket.clone(),
         };
         self.approvals.cancel_all(&mut control, reason);
+        self.inputs.cancel_all(&self.config);
         result
     }
 
@@ -828,6 +834,7 @@ impl CodexWatcher {
 
         while !stop.load(Ordering::Acquire) {
             self.poll_approvals(socket)?;
+            self.inputs.poll(&self.config, socket)?;
             if last_thread_reconcile.elapsed() >= THREAD_RECONCILE_DELAY {
                 self.load_existing_threads(socket)?;
                 last_thread_reconcile = Instant::now();
@@ -892,6 +899,14 @@ impl CodexWatcher {
         socket: &mut Socket,
         value: &Value,
     ) -> Result<(), BridgeError> {
+        if value["method"] == "turn/completed"
+            && let (Some(thread), Some(turn)) = (
+                value["params"]["threadId"].as_str(),
+                value["params"]["turn"]["id"].as_str(),
+            )
+        {
+            self.inputs.complete_turn(&self.config, thread, turn);
+        }
         if let Some(thread_id) = announced_thread_id(value) {
             self.missing_rollouts.remove(thread_id);
             if let Err(error) = self.subscribe_thread(socket, thread_id) {
@@ -899,6 +914,7 @@ impl CodexWatcher {
             }
         }
         if let Some((thread_id, request_id)) = resolved_server_request(value) {
+            self.inputs.reconcile(&self.config, thread_id, request_id);
             let mut control = SocketApprovalControl {
                 path: self.config.control_socket.clone(),
             };
@@ -912,6 +928,12 @@ impl CodexWatcher {
             };
             self.approvals
                 .acknowledge_item_progress(thread_id, turn_id, item_id, &mut control)?;
+        }
+        if let Some(request) = InputRequest::parse(value) {
+            if let Err(error) = self.inputs.begin(&self.config, request) {
+                eprintln!("wmcterm: input panel unavailable; use the Codex TUI: {error}");
+            }
+            return Ok(());
         }
         let Some(request) = ApprovalRequest::parse(value) else {
             self.observe_value(value);
@@ -1251,6 +1273,7 @@ fn command_decision(params: &Value, mode: ApprovalDecision) -> Value {
                 reject_decision(params)
             }
         }
+        ApprovalDecision::Strict => reject_decision(params),
     }
 }
 
@@ -1260,6 +1283,7 @@ fn supported_modes(request: &ApprovalRequest) -> Vec<ApprovalDecision> {
         ApprovalKind::Permissions => {
             if available(&request.params, "accept") {
                 modes.push(ApprovalDecision::Once);
+                modes.push(ApprovalDecision::Strict);
             }
             if available(&request.params, "acceptForSession") {
                 modes.push(ApprovalDecision::Always);
@@ -1294,6 +1318,7 @@ fn supported_modes(request: &ApprovalRequest) -> Vec<ApprovalDecision> {
 
 fn file_decision(params: &Value, mode: ApprovalDecision) -> Value {
     match mode {
+        ApprovalDecision::Strict => reject_decision(params),
         ApprovalDecision::Deny => reject_decision(params),
         ApprovalDecision::Once => {
             if available(params, "accept") {
@@ -1322,10 +1347,14 @@ fn permission_decision(params: &Value, mode: ApprovalDecision) -> Value {
             .cloned()
             .unwrap_or_else(|| json!({}))
     };
-    json!({
+    let mut result = json!({
         "permissions": permissions,
         "scope": if persistent { "session" } else { "turn" },
-    })
+    });
+    if mode == ApprovalDecision::Strict {
+        result["strictAutoReview"] = json!(true);
+    }
+    result
 }
 
 fn bounded_json(value: &Value, depth: usize) -> Value {
@@ -1513,13 +1542,22 @@ fn send_json(socket: &mut Socket, value: &Value) -> Result<(), BridgeError> {
 }
 
 fn read_json(socket: &mut Socket) -> Result<Option<Value>, BridgeError> {
+    let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        match socket.read()? {
-            Message::Text(text) => return Ok(Some(serde_json::from_str(&text)?)),
-            Message::Binary(bytes) => return Ok(Some(serde_json::from_slice(&bytes)?)),
-            Message::Close(_) => return Ok(None),
-            Message::Ping(payload) => socket.send(Message::Pong(payload))?,
-            _ => {}
+        match read_json_poll(socket)? {
+            SocketRead::Message(value) => return Ok(Some(value)),
+            SocketRead::Closed => return Ok(None),
+            SocketRead::Idle => {
+                // Polling timeouts are expected while a synchronous RPC is pending.
+                if Instant::now() >= deadline {
+                    return Err(BridgeError::WebSocket(tungstenite::Error::Io(
+                        std::io::Error::new(
+                            std::io::ErrorKind::TimedOut,
+                            "Codex app-server response timed out",
+                        ),
+                    )));
+                }
+            }
         }
     }
 }
@@ -2009,6 +2047,33 @@ mod tests {
         let mut watcher = CodexWatcher::new(test_config(endpoint));
         watcher.run_until(&stop).unwrap();
         assert_eq!(watcher.depths.get("existing-thread"), Some(&0));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn synchronous_read_waits_across_socket_poll_timeouts() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let endpoint = format!("ws://{}", listener.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            std::thread::sleep(APPROVAL_POLL_DELAY * 4);
+            socket
+                .send(Message::Text(
+                    json!({"id": 1, "result": {}}).to_string().into(),
+                ))
+                .unwrap();
+        });
+        let (mut socket, _) = connect(&endpoint).unwrap();
+        configure_socket_polling(&mut socket).unwrap();
+        assert!(matches!(
+            read_json_poll(&mut socket).unwrap(),
+            SocketRead::Idle
+        ));
+        assert_eq!(
+            read_json(&mut socket).unwrap(),
+            Some(json!({"id": 1, "result": {}}))
+        );
         server.join().unwrap();
     }
 
@@ -2823,6 +2888,33 @@ mod tests {
         assert_eq!(
             file_request.controlled_response(ApprovalDecision::Always),
             json!({"id": 7, "result": {"decision": "decline"}})
+        );
+    }
+
+    #[test]
+    fn strict_review_grants_only_turn_permissions_and_never_other_approval_kinds() {
+        let request = ApprovalRequest::parse(&json!({"id":1,"method":"item/permissions/requestApproval","params":{"threadId":"thread","turnId":"turn","itemId":"item","permissions":{"network":{"enabled":true}}}})).unwrap();
+        assert!(supported_modes(&request).contains(&ApprovalDecision::Strict));
+        assert_eq!(
+            request.controlled_response(ApprovalDecision::Strict)["result"],
+            json!({"permissions":{"network":{"enabled":true}},"scope":"turn","strictAutoReview":true})
+        );
+        assert_eq!(
+            request.response(ApprovalDecision::Always)["result"]["scope"],
+            "session"
+        );
+        assert!(
+            request.response(ApprovalDecision::Once)["result"]
+                .get("strictAutoReview")
+                .is_none()
+        );
+        assert_eq!(
+            command_decision(&json!({}), ApprovalDecision::Strict),
+            "decline"
+        );
+        assert_eq!(
+            file_decision(&json!({}), ApprovalDecision::Strict),
+            "decline"
         );
     }
 

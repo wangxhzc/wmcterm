@@ -207,6 +207,36 @@ impl WmctermApplication {
         Ok(json!({"ok": true}))
     }
 
+    pub(super) fn codex_turn_event(&mut self, params: &Value) -> Result<Value, String> {
+        let (terminal, _) = self.codex_agent_update_route(params)?;
+        let session_id = params["session_id"]
+            .as_str()
+            .ok_or("missing Codex thread ID")?;
+        let launch = self
+            .managed_codex
+            .get(&terminal)
+            .ok_or("Codex launch is not registered")?;
+        if !launch.verified || launch.saved.session_id != session_id {
+            return Err("stale Codex turn event".into());
+        }
+        self.validate_codex_session(terminal, session_id)?;
+        let event: AgentEvent = serde_json::from_value(params["agent_event"].clone())
+            .map_err(|error| error.to_string())?;
+        if !matches!(
+            event,
+            AgentEvent::ToolUse { .. }
+                | AgentEvent::Stop { .. }
+                | AgentEvent::TurnComplete { .. }
+                | AgentEvent::TurnFailed { .. }
+        ) {
+            return Err("invalid Codex turn event".into());
+        }
+        self.record_agent_event(terminal, params, &event)?;
+        let state = self.apply_agent_event(terminal, event);
+        self.rebuild_scene();
+        Ok(json!({"state": state}))
+    }
+
     pub(super) fn codex_child(&mut self, params: &Value) -> Result<Value, String> {
         let mut route = params.clone();
         route["surface_id"] = params["root_surface_id"].clone();
@@ -343,6 +373,33 @@ pub(super) mod tests {
         assert!(app.managed_codex[&terminal].saved.session_id.is_empty());
         params["mode"] = json!("full-access");
         app.codex_launch_ready(&params).unwrap();
+        let root_session = params["session_id"].as_str().unwrap().to_owned();
+        let running = AgentEvent::ToolUse {
+            tool: "active task".into(),
+        };
+        app.record_agent_event(terminal, &params, &running).unwrap();
+        app.apply_agent_event(terminal, running);
+        let reviewer = AgentEvent::SessionStart {
+            agent: "codex".into(),
+            session_id: Some(uuid::Uuid::new_v4().to_string()),
+        };
+        assert!(
+            app.record_agent_event(terminal, &params, &reviewer)
+                .is_err()
+        );
+        assert_eq!(
+            app.state.surfaces[&surface]
+                .agent
+                .as_ref()
+                .unwrap()
+                .session_id
+                .as_deref(),
+            Some(root_session.as_str())
+        );
+        assert_eq!(
+            app.state.surfaces[&surface].agent.as_ref().unwrap().state,
+            wmcterm_core::AgentState::Running
+        );
         assert_eq!(
             app.state.surfaces[&surface]
                 .agent

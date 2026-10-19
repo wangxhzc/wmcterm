@@ -959,6 +959,7 @@ pub enum SessionEvent {
     ForegroundProcess(Vec<String>),
     ChildProcesses(Vec<String>),
     Agent(AgentEvent),
+    ProgramStatus(AgentEvent),
     Notification(String),
     ClipboardText {
         text: String,
@@ -1289,6 +1290,11 @@ fn process_pty_output_chunk(
     reply_limiter.begin_output_chunk(std::time::Instant::now());
     for event in osc.feed(bytes) {
         match event {
+            OscEvent::ProgramStatus(state) => {
+                let _ = events.send(SessionEvent::ProgramStatus(AgentEvent::StateObserved {
+                    state,
+                }));
+            }
             OscEvent::Agent(event) => {
                 let _ = events.send(SessionEvent::Agent(event));
             }

@@ -392,7 +392,8 @@ fn relay(
         stream.set_write_timeout(Some(Duration::from_secs(2)))?;
     }
     let mut pending = HashSet::new();
-    let mut verified: HashMap<String, Value> = HashMap::new();
+    let mut verified: HashMap<String, VerifiedThread> = HashMap::new();
+    let mut active_turns: HashMap<String, String> = HashMap::new();
     while !stop.load(Ordering::Acquire) {
         match client.read() {
             Ok(Message::Text(text)) => {
@@ -426,16 +427,21 @@ fn relay(
                         }
                     }
                     Some("turn/start") => {
-                        let sandbox = verified
+                        let thread = verified
                             .get(request["params"]["threadId"].as_str().unwrap_or_default())
-                            .expect("verified thread")
-                            .clone();
+                            .expect("verified thread");
+                        if let Err(error) = thread.validate_turn(&request) {
+                            client.send(Message::Text(json!({"id": request["id"], "error": {"code": -32602, "message": error}}).to_string().into()))?;
+                            continue;
+                        }
                         request["params"]["approvalPolicy"] = permissions.approval_policy.clone();
                         request["params"]["approvalsReviewer"] =
                             json!(permissions.approvals_reviewer);
-                        request["params"]["sandboxPolicy"] = sandbox;
+                        request["params"]["sandboxPolicy"] = thread.sandbox.clone();
                         if let Some(params) = request["params"].as_object_mut() {
                             params.remove("permissions");
+                            params.remove("cwd");
+                            params.remove("runtimeWorkspaceRoots");
                         }
                     }
                     _ => {}
@@ -457,16 +463,24 @@ fn relay(
         }
         match read_json_poll(&mut server)? {
             SocketRead::Message(response) => {
+                if let Some(event) = managed_turn_event(&response, &verified, &mut active_turns)
+                    && let Err(error) = control(config, "agent.codex.turn", event)
+                {
+                    eprintln!("wmcterm: Codex turn telemetry: {error}");
+                }
                 if response.get("method").is_none()
                     && response.get("id").is_some()
                     && pending.remove(&response["id"].to_string())
                     && response.get("error").is_none()
                 {
                     let result = permissions.verify(&response).and_then(|()| {
+                        let settings = VerifiedThread::from_response(&response)?;
                         let thread = response.pointer("/result/thread/id").and_then(Value::as_str)
                             .ok_or_else(|| BridgeError::Protocol("missing resumed thread ID".into()))?;
-                        control(config, "agent.codex.ready", json!({"session_id": thread, "mode": permissions.run_mode(), "cwd": response["result"]["cwd"]}))?;
-                        verified.insert(thread.to_owned(), response["result"]["sandbox"].clone());
+                        if !settings.ephemeral {
+                            control(config, "agent.codex.ready", json!({"session_id": thread, "mode": permissions.run_mode(), "cwd": response["result"]["cwd"]}))?;
+                        }
+                        verified.insert(thread.to_owned(), settings);
                         Ok(())
                     });
                     if let Err(error) = result {
@@ -485,6 +499,111 @@ fn relay(
     Ok(())
 }
 
+fn managed_turn_event(
+    notification: &Value,
+    verified: &HashMap<String, VerifiedThread>,
+    active: &mut HashMap<String, String>,
+) -> Option<Value> {
+    if notification.get("id").is_some() {
+        return None;
+    }
+    let method = notification["method"].as_str()?;
+    if !matches!(method, "turn/started" | "turn/completed") {
+        return None;
+    }
+    let params = &notification["params"];
+    let thread = params["threadId"].as_str()?;
+    let turn = params["turn"]["id"].as_str()?.trim();
+    if turn.is_empty()
+        || verified
+            .get(thread)
+            .is_none_or(|settings| settings.ephemeral)
+    {
+        return None;
+    }
+    let event = if method == "turn/started" {
+        active.insert(thread.to_owned(), turn.to_owned());
+        json!({"event": "tool_use", "tool": "Codex turn"})
+    } else {
+        if active.get(thread).map(String::as_str) != Some(turn) {
+            return None;
+        }
+        let event = match params["turn"]["status"].as_str()? {
+            "completed" => json!({"event": "stop", "success": true, "message": null}),
+            "interrupted" => {
+                json!({"event": "turn_complete", "continuing": false, "message": null})
+            }
+            "failed" => json!({"event": "turn_failed", "message": null}),
+            _ => return None,
+        };
+        active.remove(thread);
+        event
+    };
+    Some(json!({"session_id": thread, "turn_id": turn, "agent_event": event}))
+}
+
+struct VerifiedThread {
+    ephemeral: bool,
+    sandbox: Value,
+    cwd: String,
+    runtime_workspace_roots: Value,
+}
+
+impl VerifiedThread {
+    fn from_response(response: &Value) -> Result<Self, BridgeError> {
+        let result = &response["result"];
+        let cwd = result["cwd"]
+            .as_str()
+            .filter(|cwd| !cwd.is_empty())
+            .ok_or_else(|| BridgeError::Protocol("missing verified thread cwd".into()))?;
+        let roots = result
+            .get("runtimeWorkspaceRoots")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        if !roots.as_array().is_some_and(|roots| {
+            roots
+                .iter()
+                .all(|root| root.as_str().is_some_and(|root| !root.is_empty()))
+        }) {
+            return Err(BridgeError::Protocol(
+                "invalid runtime workspace roots".into(),
+            ));
+        }
+        Ok(Self {
+            ephemeral: result
+                .pointer("/thread/ephemeral")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            sandbox: result["sandbox"].clone(),
+            cwd: cwd.to_owned(),
+            runtime_workspace_roots: roots,
+        })
+    }
+
+    fn validate_turn(&self, request: &Value) -> Result<(), &'static str> {
+        let params = request["params"]
+            .as_object()
+            .ok_or("Turn start requires object params")?;
+        for (field, expected) in [
+            ("cwd", json!(self.cwd)),
+            (
+                "runtimeWorkspaceRoots",
+                self.runtime_workspace_roots.clone(),
+            ),
+        ] {
+            if params
+                .get(field)
+                .is_some_and(|value| !value.is_null() && *value != expected)
+            {
+                return Err(
+                    "Managed Codex cwd and workspace roots are fixed after thread verification; restart through wmcterm to change them",
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
 fn validate_settings_update(request: &Value) -> Result<(), &'static str> {
     let params = request["params"]
         .as_object()
@@ -497,6 +616,7 @@ fn validate_settings_update(request: &Value) -> Result<(), &'static str> {
         "sandboxPolicy",
         "permissions",
         "cwd",
+        "runtimeWorkspaceRoots",
     ]
     .iter()
     .any(|field| params.get(*field).is_some_and(|value| !value.is_null()))
@@ -510,6 +630,94 @@ fn validate_settings_update(request: &Value) -> Result<(), &'static str> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn managed_turn_notifications_track_verified_threads_and_matching_turns() {
+        let mut verified = HashMap::from([(
+            "thread".into(),
+            VerifiedThread {
+                ephemeral: false,
+                sandbox: json!({"type": "workspaceWrite"}),
+                cwd: "/work".into(),
+                runtime_workspace_roots: json!([]),
+            },
+        )]);
+        let mut active = HashMap::new();
+        verified.insert(
+            "reviewer".into(),
+            VerifiedThread {
+                ephemeral: true,
+                sandbox: json!({"type": "workspaceWrite"}),
+                cwd: "/work".into(),
+                runtime_workspace_roots: json!([]),
+            },
+        );
+        assert!(managed_turn_event(&json!({"method": "turn/started", "params": {"threadId": "reviewer", "turn": {"id": "1"}}}), &verified, &mut active).is_none());
+        let notification = |method: &str, thread: &str, turn: &str, status: &str| json!({"method": method, "params": {"threadId": thread, "turn": {"id": turn, "status": status}}});
+        assert!(
+            managed_turn_event(
+                &notification("turn/started", "other", "1", "inProgress"),
+                &verified,
+                &mut active
+            )
+            .is_none()
+        );
+        let started = managed_turn_event(
+            &notification("turn/started", "thread", "1", "inProgress"),
+            &verified,
+            &mut active,
+        )
+        .unwrap();
+        assert_eq!(started["agent_event"]["event"], "tool_use");
+        assert_eq!(started["session_id"], "thread");
+        managed_turn_event(
+            &notification("turn/started", "thread", "2", "inProgress"),
+            &verified,
+            &mut active,
+        )
+        .unwrap();
+        assert!(
+            managed_turn_event(
+                &notification("turn/completed", "thread", "1", "completed"),
+                &verified,
+                &mut active
+            )
+            .is_none()
+        );
+        let completed = managed_turn_event(
+            &notification("turn/completed", "thread", "2", "completed"),
+            &verified,
+            &mut active,
+        )
+        .unwrap();
+        assert_eq!(completed["agent_event"]["event"], "stop");
+        assert_eq!(completed["agent_event"]["success"], true);
+        assert!(
+            managed_turn_event(
+                &notification("turn/completed", "thread", "2", "completed"),
+                &verified,
+                &mut active
+            )
+            .is_none()
+        );
+        for (status, expected) in [("interrupted", "turn_complete"), ("failed", "turn_failed")] {
+            managed_turn_event(
+                &notification("turn/started", "thread", "3", "inProgress"),
+                &verified,
+                &mut active,
+            )
+            .unwrap();
+            assert_eq!(
+                managed_turn_event(
+                    &notification("turn/completed", "thread", "3", status),
+                    &verified,
+                    &mut active
+                )
+                .unwrap()["agent_event"]["event"],
+                expected
+            );
+        }
+    }
+
     use super::*;
 
     #[test]
@@ -565,7 +773,20 @@ mod tests {
                 .join(format!("wmcterm-permission-{}.sock", uuid::Uuid::new_v4()));
             let ready_count = Arc::new(AtomicU64::new(0));
             let observed = Arc::clone(&ready_count);
+            let turn_count = Arc::new(AtomicU64::new(0));
+            let observed_turns = Arc::clone(&turn_count);
             let _control = wmcterm_ipc::UnixServer::spawn(&socket_path, move |request| {
+                if request.method == "agent.codex.turn" {
+                    assert_eq!(request.params["surface_id"], "surface");
+                    assert_eq!(request.params["session_id"], "thread");
+                    assert_eq!(request.params["turn_id"], "turn");
+                    let index = observed_turns.fetch_add(1, Ordering::Relaxed);
+                    assert_eq!(
+                        request.params["agent_event"]["event"],
+                        if index == 0 { "tool_use" } else { "stop" }
+                    );
+                    return wmcterm_ipc::Response::success(request.id, json!({"ok": true}));
+                }
                 assert_eq!(request.method, "agent.codex.ready");
                 observed.fetch_add(1, Ordering::Relaxed);
                 wmcterm_ipc::Response::success(request.id, json!({"ok": true}))
@@ -580,59 +801,84 @@ mod tests {
                 workspace_cwd: "/tmp".into(),
                 max_auto_depth: 2,
             };
-            let provider =
-                std::thread::spawn(move || {
-                    let mut socket = tungstenite::accept(upstream.accept().unwrap().0).unwrap();
-                    let mut read = || -> Value {
-                        loop {
-                            if let Message::Text(text) = socket.read().unwrap() {
-                                return serde_json::from_str(&text).unwrap();
-                            }
+            let provider = std::thread::spawn(move || {
+                let mut socket = tungstenite::accept(upstream.accept().unwrap().0).unwrap();
+                let mut read = || -> Value {
+                    loop {
+                        if let Message::Text(text) = socket.read().unwrap() {
+                            return serde_json::from_str(&text).unwrap();
                         }
-                    };
-                    let request = read();
-                    assert_eq!(request["method"], "thread/resume");
-                    assert_eq!(request["params"]["approvalsReviewer"], "auto_review");
-                    assert_eq!(request["params"]["sandbox"], "workspace-write");
-                    assert_eq!(request["params"]["cwd"], "/worktree");
-                    socket.send(Message::Text(json!({"id": request["id"], "result": {
-                    "thread": {"id": "thread"}, "approvalPolicy": "on-request",
-                    "approvalsReviewer": if mismatch { "user" } else { "auto_review" },
-                    "sandbox": {"type": "workspaceWrite", "writableRoots": ["/worktree"]}
-                }}).to_string().into())).unwrap();
-                    if !mismatch {
-                        let Message::Text(text) = socket.read().unwrap() else {
-                            panic!("expected ordinary settings update")
-                        };
-                        let settings: Value = serde_json::from_str(&text).unwrap();
-                        assert_eq!(settings["method"], "thread/settings/update");
-                        assert_eq!(
-                            settings["params"],
-                            json!({"threadId": "thread", "model": "test-model"})
-                        );
-                        socket
-                            .send(Message::Text(
-                                json!({"id": settings["id"], "result": {}})
-                                    .to_string()
-                                    .into(),
-                            ))
-                            .unwrap();
-                        let Message::Text(text) = socket.read().unwrap() else {
-                            panic!("expected turn")
-                        };
-                        let turn: Value = serde_json::from_str(&text).unwrap();
-                        assert_eq!(turn["method"], "turn/start");
-                        assert_eq!(turn["params"]["sandboxPolicy"]["type"], "workspaceWrite");
-                        assert_eq!(turn["params"]["approvalsReviewer"], "auto_review");
-                        socket
-                            .send(Message::Text(
-                                json!({"id": turn["id"], "result": {"ok": true}})
-                                    .to_string()
-                                    .into(),
-                            ))
-                            .unwrap();
                     }
-                });
+                };
+                let request = read();
+                assert_eq!(request["method"], "thread/resume");
+                assert_eq!(request["params"]["approvalsReviewer"], "auto_review");
+                assert_eq!(request["params"]["sandbox"], "workspace-write");
+                assert_eq!(request["params"]["cwd"], "/worktree");
+                socket
+                    .send(Message::Text(
+                        json!({"id": request["id"], "result": {
+                            "thread": {"id": "thread"}, "approvalPolicy": "on-request",
+                            "cwd": "/worktree", "runtimeWorkspaceRoots": ["/worktree"],
+                            "approvalsReviewer": if mismatch { "user" } else { "auto_review" },
+                            "sandbox": {"type": "workspaceWrite", "writableRoots": ["/worktree"]}
+                        }})
+                        .to_string()
+                        .into(),
+                    ))
+                    .unwrap();
+                if !mismatch {
+                    let Message::Text(text) = socket.read().unwrap() else {
+                        panic!("expected reviewer resume")
+                    };
+                    let reviewer: Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(reviewer["method"], "thread/resume");
+                    socket.send(Message::Text(json!({"id": reviewer["id"], "result": {
+                            "thread": {"id": "reviewer", "ephemeral": true},
+                            "approvalPolicy": "on-request", "approvalsReviewer": "auto_review",
+                            "cwd": "/worktree", "runtimeWorkspaceRoots": ["/worktree"],
+                            "sandbox": {"type": "workspaceWrite", "writableRoots": ["/worktree"]}
+                        }}).to_string().into())).unwrap();
+                    let Message::Text(text) = socket.read().unwrap() else {
+                        panic!("expected ordinary settings update")
+                    };
+                    let settings: Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(settings["method"], "thread/settings/update");
+                    assert_eq!(
+                        settings["params"],
+                        json!({"threadId": "thread", "model": "test-model"})
+                    );
+                    socket
+                        .send(Message::Text(
+                            json!({"id": settings["id"], "result": {}})
+                                .to_string()
+                                .into(),
+                        ))
+                        .unwrap();
+                    let Message::Text(text) = socket.read().unwrap() else {
+                        panic!("expected turn")
+                    };
+                    let turn: Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(turn["method"], "turn/start");
+                    assert_eq!(turn["params"]["sandboxPolicy"]["type"], "workspaceWrite");
+                    assert_eq!(turn["params"]["approvalsReviewer"], "auto_review");
+                    assert!(turn["params"].get("cwd").is_none());
+                    assert!(turn["params"].get("runtimeWorkspaceRoots").is_none());
+                    for (method, status) in [
+                        ("turn/started", "inProgress"),
+                        ("turn/completed", "completed"),
+                    ] {
+                        socket.send(Message::Text(json!({"method": method, "params": {"threadId": "thread", "turn": {"id": "turn", "status": status}}}).to_string().into())).unwrap();
+                    }
+                    socket
+                        .send(Message::Text(
+                            json!({"id": turn["id"], "result": {"ok": true}})
+                                .to_string()
+                                .into(),
+                        ))
+                        .unwrap();
+                }
+            });
             let stop = Arc::new(AtomicBool::new(false));
             let relay_stop = Arc::clone(&stop);
             let worker = std::thread::spawn(move || {
@@ -669,6 +915,11 @@ mod tests {
             let response = read_json(&mut client).unwrap().unwrap();
             assert_eq!(response.get("error").is_some(), mismatch);
             if !mismatch {
+                send_json(&mut client, &json!({"id": 14, "method": "thread/resume", "params": {"threadId": "reviewer"}})).unwrap();
+                assert_eq!(
+                    read_json(&mut client).unwrap().unwrap()["result"]["thread"]["ephemeral"],
+                    true
+                );
                 for method in ["thread/settings/update", "turn/settings/update"] {
                     for (field, value) in [
                         ("approvalPolicy", json!("never")),
@@ -676,6 +927,7 @@ mod tests {
                         ("sandboxPolicy", json!({"type": "dangerFullAccess"})),
                         ("permissions", json!("full-access")),
                         ("cwd", json!("/other-workspace")),
+                        ("runtimeWorkspaceRoots", json!(["/other-workspace"])),
                     ] {
                         let mut request = json!({"id": 10, "method": method, "params": {"threadId": "thread", "turnId": "turn"}});
                         request["params"][field] = value;
@@ -695,7 +947,23 @@ mod tests {
                     read_json(&mut client).unwrap().unwrap()["result"],
                     json!({})
                 );
-                send_json(&mut client, &json!({"id": 3, "method": "turn/start", "params": {"threadId": "thread", "sandboxPolicy": {"type": "dangerFullAccess"}}})).unwrap();
+                for (field, value) in [
+                    ("cwd", json!("/other-workspace")),
+                    ("runtimeWorkspaceRoots", json!(["/other-workspace"])),
+                ] {
+                    let mut request =
+                        json!({"id": 13, "method": "turn/start", "params": {"threadId": "thread"}});
+                    request["params"][field] = value;
+                    send_json(&mut client, &request).unwrap();
+                    assert_eq!(
+                        read_json(&mut client).unwrap().unwrap()["error"]["code"],
+                        -32602
+                    );
+                }
+                send_json(&mut client, &json!({"id": 3, "method": "turn/start", "params": {"threadId": "thread", "cwd": "/worktree", "runtimeWorkspaceRoots": ["/worktree"], "sandboxPolicy": {"type": "dangerFullAccess"}}})).unwrap();
+                for method in ["turn/started", "turn/completed"] {
+                    assert_eq!(read_json(&mut client).unwrap().unwrap()["method"], method);
+                }
                 assert_eq!(
                     read_json(&mut client).unwrap().unwrap()["result"]["ok"],
                     true
@@ -709,6 +977,10 @@ mod tests {
             }
             provider.join().unwrap();
             assert_eq!(ready_count.load(Ordering::Relaxed), u64::from(!mismatch));
+            assert_eq!(
+                turn_count.load(Ordering::Relaxed),
+                if mismatch { 0 } else { 2 }
+            );
         }
     }
 
@@ -725,6 +997,51 @@ mod tests {
             );
             assert!(validate_settings_update(&json!({"method": method, "params": []})).is_err());
         }
+    }
+
+    #[test]
+    fn turns_preserve_verified_workspace_and_reject_malformed_overrides() {
+        let response = json!({"result": {
+            "cwd": "/worktree", "sandbox": {"type": "workspaceWrite"},
+            "runtimeWorkspaceRoots": ["/worktree", "/shared"]
+        }});
+        let thread = VerifiedThread::from_response(&response).unwrap();
+        for params in [
+            json!({}),
+            json!({"cwd": null, "runtimeWorkspaceRoots": null}),
+            json!({"cwd": "/worktree", "runtimeWorkspaceRoots": ["/worktree", "/shared"]}),
+        ] {
+            assert!(thread.validate_turn(&json!({"params": params})).is_ok());
+        }
+        for params in [
+            json!({"cwd": "/other"}),
+            json!({"cwd": 1}),
+            json!({"runtimeWorkspaceRoots": []}),
+            json!({"runtimeWorkspaceRoots": ["/worktree", "/shared", "/extra"]}),
+            json!({"runtimeWorkspaceRoots": "invalid"}),
+            json!([]),
+        ] {
+            assert!(thread.validate_turn(&json!({"params": params})).is_err());
+        }
+        for result in [
+            json!({}),
+            json!({"cwd": ""}),
+            json!({"cwd": "/worktree", "runtimeWorkspaceRoots": [1]}),
+        ] {
+            assert!(VerifiedThread::from_response(&json!({"result": result})).is_err());
+        }
+        let legacy =
+            VerifiedThread::from_response(&json!({"result": {"cwd": "/worktree"}})).unwrap();
+        assert!(
+            legacy
+                .validate_turn(&json!({"params": {"runtimeWorkspaceRoots": []}}))
+                .is_ok()
+        );
+        assert!(
+            legacy
+                .validate_turn(&json!({"params": {"runtimeWorkspaceRoots": ["/extra"]}}))
+                .is_err()
+        );
     }
 
     #[test]

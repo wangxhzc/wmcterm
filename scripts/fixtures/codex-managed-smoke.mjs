@@ -11,10 +11,13 @@ const token = process.env[args[args.indexOf('--remote-auth-token-env') + 1]];
 assert(token);
 const socket = new WebSocket(endpoint, { headers: { Authorization: `Bearer ${token}` } });
 const pending = new Map();
+let completedTurn;
+const turnCompleted = new Promise(resolve => { completedTurn = resolve; });
 let sequence = 0;
 const timeout = setTimeout(() => { console.error('managed Codex smoke timed out'); process.exit(1); }, 20000);
 socket.addEventListener('message', event => {
   const message = JSON.parse(event.data);
+  if (message.method === 'turn/completed') completedTurn(message.params);
   if (!message.method && pending.has(message.id)) {
     const { resolve, reject } = pending.get(message.id);
     pending.delete(message.id);
@@ -36,12 +39,30 @@ socket.addEventListener('open', async () => {
       ? await request('thread/resume', { threadId: args[resume + 1] })
       : await request('thread/start', { cwd: process.cwd() });
     const threadId = result.thread.id;
+    if (process.env.WMCTERM_TEST_INPUT_ROUNDTRIP === '1') {
+      const started = await request('turn/start', {
+        threadId, input: [{ type: 'text', text: 'Ask for a target', text_elements: [] }],
+        collaborationMode: { mode: 'plan', settings: { model: 'mock-model', reasoning_effort: 'medium', developer_instructions: null } },
+      });
+      const completed = await turnCompleted;
+      assert.equal(completed.turn.id, started.turn.id);
+      assert.equal(completed.turn.status, 'completed');
+      appendFileSync(process.env.WMCTERM_TEST_RESULTS, JSON.stringify({ threadId, completed: true }) + '\n');
+      clearTimeout(timeout);
+      socket.close();
+      return;
+    }
     for (const method of ['thread/settings/update', 'turn/settings/update']) {
       await assert.rejects(request(method, { threadId, turnId: 'no-active-turn', approvalsReviewer: 'user' }), /fixed at launch/);
       await assert.rejects(request(method, { threadId: 'unverified-thread', model: 'test-model' }), /not been verified/);
     }
     await assert.rejects(request('thread/settings/update', { threadId, permissions: 'full-access' }), /fixed at launch/);
     await assert.rejects(request('thread/settings/update', { threadId, cwd: '/different-workspace' }), /fixed at launch/);
+    await assert.rejects(request('thread/settings/update', { threadId, runtimeWorkspaceRoots: ['/different-workspace'] }), /fixed at launch/);
+    // Invalid input also prevents a model turn if a broken proxy forwards these probes.
+    for (const workspace of [{ cwd: '/different-workspace' }, { runtimeWorkspaceRoots: ['/different-workspace'] }]) {
+      await assert.rejects(request('turn/start', { threadId, input: [{ type: 'wmcterm_invalid_fixture' }], ...workspace }), /fixed after thread verification/);
+    }
     await request('thread/settings/update', { threadId, effort: 'high' });
     await request('thread/inject_items', { threadId, items: [{ type: 'message', role: 'user', content: [{ type: 'input_text', text: 'wmcterm restore smoke fixture; no model turn.' }] }] });
     // The same RPC used by the in-session /resume path.

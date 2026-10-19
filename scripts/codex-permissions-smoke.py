@@ -72,11 +72,23 @@ def main():
                         ]}],
                     })
                     resumed = request("thread/resume", dict(permissions, threadId=thread_id))
-                    for result in (started, resumed):
+                    saved = request("thread/resume", {"threadId": thread_id, "excludeTurns": True})
+                    for result in (started, resumed, saved):
                         assert result["approvalPolicy"] == policy, result["approvalPolicy"]
                         assert result["approvalsReviewer"] == reviewer, result["approvalsReviewer"]
                         assert result["sandbox"]["type"] == wire_sandbox, result["sandbox"]
-                    print(f"PASS {name}: thread/start + thread/resume verified")
+                        assert result["cwd"] == directory, result["cwd"]
+                        assert isinstance(result.get("runtimeWorkspaceRoots", []), list), result
+                    alternate = {"approvalPolicy": "on-request", "approvalsReviewer": "user", "sandbox": "read-only"}
+                    request("thread/unsubscribe", {"threadId": thread_id})
+                    changed = request("thread/resume", dict(alternate, threadId=thread_id))
+                    assert changed["sandbox"]["type"] == "readOnly", changed
+                    request("thread/unsubscribe", {"threadId": thread_id})
+                    restored = request("thread/resume", dict(permissions, threadId=thread_id))
+                    assert restored["approvalPolicy"] == policy, restored
+                    assert restored["approvalsReviewer"] == reviewer, restored
+                    assert restored["sandbox"]["type"] == wire_sandbox, restored
+                    print(f"PASS {name}: create, saved permissions, explicit mode change and restore verified")
             finally:
                 selector.close()
                 server.terminate()

@@ -157,6 +157,8 @@ fn print_help() {
          \x20 wmcterm notify [--title TITLE] [--body BODY] [--surface ID]\n\
          \x20 wmcterm agent-event JSON\n\
          \x20 wmcterm agent-request list|reply|cancel ...\n\
+         \x20   reply ID --choice strict: turn-scoped Codex permissions with strict command review\n\
+         \x20   reply ID --text JSON: input field IDs mapped to string answers\n\
          \x20 wmcterm hook receive|plan|install --agent KIND [--event NAME]\n\
          \x20   Claude StopFailure reports a failed turn without ending the session\n\
          \x20 wmcterm skill print|install [--scope project|user] [--force]\n\
@@ -164,13 +166,16 @@ fn print_help() {
          \x20 wmcterm agent [--mode interactive|unattended|full-access] claude|codex [ARG...]\n\
          \x20 wmcterm codex-teams [CODEX_ARG...]\n\
          \x20   Codex defaults: --ask-for-approval on-request --sandbox workspace-write\n\
-         \x20   Claude interactive defaults: --permission-mode default (explicit modes are preserved)\n\
+         \x20   Claude interactive defaults: --permission-mode manual (explicit modes are preserved)\n\
          \x20   Auto review (--mode unattended): Codex --approve-for-me/workspace-write; Claude --permission-mode auto\n\
          \x20   --mode full-access is blocked in CLI and requires UI-authorized flow\n\
          \x20   Managed Codex/Claude bypass options are rejected\n\
+         \x20   Managed Claude rejects hook-disabling modes, settings sources, settings and environment\n\
+         \x20   Managed Claude rejects --bg/--background, --cloud, --desktop and --tmux\n\
          \x20   Managed Codex restores its saved mode and Teams bridge after restart\n\
          \x20   Remote /resume permissions are applied and verified server-side; failures do not downgrade\n\
          \x20   Managed Codex rejects in-session permission/cwd settings updates; restart with the desired profile\n\
+         \x20   Codex turn/start cannot change verified cwd or runtime workspace roots\n\
          \x20 wmcterm ssh TARGET [SSH_ARG...]\n\
          \x20 wmcterm ssh HOST --surface UUID [--wait] [--timeout-ms N]\n\
          \x20 wmcterm ssh HOST [--new] [--pane UUID] [--timeout-ms N] (right split, no focus; defaults to WMCTERM_PANE_ID)\n\
@@ -1103,6 +1108,13 @@ fn run_agent(mut args: impl Iterator<Item = String>) -> Result<()> {
     let (mode, program, supplied) = parse_agent_launch_args(&mut args)?;
     let (mut executable, mut child_args) = plan_agent_process(mode, &program, &supplied)?;
     if program == "claude" {
+        for name in ["CLAUDE_CODE_SIMPLE", "CLAUDE_CODE_SAFE_MODE"] {
+            validate_claude_hook_environment(name, env::var_os(name).as_deref())?;
+        }
+        validate_claude_hook_config_files(
+            &agent_config_root(wmcterm_agent::AgentKind::Claude, InstallScope::User)?,
+            &env::current_dir()?,
+        )?;
         (executable, child_args) = resolve_claude_command(executable, child_args);
     }
     let status = std::process::Command::new(&executable)
@@ -1250,6 +1262,42 @@ fn plan_claude_launch_args(mode: AgentRunMode, args: &[String]) -> Result<Vec<St
         if argument == "--" {
             break;
         }
+        let option = argument.split('=').next().unwrap_or(argument);
+        if matches!(
+            option,
+            "--bg" | "--background" | "--cloud" | "--desktop" | "--tmux"
+        ) {
+            bail!(
+                "Claude option {option} detaches from the managed terminal and is not supported; start an interactive session instead"
+            );
+        }
+        if matches!(
+            option,
+            "--bare" | "--safe-mode" | "--restricted" | "--setting-sources"
+        ) {
+            bail!(
+                "Claude option {option} can disable wmcterm hooks and is not supported by the managed launcher"
+            );
+        }
+        if option == "--settings" {
+            let value = if let Some((_, value)) = argument.split_once('=') {
+                value
+            } else {
+                index += 1;
+                args.get(index)
+                    .context("`--settings` requires a file or JSON object")?
+            };
+            let settings: Value = if value.trim_start().starts_with('{') {
+                serde_json::from_str(value).context("invalid Claude --settings JSON")?
+            } else {
+                let contents = std::fs::read_to_string(value)
+                    .with_context(|| format!("could not read Claude settings {value}"))?;
+                serde_json::from_str(&contents).context("invalid Claude settings file")?
+            };
+            validate_claude_hook_settings(&settings)?;
+            index += 1;
+            continue;
+        }
         if argument == "--dangerously-skip-permissions"
             || argument == "--allow-dangerously-skip-permissions"
             || argument.starts_with("--dangerously-skip-permissions=")
@@ -1286,12 +1334,70 @@ fn plan_claude_launch_args(mode: AgentRunMode, args: &[String]) -> Result<Vec<St
         let permission_mode = if mode == AgentRunMode::Unattended {
             "auto"
         } else {
-            "default"
+            "manual"
         };
         planned.extend(["--permission-mode".into(), permission_mode.into()]);
     }
     planned.extend_from_slice(args);
     Ok(planned)
+}
+
+fn validate_claude_hook_settings(settings: &Value) -> Result<()> {
+    let object = settings
+        .as_object()
+        .context("Claude settings must be a JSON object")?;
+    for name in ["disableAllHooks", "allowManagedHooksOnly"] {
+        if object
+            .get(name)
+            .is_some_and(|value| *value != Value::Bool(false))
+        {
+            bail!(
+                "Claude setting {name} can disable wmcterm hooks and is not supported by the managed launcher"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_claude_hook_config_files(user_root: &Path, cwd: &Path) -> Result<()> {
+    let mut paths = vec![user_root.join("settings.json")];
+    for directory in cwd.ancestors() {
+        paths.extend([
+            directory.join(".claude/settings.json"),
+            directory.join(".claude/settings.local.json"),
+        ]);
+        if directory.join(".git").exists() {
+            break;
+        }
+    }
+    for path in paths {
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| format!("could not read {}", path.display()));
+            }
+        };
+        let settings: Value = serde_json::from_str(&contents)
+            .with_context(|| format!("invalid Claude settings in {}", path.display()))?;
+        validate_claude_hook_settings(&settings).with_context(|| {
+            format!(
+                "Claude settings in {} disable managed integration",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+fn validate_claude_hook_environment(name: &str, value: Option<&std::ffi::OsStr>) -> Result<()> {
+    if value.is_some_and(|value| {
+        let value = value.to_string_lossy();
+        !value.is_empty() && value != "0" && !value.eq_ignore_ascii_case("false")
+    }) {
+        bail!("{name} can disable wmcterm hooks; unset it before launching managed Claude");
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -1787,6 +1893,7 @@ fn run_hook(mut args: impl Iterator<Item = String>) -> Result<()> {
 
 #[derive(Debug, Default)]
 struct CodexHookContext {
+    session_id: Option<String>,
     subagent: Option<wmcterm_agent::CodexSubagentHookEvent>,
     session_end: Option<String>,
 }
@@ -1800,12 +1907,14 @@ fn codex_hook_context(
         return CodexHookContext::default();
     }
     let event = event.or_else(|| payload.get("hook_event_name").and_then(Value::as_str));
-    match event {
+    let mut context = match event {
         Some("SubagentStart" | "SubagentStop") => CodexHookContext {
+            session_id: None,
             subagent: wmcterm_agent::normalize_codex_subagent_hook_event(event, payload).ok(),
             session_end: None,
         },
         Some("SessionEnd") => CodexHookContext {
+            session_id: None,
             subagent: None,
             session_end: payload
                 .get("session_id")
@@ -1814,7 +1923,13 @@ fn codex_hook_context(
                 .map(str::to_owned),
         },
         _ => CodexHookContext::default(),
-    }
+    };
+    context.session_id = payload
+        .get("session_id")
+        .and_then(Value::as_str)
+        .filter(|session| !session.trim().is_empty())
+        .map(str::to_owned);
+    context
 }
 
 const HOOK_DELIVERY_BUDGET: Duration = Duration::from_millis(75);
@@ -1896,6 +2011,9 @@ fn deliver_hook_bounded(
         object.insert("claude_hook".into(), hook);
     }
     if let Some(object) = params.as_object_mut() {
+        if let Some(session_id) = codex_hook.session_id {
+            object.insert("codex_session_id".into(), session_id.into());
+        }
         if let Some(hook) = codex_hook.subagent
             && let Ok(hook) = serde_json::to_value(hook)
         {
@@ -2774,7 +2892,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(program, PathBuf::from("claude"));
-        assert_eq!(args, ["--permission-mode", "default", "--model", "sonnet"]);
+        assert_eq!(args, ["--permission-mode", "manual", "--model", "sonnet"]);
 
         let (program, args) = plan_agent_process(AgentRunMode::Interactive, "codex", &[]).unwrap();
         assert_eq!(program, env::current_exe().unwrap());
@@ -3269,11 +3387,12 @@ mod tests {
     fn claude_interactive_pins_manual_permissions_and_preserves_explicit_modes() {
         assert_eq!(
             plan_claude_launch_args(AgentRunMode::Interactive, &[]).unwrap(),
-            ["--permission-mode", "default"]
+            ["--permission-mode", "manual"]
         );
         for args in [
             vec!["--permission-mode=plan".into()],
             vec!["--permission-mode".into(), "manual".into()],
+            vec!["--permission-mode=default".into()],
         ] {
             assert_eq!(
                 plan_claude_launch_args(AgentRunMode::Interactive, &args).unwrap(),
@@ -3288,7 +3407,7 @@ mod tests {
             .unwrap(),
             [
                 "--permission-mode",
-                "default",
+                "manual",
                 "--",
                 "--permission-mode=auto"
             ]
@@ -3320,6 +3439,120 @@ mod tests {
         ] {
             assert!(plan_claude_launch_args(AgentRunMode::Interactive, &[option.into()]).is_err());
         }
+    }
+
+    #[test]
+    fn claude_launch_rejects_hook_disabling_options_and_settings() {
+        for args in [
+            vec!["--bare"],
+            vec!["--safe-mode"],
+            vec!["--restricted"],
+            vec!["--setting-sources", "user"],
+            vec!["--setting-sources="],
+            vec!["--settings", "{\"disableAllHooks\":true}"],
+            vec!["--settings={\"allowManagedHooksOnly\":true}"],
+            vec!["--settings", "{\"disableAllHooks\":\"false\"}"],
+            vec!["--settings", "{invalid}"],
+            vec!["--settings"],
+        ] {
+            let args = args.into_iter().map(String::from).collect::<Vec<_>>();
+            assert!(
+                plan_claude_launch_args(AgentRunMode::Interactive, &args).is_err(),
+                "{args:?}"
+            );
+        }
+        let args = vec![
+            "--settings".into(),
+            "{\"disableAllHooks\":false,\"model\":\"sonnet\"}".into(),
+            "--permission-mode=plan".into(),
+        ];
+        assert_eq!(
+            plan_claude_launch_args(AgentRunMode::Interactive, &args).unwrap(),
+            args
+        );
+        let args = vec!["--".into(), "--bare".into()];
+        assert_eq!(
+            plan_claude_launch_args(AgentRunMode::Interactive, &args).unwrap(),
+            ["--permission-mode", "manual", "--", "--bare"]
+        );
+    }
+
+    #[test]
+    fn claude_managed_launch_rejects_detached_terminal_modes() {
+        for option in [
+            "--bg",
+            "--background",
+            "--bg=true",
+            "--cloud",
+            "--desktop",
+            "--tmux=classic",
+        ] {
+            assert!(
+                plan_claude_launch_args(AgentRunMode::Interactive, &[option.into()])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("detaches")
+            );
+        }
+        assert!(
+            plan_claude_launch_args(AgentRunMode::Interactive, &["--".into(), "--bg".into()])
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn claude_launch_rejects_hook_disabling_environment_without_mutating_it() {
+        for name in ["CLAUDE_CODE_SIMPLE", "CLAUDE_CODE_SAFE_MODE"] {
+            assert!(validate_claude_hook_environment(name, None).is_ok());
+            for value in ["", "0", "false", "FALSE"] {
+                assert!(
+                    validate_claude_hook_environment(name, Some(std::ffi::OsStr::new(value)))
+                        .is_ok()
+                );
+            }
+            for value in ["1", "true", "yes"] {
+                assert!(
+                    validate_claude_hook_environment(name, Some(std::ffi::OsStr::new(value)))
+                        .is_err()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn claude_launch_checks_settings_files_and_inherited_project_settings() {
+        let directory = env::temp_dir().join(format!(
+            "wmcterm-claude-settings-{}-{}",
+            std::process::id(),
+            HOOK_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+        ));
+        let user = directory.join("user");
+        let project = directory.join("project");
+        let cwd = project.join("nested");
+        fs::create_dir_all(&user).unwrap();
+        fs::create_dir_all(project.join(".git")).unwrap();
+        fs::create_dir_all(project.join(".claude")).unwrap();
+        fs::create_dir_all(&cwd).unwrap();
+        assert!(validate_claude_hook_config_files(&user, &cwd).is_ok());
+        let path = project.join(".claude/settings.local.json");
+        fs::write(&path, "{\"disableAllHooks\":true}").unwrap();
+        assert!(validate_claude_hook_config_files(&user, &cwd).is_err());
+        let args = vec!["--settings".into(), path.to_string_lossy().into_owned()];
+        assert!(plan_claude_launch_args(AgentRunMode::Interactive, &args).is_err());
+        let equals = vec![format!("--settings={}", path.display())];
+        assert!(plan_claude_launch_args(AgentRunMode::Interactive, &equals).is_err());
+        fs::write(&path, "{\"disableAllHooks\":false}").unwrap();
+        assert!(validate_claude_hook_config_files(&user, &cwd).is_ok());
+        assert!(plan_claude_launch_args(AgentRunMode::Interactive, &args).is_ok());
+        fs::write(
+            user.join("settings.json"),
+            "{\"allowManagedHooksOnly\":true}",
+        )
+        .unwrap();
+        assert!(validate_claude_hook_config_files(&user, &cwd).is_err());
+        fs::write(user.join("settings.json"), "invalid JSON").unwrap();
+        assert!(validate_claude_hook_config_files(&user, &cwd).is_err());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

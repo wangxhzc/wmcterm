@@ -41,8 +41,32 @@ try {
   const terminal = rpc('app.diagnostics').terminals.find(item => item.surface_id === surface);
   const hookEnv = { ...env, WMCTERM: '1', WMCTERM_SURFACE_ID: surface,
     WMCTERM_WORKSPACE_ID: workspace, WMCTERM_TERMINAL_LIFECYCLE_ID: terminal.lifecycle_id };
+  const launchEnv = { ...hookEnv, CLAUDE_CONFIG_DIR: join(directory, 'claude') };
+  delete launchEnv.CLAUDE_CODE_SIMPLE;
+  delete launchEnv.CLAUDE_CODE_SAFE_MODE;
+  for (const options of [
+    ['--bare'], ['--safe-mode'], ['--restricted'], ['--setting-sources=user'],
+    ['--settings', '{"disableAllHooks":true}'],
+    ['--settings={"allowManagedHooksOnly":true}'],
+  ]) {
+    assert.throws(() => execFileSync(binary, ['agent', 'claude', ...options, '--version'], {
+      env: launchEnv, cwd: join(directory, 'workspace'), timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'],
+    }), /disable wmcterm hooks/);
+  }
+  for (const flag of ['CLAUDE_CODE_SIMPLE', 'CLAUDE_CODE_SAFE_MODE']) {
+    assert.throws(() => execFileSync(binary, ['agent', 'claude', '--version'], {
+      env: { ...launchEnv, [flag]: '1' }, cwd: join(directory, 'workspace'),
+      timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'],
+    }), /disable wmcterm hooks/);
+  }
   const plan = JSON.parse(execFileSync(binary, ['hook', 'plan', '--agent', 'claude'], { env }));
   const hooks = JSON.parse(plan.snippets[0].content).hooks;
+  assert.equal(hooks.PermissionRequest[0].hooks[0].onFailure, 'block');
+  for (const option of ['--bg', '--background', '--desktop', '--cloud', '--tmux=classic']) {
+    assert.throws(() => execFileSync(binary, ['agent', 'claude', option, '--version'], {
+      env: launchEnv, cwd: join(directory, 'workspace'), timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'],
+    }), /detaches from the managed terminal/);
+  }
   const receive = (event, payload) => execFileSync('/bin/sh', ['-c', hooks[event][0].hooks[0].command], {
     env: hookEnv, input: JSON.stringify({ session_id: 'smoke-session', ...payload }), timeout: 5000,
   });
@@ -50,6 +74,9 @@ try {
     notification_type, message: 'smoke notification', permission_mode,
   });
   receive('SessionStart', { permission_mode: 'default' });
+  receive('UserPromptSubmit', { prompt: 'smoke prompt', permission_mode: 'default' });
+  assert.equal(metadata().state, 'running');
+  receive('Stop', { permission_mode: 'default' });
   hook('agent_completed', 'notification', { message: 'smoke notification' });
   assert.equal(metadata().state, 'idle');
   assert.equal(metadata().run_mode, 'unattended');
@@ -106,7 +133,7 @@ try {
     assert.equal((await permissionExit)[0], 0);
     assert.equal(JSON.parse(permissionOutput).hookSpecificOutput.decision.behavior, 'allow');
   } finally { clearTimeout(permissionTimer); }
-  console.log('Claude notification and mode smoke passed');
+  console.log('Claude launch guards, notification and mode smoke passed');
 } finally {
   if (permission && permission.exitCode === null && permission.signalCode === null) permission.kill('SIGKILL');
   if (app.exitCode === null && app.signalCode === null) app.kill('SIGTERM');

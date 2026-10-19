@@ -281,6 +281,17 @@ impl PendingAgentRequests {
             .collect())
     }
 
+    pub fn completed_reply(
+        &self,
+        request_id: &str,
+    ) -> Result<Option<AgentInteractionReply>, PendingAgentRequestError> {
+        Ok(self
+            .lock()?
+            .completed
+            .get(request_id)
+            .map(|record| record.reply.clone()))
+    }
+
     pub fn resolve(
         &self,
         request_id: &str,
@@ -763,6 +774,60 @@ mod agent_request_tests {
                 .unwrap(),
             reply
         );
+    }
+
+    #[test]
+    fn concurrent_input_reply_and_disconnect_preserve_first_completion() {
+        for iteration in 0..32 {
+            let pending = PendingAgentRequests::new(1).unwrap();
+            let mut input = request("r1", "life-1", None);
+            input.kind = AgentRequestKind::new(AgentRequestKind::INPUT);
+            pending.register(input).unwrap();
+            let gate = Arc::new(std::sync::Barrier::new(3));
+            let replying = pending.clone();
+            let reply_gate = gate.clone();
+            let answer = std::thread::spawn(move || {
+                reply_gate.wait();
+                replying
+                    .resolve(
+                        "r1",
+                        AgentResolution {
+                            text: Some(r#"{"target":"test"}"#.into()),
+                            ..Default::default()
+                        },
+                        iteration,
+                    )
+                    .unwrap()
+            });
+            let disconnecting = pending.clone();
+            let cancel_gate = gate.clone();
+            let cancel = std::thread::spawn(move || {
+                cancel_gate.wait();
+                disconnecting
+                    .cancel("r1", "codex_disconnected", iteration)
+                    .unwrap()
+            });
+            gate.wait();
+            let outcomes = [answer.join().unwrap(), cancel.join().unwrap()];
+            assert_eq!(
+                outcomes
+                    .iter()
+                    .filter(|outcome| matches!(outcome, CompleteOutcome::Completed(_)))
+                    .count(),
+                1
+            );
+            let replies = outcomes.map(|outcome| match outcome {
+                CompleteOutcome::Completed(reply) | CompleteOutcome::AlreadyCompleted(reply) => {
+                    reply
+                }
+            });
+            assert_eq!(replies[0], replies[1]);
+            assert_eq!(
+                pending.completed_reply("r1").unwrap(),
+                Some(replies[0].clone())
+            );
+            assert!(pending.is_empty().unwrap());
+        }
     }
 
     #[test]

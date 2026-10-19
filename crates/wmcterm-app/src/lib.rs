@@ -2,6 +2,8 @@
 mod claude_regression;
 mod codex_restore;
 mod i18n;
+#[cfg(test)]
+mod input_regression;
 mod session_start_guard;
 mod system_proxy;
 mod text_edit;
@@ -442,6 +444,7 @@ struct TerminalClick {
 
 #[derive(Clone, Copy)]
 enum PromptKind {
+    AgentInput,
     RenameWorkspace,
     DescribeWorkspace,
     ChangeWorkspaceDirectory,
@@ -641,6 +644,7 @@ enum AgentApprovalAction {
     Deny,
     AllowOnce,
     AlwaysAllow,
+    StrictReview,
 }
 
 const TAB_CONTEXT_ACTIONS: [TabContextAction; 3] = [
@@ -1187,6 +1191,8 @@ struct WmctermApplication {
     pending_agent_requests: PendingAgentRequests,
     agent_approval_results: HashMap<String, AgentApprovalAction>,
     agent_approval_bindings: HashMap<String, (SurfaceId, String, Option<u64>)>,
+    agent_input_forms: HashMap<String, wmcterm_codex::InputRequest>,
+    agent_input_edit: Option<(String, usize, serde_json::Map<String, Value>)>,
     agent_approval_result_order: VecDeque<String>,
     claude_subagents: HashMap<String, ClaudeSubagentStatus>,
     codex_subagents: CodexSubagentTracker,
@@ -1403,6 +1409,8 @@ impl WmctermApplication {
                 .expect("pending Agent request capacity is non-zero"),
             agent_approval_results: HashMap::new(),
             agent_approval_bindings: HashMap::new(),
+            agent_input_forms: HashMap::new(),
+            agent_input_edit: None,
             agent_approval_result_order: VecDeque::new(),
             claude_subagents: HashMap::new(),
             codex_subagents: CodexSubagentTracker::default(),
@@ -1913,6 +1921,18 @@ impl WmctermApplication {
                         changed = true;
                     }
                 }
+                SessionEvent::ProgramStatus(event) => {
+                    // Hooks have session identity; anonymous terminal reports are a fallback.
+                    if !self.last_hook_delivery.contains_key(&terminal_id)
+                        && self.surface_for_terminal(terminal_id).and_then(|id| self.state.surfaces.get(&id)).is_some_and(|surface| surface.agent.is_some())
+                    {
+                        let params = json!({"surface": self.surface_for_terminal(terminal_id), "lifecycle_id": self.terminals.get(&terminal_id).map(|runtime| &runtime.lifecycle_id)});
+                        if self.record_agent_event(terminal_id, &params, &event).unwrap_or(false) {
+                            self.apply_agent_event(terminal_id, event);
+                            changed = true;
+                        }
+                    }
+                }
                 SessionEvent::Agent(event) => {
                     let lifecycle = self
                         .terminals
@@ -2028,6 +2048,13 @@ impl WmctermApplication {
     }
 
     fn handle_terminal_bell(&mut self, terminal: TerminalId) -> bool {
+        // Integrated agents deliver explicit notifications independently of BEL.
+        let agent_notifications = self.managed_codex.contains_key(&terminal)
+            || (self.last_hook_delivery.contains_key(&terminal)
+                && self
+                    .surface_for_terminal(terminal)
+                    .and_then(|id| self.state.surfaces.get(&id))
+                    .is_some_and(|surface| surface.agent.is_some()));
         let now = std::time::Instant::now();
         let since_last = self
             .last_bell_notifications
@@ -2035,6 +2062,7 @@ impl WmctermApplication {
             .map(|last| now.saturating_duration_since(*last));
         if !should_notify_terminal_bell(
             self.config.terminal.bell_notifications,
+            agent_notifications,
             self.window_focused,
             self.active_terminal_id() == Some(terminal),
             since_last,
@@ -2155,12 +2183,30 @@ impl WmctermApplication {
         event: &AgentEvent,
     ) -> Result<bool, String> {
         let (surface, effective_lifecycle) = self.validate_agent_event_route(terminal, params)?;
+        if let Some(session_id) = params.get("codex_session_id").and_then(Value::as_str)
+            && self
+                .managed_codex
+                .get(&terminal)
+                .is_some_and(|launch| launch.verified && launch.saved.session_id != session_id)
+        {
+            return Err("Codex hook session does not match the managed thread".into());
+        }
         let mut start_guard = None;
         if let AgentEvent::SessionStart {
             agent,
             session_id: Some(id),
         } = event
         {
+            // Native reviewer SessionStart hooks belong to an internal thread,
+            // not the managed TUI's registered session. /resume is routed by ready.
+            if agent.eq_ignore_ascii_case("codex")
+                && self
+                    .managed_codex
+                    .get(&terminal)
+                    .is_some_and(|launch| launch.verified && launch.saved.session_id != *id)
+            {
+                return Err("Codex hook session does not match the managed thread".into());
+            }
             let mut guard = self
                 .session_start_guards
                 .get(&terminal)
@@ -3138,6 +3184,30 @@ impl WmctermApplication {
             return;
         }
         if self.prompt.is_some() {
+            if matches!(
+                event.logical_key,
+                Key::Named(NamedKey::ArrowUp | NamedKey::ArrowDown)
+            ) && !self.agent_input_options().is_empty()
+            {
+                let options = self.agent_input_options();
+                let selected = self.prompt.as_ref().and_then(|prompt| {
+                    options
+                        .iter()
+                        .position(|value| value == prompt.editor.text())
+                });
+                let index = if matches!(event.logical_key, Key::Named(NamedKey::ArrowDown)) {
+                    selected.map_or(0, |index| (index + 1).min(options.len() - 1))
+                } else {
+                    selected.map_or(options.len() - 1, |index| index.saturating_sub(1))
+                };
+                let value = options[index].clone();
+                if let Some(prompt) = &mut self.prompt {
+                    prompt.editor = TextEditor::new(value);
+                    prompt.error = None;
+                }
+                self.rebuild_scene();
+                return;
+            }
             if let Some(shortcut) = text_edit_shortcut(event, self.modifiers) {
                 let copied = self
                     .prompt
@@ -3166,6 +3236,7 @@ impl WmctermApplication {
             match &event.logical_key {
                 Key::Named(NamedKey::Escape) => {
                     self.prompt = None;
+                    self.agent_input_edit = None;
                     self.rebuild_scene();
                 }
                 Key::Named(NamedKey::Enter) => self.submit_prompt(),
@@ -4234,9 +4305,56 @@ impl WmctermApplication {
             self.window_size.width as f32,
             self.window_size.height as f32,
             520.0,
-            132.0,
+            132.0 + self.agent_input_options().len().min(6) as f32 * 24.0,
             16.0,
         )
+    }
+
+    fn agent_input_options(&self) -> &[String] {
+        if !self
+            .prompt
+            .as_ref()
+            .is_some_and(|prompt| matches!(prompt.kind, PromptKind::AgentInput))
+        {
+            return &[];
+        }
+        self.agent_input_edit
+            .as_ref()
+            .and_then(|(id, index, _)| {
+                self.agent_input_forms
+                    .get(id)
+                    .and_then(|form| form.fields.get(*index))
+            })
+            .map_or(&[], |field| &field.options)
+    }
+
+    fn agent_input_option_rows(&self) -> Vec<(usize, ui::Bounds)> {
+        let input = self.prompt_input_bounds();
+        let options = self.agent_input_options();
+        let selected = self
+            .prompt
+            .as_ref()
+            .and_then(|prompt| {
+                options
+                    .iter()
+                    .position(|value| value == prompt.editor.text())
+            })
+            .unwrap_or(0);
+        let start = selected.saturating_sub(5);
+        (start..options.len().min(start + 6))
+            .enumerate()
+            .map(|(row, index)| {
+                (
+                    index,
+                    ui::Bounds {
+                        x: input.x,
+                        y: input.y + input.height + 6.0 + row as f32 * 24.0,
+                        width: input.width,
+                        height: 24.0,
+                    },
+                )
+            })
+            .collect()
     }
 
     fn confirmation_panel(&self) -> ui::Bounds {
@@ -4571,6 +4689,20 @@ impl WmctermApplication {
         let Ok(Some(request)) = self.pending_agent_requests.get(&request_id) else {
             return;
         };
+        if request.kind.as_str() == IpcAgentRequestKind::INPUT
+            && action == AgentApprovalAction::AllowOnce
+        {
+            if self.agent_input_forms.contains_key(&request_id) {
+                self.agent_input_edit = Some((request_id, 0, serde_json::Map::new()));
+                self.prompt = Some(TextPrompt {
+                    kind: PromptKind::AgentInput,
+                    editor: TextEditor::new(String::new()),
+                    error: None,
+                });
+                self.rebuild_scene();
+            }
+            return;
+        }
         let resolution = agent_approval_resolution(&request, action);
         let result = self
             .pending_agent_requests
@@ -4599,6 +4731,12 @@ impl WmctermApplication {
         self.agent_approval_bindings.retain(|id, _| {
             self.agent_approval_results.contains_key(id)
                 || self.pending_agent_requests.get(id).ok().flatten().is_some()
+                || self
+                    .pending_agent_requests
+                    .completed_reply(id)
+                    .ok()
+                    .flatten()
+                    .is_some()
         });
     }
 
@@ -5075,6 +5213,7 @@ impl WmctermApplication {
             return;
         };
         let input = match kind {
+            PromptKind::AgentInput => String::new(),
             PromptKind::RenameWorkspace => workspace.name.clone(),
             PromptKind::DescribeWorkspace => workspace.description.clone(),
             PromptKind::ChangeWorkspaceDirectory => workspace.cwd.display().to_string(),
@@ -5185,6 +5324,10 @@ impl WmctermApplication {
         let Some(prompt) = self.prompt.take() else {
             return;
         };
+        if matches!(prompt.kind, PromptKind::AgentInput) {
+            self.submit_agent_input(prompt);
+            return;
+        }
         let Some(workspace_id) = self.state.active_workspace().map(|workspace| workspace.id) else {
             return;
         };
@@ -5199,6 +5342,7 @@ impl WmctermApplication {
             return;
         }
         let command = match prompt.kind {
+            PromptKind::AgentInput => return,
             PromptKind::RenameWorkspace => AppCommand::Workspace(WorkspaceCommand::Rename {
                 id: workspace_id,
                 name: input,
@@ -7351,6 +7495,19 @@ impl WmctermApplication {
             return true;
         }
         if self.prompt.is_some() {
+            if let Some((index, _)) = self
+                .agent_input_option_rows()
+                .into_iter()
+                .find(|(_, bounds)| bounds.contains(x, y))
+            {
+                let value = self.agent_input_options()[index].clone();
+                if let Some(prompt) = &mut self.prompt {
+                    prompt.editor = TextEditor::new(value);
+                    prompt.error = None;
+                }
+                self.rebuild_scene();
+                return true;
+            }
             let input = self.prompt_input_bounds();
             if input.contains(x, y)
                 && let Some(prompt) = &mut self.prompt
@@ -10256,6 +10413,17 @@ impl WmctermApplication {
             let panel = self.prompt_panel();
             let input = self.prompt_input_bounds();
             let label = match prompt.kind {
+                PromptKind::AgentInput => self
+                    .agent_input_edit
+                    .as_ref()
+                    .and_then(|(id, index, _)| {
+                        self.agent_input_forms.get(id).and_then(|form| {
+                            form.fields.get(*index).map(|field| {
+                                format!("{}/{} {}", index + 1, form.fields.len(), field.label)
+                            })
+                        })
+                    })
+                    .unwrap_or_default(),
                 PromptKind::RenameWorkspace => self.language.rename_workspace().to_owned(),
                 PromptKind::DescribeWorkspace => self.language.workspace_description().to_owned(),
                 PromptKind::ChangeWorkspaceDirectory => {
@@ -10308,7 +10476,10 @@ impl WmctermApplication {
                 },
             );
             overlay_blocks.push(TextBlock {
-                text: label,
+                text: ui::truncate_display_width(
+                    &label.replace(['\r', '\n'], " "),
+                    ((panel.width - 36.0) / (14.0 * 0.6)).floor().max(1.0) as usize,
+                ),
                 spans: vec![],
                 left: panel.x + 18.0,
                 top: panel.y + 14.0,
@@ -10347,10 +10518,41 @@ impl WmctermApplication {
                     text: error.clone(),
                     spans: vec![],
                     left: panel.x + 18.0,
-                    top: input.y + input.height + 9.0,
+                    top: input.y
+                        + input.height
+                        + 9.0
+                        + self.agent_input_options().len().min(6) as f32 * 24.0,
                     width: panel.width - 36.0,
                     height: 24.0,
                     color: theme_red,
+                    font_size: 13.0,
+                    line_height: 18.0,
+                });
+            }
+            for (index, row) in self.agent_input_option_rows() {
+                let selected = prompt.editor.text() == self.agent_input_options()[index];
+                overlay_rectangles.push(RectBlock {
+                    left: row.x,
+                    top: row.y,
+                    width: row.width,
+                    height: row.height,
+                    color: if selected {
+                        theme_selection
+                    } else {
+                        theme_mantle
+                    },
+                });
+                overlay_blocks.push(TextBlock {
+                    text: ui::truncate_display_width(
+                        &self.agent_input_options()[index],
+                        ((row.width - 16.0) / (13.0 * 0.6)).max(1.0) as usize,
+                    ),
+                    spans: vec![],
+                    left: row.x + 8.0,
+                    top: row.y + 3.0,
+                    width: row.width - 16.0,
+                    height: row.height - 3.0,
+                    color: theme_text,
                     font_size: 13.0,
                     line_height: 18.0,
                 });
@@ -11498,8 +11700,11 @@ impl WmctermApplication {
             let mode = decision
                 .as_str()
                 .ok_or_else(|| "params.decisions entries must be strings".to_owned())?;
-            if !matches!(mode, "deny" | "once" | "always" | "all") {
+            if !matches!(mode, "deny" | "once" | "always" | "all" | "strict") {
                 return Err(format!("unsupported approval decision `{mode}`"));
+            }
+            if mode == "strict" && !(source == "codex_app_server" && kind == "permissions") {
+                return Err("strict review requires a Codex permissions request".into());
             }
             if !modes.contains(&mode) {
                 modes.push(mode);
@@ -11530,7 +11735,18 @@ impl WmctermApplication {
                 jsonrpc_id
             ])
         );
-        let summary = agent_approval_message(self.language, source, kind, method, request_params);
+        let summary = if kind == "input" {
+            let form: wmcterm_codex::InputRequest = serde_json::from_value(request_params.clone())
+                .map_err(|error| error.to_string())?;
+            let mut lines = vec![form.message];
+            for field in form.fields {
+                lines.push(field.label);
+                lines.extend(field.options);
+            }
+            lines.join("\n\n")
+        } else {
+            agent_approval_message(self.language, source, kind, method, request_params)
+        };
         let binding = (surface_id, lifecycle_id.clone(), generation);
         let interaction = AgentInteractionRequest {
             request_id: approval_id.clone(),
@@ -11538,7 +11754,11 @@ impl WmctermApplication {
             lifecycle_id,
             agent_pid: None,
             pid_start_time: None,
-            kind: IpcAgentRequestKind::new(IpcAgentRequestKind::PERMISSION),
+            kind: IpcAgentRequestKind::new(if kind == "input" {
+                IpcAgentRequestKind::INPUT
+            } else {
+                IpcAgentRequestKind::PERMISSION
+            }),
             message: summary.clone(),
             choices: modes
                 .into_iter()
@@ -11600,6 +11820,190 @@ impl WmctermApplication {
                 Ok(json!({"status":"pending","approval_id":approval_id}))
             }
         }
+    }
+
+    fn register_agent_input(&mut self, params: &Value) -> Result<Value, String> {
+        let form: wmcterm_codex::InputRequest =
+            serde_json::from_value(params["request"]["params"].clone())
+                .map_err(|error| error.to_string())?;
+        form.validate()?;
+        if params["source"] != "codex_app_server"
+            || params["request"]["kind"] != "input"
+            || params["request"]["method"].as_str() != Some(form.method.as_str())
+            || params["request"]["thread_id"].as_str() != Some(form.thread_id.as_str())
+            || params["request"]["turn_id"].as_str() != Some(form.turn_id.as_str())
+            || params["request"]["item_id"].as_str() != Some(form.item_id.as_str())
+            || params["request"]["jsonrpc_id"] != form.id
+            || form.fields.is_empty()
+            || form.fields.len() > 32
+            || serde_json::to_vec(&form)
+                .map_err(|error| error.to_string())?
+                .len()
+                > 64 * 1024
+        {
+            return Err("invalid Codex input request".into());
+        }
+        let surface = uuid::Uuid::parse_str(required_string(params, "surface_id")?)
+            .map_err(|error| error.to_string())?;
+        let workspace = uuid::Uuid::parse_str(required_string(params, "workspace_id")?)
+            .map_err(|error| error.to_string())?;
+        if !self.state.workspaces.iter().any(|candidate| {
+            candidate.id == workspace
+                && self.state.panes.values().any(|pane| {
+                    candidate.root.contains(pane.id) && pane.surfaces.contains(&surface)
+                })
+        }) {
+            return Err("surface does not belong to params.workspace_id".into());
+        }
+        let terminal = self
+            .state
+            .surfaces
+            .get(&surface)
+            .and_then(|surface| match surface.kind {
+                SurfaceKind::Terminal(id) => Some(id),
+                _ => None,
+            })
+            .ok_or("input target must be a terminal")?;
+        if !self.terminals.contains_key(&terminal)
+            || self
+                .agent_sessions
+                .get(&surface)
+                .is_none_or(|session| session.agent_kind.as_str() != "codex")
+        {
+            return Err("input target has no live Codex session".into());
+        }
+        let generation = self
+            .agent_sessions
+            .get(&surface)
+            .map(|session| session.lifecycle.generation);
+        for (id, existing) in &self.agent_input_forms {
+            if existing.id == form.id
+                && existing.thread_id == form.thread_id
+                && existing.method == form.method
+                && (self.pending_agent_requests.get(id).ok().flatten().is_some()
+                    || self
+                        .pending_agent_requests
+                        .completed_reply(id)
+                        .ok()
+                        .flatten()
+                        .is_some())
+                && self.agent_approval_bindings.get(id).is_some_and(
+                    |(bound, _, bound_generation)| {
+                        *bound == surface && *bound_generation == generation
+                    },
+                )
+            {
+                if existing != &form {
+                    return Err("conflicting duplicate input request".into());
+                }
+                return Ok(json!({"status":"pending", "approval_id":id}));
+            }
+        }
+        if self.agent_input_forms.len() >= 256 {
+            self.agent_input_forms
+                .retain(|id, _| self.pending_agent_requests.get(id).ok().flatten().is_some());
+            if self.agent_input_forms.len() >= 256 {
+                return Err("too many retained input requests".into());
+            }
+        }
+        let mut params = params.clone();
+        params["deadline_unix_ms"] = json!(
+            params
+                .get("deadline_unix_ms")
+                .and_then(Value::as_u64)
+                .unwrap_or(u64::MAX)
+                .min(unix_time_ms().saturating_add(9 * 60 * 1000))
+        );
+        let result = self.register_agent_approval(&params)?;
+        let id = result["approval_id"]
+            .as_str()
+            .ok_or("input request already completed")?
+            .to_owned();
+        self.agent_input_forms.insert(id, form);
+        Ok(result)
+    }
+
+    fn poll_agent_input(&self, params: &Value) -> Result<Value, String> {
+        let id = required_string(params, "request_id")?;
+        let (surface, lifecycle, generation) = self
+            .agent_approval_bindings
+            .get(id)
+            .ok_or("input binding not found")?;
+        let current = self.agent_sessions.get(surface);
+        let live = self.state.surfaces.get(surface).is_some_and(|surface| matches!(surface.kind, SurfaceKind::Terminal(terminal) if self.terminals.contains_key(&terminal)));
+        if !live
+            || current.map(|session| session.lifecycle.generation) != *generation
+            || current
+                .and_then(|session| session.lifecycle.external_id.as_ref())
+                .is_some_and(|id| id != lifecycle)
+        {
+            return Ok(json!({"status": "cancelled"}));
+        }
+        if let Some(reply) = self
+            .pending_agent_requests
+            .completed_reply(id)
+            .map_err(|error| error.to_string())?
+        {
+            return Ok(json!(reply));
+        }
+        if self
+            .pending_agent_requests
+            .get(id)
+            .map_err(|error| error.to_string())?
+            .is_some()
+        {
+            Ok(json!({"status": "pending"}))
+        } else {
+            Err("input request not found".into())
+        }
+    }
+
+    fn submit_agent_input(&mut self, prompt: TextPrompt) {
+        let Some((id, index, answers)) = &mut self.agent_input_edit else {
+            return;
+        };
+        let Some(form) = self.agent_input_forms.get(id) else {
+            return;
+        };
+        if self.pending_agent_requests.get(id).ok().flatten().is_none() {
+            self.agent_input_edit = None;
+            self.rebuild_scene();
+            return;
+        }
+        let result = form.field_value(*index, prompt.editor.text());
+        if let Err(error) = result {
+            self.prompt = Some(TextPrompt {
+                error: Some(if self.language.is_chinese() {
+                    format!("答案无效：{error}")
+                } else {
+                    format!("Invalid answer: {error}")
+                }),
+                ..prompt
+            });
+            self.rebuild_scene();
+            return;
+        }
+        answers.insert(form.fields[*index].id.clone(), json!(prompt.editor.text()));
+        *index += 1;
+        if *index < form.fields.len() {
+            self.prompt = Some(TextPrompt {
+                kind: PromptKind::AgentInput,
+                editor: TextEditor::new(String::new()),
+                error: None,
+            });
+        } else {
+            let request = Request {
+                id: "input-ui".into(),
+                method: "agent.request.reply".into(),
+                params: json!({"request_id": id, "resolution": {"text": serde_json::to_string(answers).expect("answers serialize")}}),
+            };
+            self.agent_input_edit = None;
+            let response = self.handle_rpc(request);
+            if let Some(error) = response.error {
+                tracing::warn!(message = error.message, "input reply rejected");
+            }
+        }
+        self.rebuild_scene();
     }
 
     fn poll_agent_approval(&self, params: &Value) -> Result<Value, String> {
@@ -11675,7 +12079,7 @@ impl WmctermApplication {
                 "unread_notifications": self.state.notifications.iter().filter(|item| !item.read).count(),
             })),
             "app.capabilities" => Ok(json!({
-                "protocol_version": 4,
+                "protocol_version": 5,
                 "product": "wmcterm",
                 "supported_agents": AgentKind::ALL,
                 "version": env!("CARGO_PKG_VERSION"),
@@ -11716,13 +12120,32 @@ impl WmctermApplication {
                     "rebuilds_teams_bridge": true,
                     "permission_verification": "server response before turn/start",
                     "settings_updates": "verified threads only; non-null permission, reviewer and cwd updates rejected; restart to change the launch profile",
+                    "turn_workspace": "turn/start preserves verified cwd and runtime workspace roots; matching overrides are removed and changes rejected",
                     "full_access": "GUI confirmation or persisted managed session; not a CLI/RPC launch option",
                     "failure": "no automatic permission downgrade; Enter retries an exited terminal",
                     "legacy": "missing managed restore record uses interactive provider resume"
                 },
+                "claude_launch": {
+                    "interactive_permission_mode": "manual",
+                    "unattended_permission_mode": "auto",
+                    "hook_disabling_options": "bare, safe-mode, restricted and custom setting-sources rejected",
+                    "hook_settings_validation": "additional settings and discovered user/project settings reject disableAllHooks and allowManagedHooksOnly; inherited SIMPLE and SAFE_MODE flags rejected",
+                    "requires_installed_hooks": true,
+                    "approval_hook_failure": "block; requires Claude 2.1.295+",
+                    "prompt_submission_event": true,
+                    "detached_modes": "bg, background, cloud, desktop and tmux rejected"
+                },
+                "codex_input": {
+                    "methods": ["item/tool/requestUserInput", "mcpServer/elicitation/request"],
+                    "forms": "ordinary non-secret questions and primitive MCP form schemas; unsupported forms stay native",
+                    "reply": "resolution.text is a JSON object mapping field ids to strings",
+                    "deadline_ms": 540000,
+                    "strict_permissions": "strict choice grants turn scope with strictAutoReview; never session scope"
+                },
+                "program_status": {"protocol": "OSC 7501", "max_records": 64, "priority": "identity-bearing hooks and pending requests precede anonymous OSC", "actionable": false},
                 "agent_events": [
                     "session_start", "tool_use", "permission_request", "needs_input",
-                    "turn_complete", "turn_failed", "notification", "stop"
+                    "turn_complete", "turn_failed", "notification", "stop", "state_observed"
                 ],
                 "terminal_input": {
                     "local_search": "Ctrl+Alt+F; next match Ctrl+Alt+G",
@@ -11755,6 +12178,7 @@ impl WmctermApplication {
                     "surface.logs", "screen.read", "send", "send.line", "terminal.search", "terminal.clear",
                     "terminal.scroll", "notification.list", "notification.mark", "notify",
                     "agent.update", "agent.request.list", "agent.request.reply", "agent.request.cancel",
+                    "agent.input.register", "agent.input.poll",
                     "agent.approval.register", "agent.approval.poll"
                 ],
                 "control_keys": [
@@ -12237,7 +12661,12 @@ impl WmctermApplication {
                 self.rebuild_scene();
                 Ok(json!({"ok": true}))
             }
-            "agent.approval.register" => self.register_agent_approval(&request.params),
+            "agent.approval.register" => {
+                if request.params["request"]["kind"] == "input" { return Err("use agent.input.register for input requests".into()); }
+                self.register_agent_approval(&request.params)
+            },
+            "agent.input.register" => self.register_agent_input(&request.params),
+            "agent.input.poll" => self.poll_agent_input(&request.params),
             "agent.approval.poll" => self.poll_agent_approval(&request.params),
             "agent.request.list" => self
                 .pending_agent_requests
@@ -12277,6 +12706,13 @@ impl WmctermApplication {
                         .transpose()
                         .map_err(|error| error.to_string())?
                         .unwrap_or_default();
+                    if let Some(form) = self.agent_input_forms.get(request_id) {
+                        if pending_request.is_some() && self.poll_agent_input(&json!({"request_id": request_id}))?["status"] != "pending" { return Err("stale input request".into()); }
+                        if resolution.approved != Some(false) && resolution.choice_id.as_deref() != Some("deny") {
+                            form.response(Some(resolution.text.as_deref().ok_or("input reply requires resolution.text")?))?;
+                        }
+                    }
+                    if resolution.choice_id.as_deref() == Some("strict") && pending_request.as_ref().is_some_and(|request| !request.choices.iter().any(|choice| choice.id == "strict")) { return Err("strict review is not available for this request".into()); }
                     self.pending_agent_requests
                         .resolve(request_id, resolution, now)
                 }
@@ -12303,6 +12739,7 @@ impl WmctermApplication {
             "agent.codex.claim" => self.claim_codex_launch(&request.params),
             "agent.codex.register" => self.register_codex_launch(&request.params),
             "agent.codex.ready" => self.codex_launch_ready(&request.params),
+            "agent.codex.turn" => self.codex_turn_event(&request.params),
             "agent.codex.child" => self.codex_child(&request.params),
             "agent.codex.child-mode" => self.codex_child_mode(&request.params),
             "agent.codex.stopped" => self.codex_launch_stopped(&request.params),
@@ -15013,6 +15450,9 @@ fn agent_session_event_kind(
     run_mode: AgentRunMode,
 ) -> Option<AgentSessionEventKind> {
     match event {
+        AgentEvent::StateObserved { state } => Some(AgentSessionEventKind::Telemetry(
+            AgentTelemetry::StateObserved { state: *state },
+        )),
         AgentEvent::SessionStart { .. } => None,
         AgentEvent::Notification { message } => Some(AgentSessionEventKind::Telemetry(
             AgentTelemetry::Notification {
@@ -15275,6 +15715,7 @@ fn listening_ports_for(_cwd: &std::path::Path) -> Vec<u16> {
 
 fn should_notify_terminal_bell(
     mode: BellNotificationMode,
+    agent_notifications: bool,
     window_focused: bool,
     terminal_active: bool,
     since_last: Option<std::time::Duration>,
@@ -15285,7 +15726,9 @@ fn should_notify_terminal_bell(
         BellNotificationMode::Background => !window_focused || !terminal_active,
         BellNotificationMode::Always => true,
     };
-    allowed_by_context && since_last.is_none_or(|elapsed| elapsed >= debounce)
+    !agent_notifications
+        && allowed_by_context
+        && since_last.is_none_or(|elapsed| elapsed >= debounce)
 }
 
 fn unix_time_ms() -> u64 {
@@ -15324,6 +15767,8 @@ fn validate_agent_approval_protocol(source: &str, method: &str, kind: &str) -> R
                 | ("item/commandExecution/requestApproval", "write_stdin")
                 | ("item/fileChange/requestApproval", "file_change")
                 | ("item/permissions/requestApproval", "permissions")
+                | ("item/tool/requestUserInput", "input")
+                | ("mcpServer/elicitation/request", "input")
         ),
         "claude_hook" => method == "PermissionRequest" && kind == "permission",
         _ => false,
@@ -15553,6 +15998,7 @@ fn apply_claude_subagent_status(
             });
         }
         ClaudeHookKind::SessionStart
+        | ClaudeHookKind::UserPromptSubmit
         | ClaudeHookKind::PreToolUse
         | ClaudeHookKind::PostToolUse
         | ClaudeHookKind::PostToolUseFailure
@@ -15677,6 +16123,7 @@ fn agent_approval_mode(action: AgentApprovalAction) -> &'static str {
         AgentApprovalAction::Deny => "deny",
         AgentApprovalAction::AllowOnce => "once",
         AgentApprovalAction::AlwaysAllow => "always",
+        AgentApprovalAction::StrictReview => "strict",
     }
 }
 
@@ -15712,6 +16159,7 @@ fn completed_approval_action(
         Some("deny") => Some(AgentApprovalAction::Deny),
         Some("once") => Some(AgentApprovalAction::AllowOnce),
         Some("always") => Some(AgentApprovalAction::AlwaysAllow),
+        Some("strict") => Some(AgentApprovalAction::StrictReview),
         Some("all") => Some(AgentApprovalAction::AlwaysAllow),
         _ if resolution.approved == Some(false) => Some(AgentApprovalAction::Deny),
         _ if resolution.approved == Some(true) => Some(AgentApprovalAction::AllowOnce),
@@ -15723,6 +16171,9 @@ fn agent_approval_actions(request: &AgentInteractionRequest) -> Vec<AgentApprova
     let mut actions = vec![AgentApprovalAction::Deny, AgentApprovalAction::AllowOnce];
     if request.choices.iter().any(|choice| choice.id == "always") {
         actions.push(AgentApprovalAction::AlwaysAllow);
+    }
+    if request.choices.iter().any(|choice| choice.id == "strict") {
+        actions.push(AgentApprovalAction::StrictReview);
     }
     actions
 }
@@ -15737,6 +16188,9 @@ fn agent_approval_resolution(
     action: AgentApprovalAction,
 ) -> AgentResolution {
     let choice = match action {
+        AgentApprovalAction::StrictReview => {
+            request.choices.iter().find(|choice| choice.id == "strict")
+        }
         AgentApprovalAction::Deny => request
             .choices
             .iter()
@@ -15806,7 +16260,24 @@ fn agent_approval_action_label(
     request: &AgentInteractionRequest,
 ) -> &str {
     match action {
+        AgentApprovalAction::StrictReview => {
+            if language.is_chinese() {
+                "严格审核"
+            } else {
+                "Strict review"
+            }
+        }
+        AgentApprovalAction::Deny if request.kind.as_str() == IpcAgentRequestKind::INPUT => {
+            language.cancel()
+        }
         AgentApprovalAction::Deny => language.deny(),
+        AgentApprovalAction::AllowOnce if request.kind.as_str() == IpcAgentRequestKind::INPUT => {
+            if language.is_chinese() {
+                "回答"
+            } else {
+                "Answer"
+            }
+        }
         AgentApprovalAction::AllowOnce => language.allow_once(),
         AgentApprovalAction::AlwaysAllow => request
             .choices
@@ -18391,6 +18862,7 @@ mod tests {
         let debounce = std::time::Duration::from_secs(1);
         assert!(!should_notify_terminal_bell(
             BellNotificationMode::Background,
+            false,
             true,
             true,
             None,
@@ -18398,6 +18870,7 @@ mod tests {
         ));
         assert!(should_notify_terminal_bell(
             BellNotificationMode::Background,
+            false,
             true,
             false,
             None,
@@ -18405,6 +18878,7 @@ mod tests {
         ));
         assert!(should_notify_terminal_bell(
             BellNotificationMode::Background,
+            false,
             false,
             true,
             None,
@@ -18414,11 +18888,13 @@ mod tests {
             BellNotificationMode::Always,
             false,
             false,
+            false,
             Some(std::time::Duration::from_millis(999)),
             debounce,
         ));
         assert!(should_notify_terminal_bell(
             BellNotificationMode::Always,
+            false,
             true,
             true,
             Some(debounce),
@@ -18428,9 +18904,28 @@ mod tests {
             BellNotificationMode::Never,
             false,
             false,
+            false,
             None,
             debounce,
         ));
+    }
+
+    #[test]
+    fn integrated_agent_notifications_suppress_redundant_terminal_bells() {
+        for mode in [
+            BellNotificationMode::Never,
+            BellNotificationMode::Background,
+            BellNotificationMode::Always,
+        ] {
+            assert!(!should_notify_terminal_bell(
+                mode,
+                true,
+                false,
+                false,
+                None,
+                std::time::Duration::from_secs(1),
+            ));
+        }
     }
 
     #[test]
@@ -19301,6 +19796,7 @@ mod tests {
             app.resolve_agent_request_from_ui(request.request_id, AgentApprovalAction::Deny);
         }
         crate::claude_regression::check(&mut app, terminal, surface);
+        crate::input_regression::check(&mut app, terminal, surface);
     }
 
     #[test]

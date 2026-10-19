@@ -164,6 +164,9 @@ from the currently focused UI item: the user may be viewing another workspace.
   `CODEX_HOME` (default `~/.codex`); user Skill installation uses the same root.
   Use `--scope project` for project configuration, and have the user
   review installed changes in Codex `/hooks`.
+- Managed remote TUI sessions also track app-server turn lifecycle notifications,
+  so running state does not depend on the task-start Hook.
+  Internal ephemeral reviewers cannot replace the owning surface's session or state.
 - Manually launched Codex processes share the same turn-state tracking. wmcterm
   reports `--approve-for-me` as auto-review and
   `--dangerously-bypass-approvals-and-sandbox` as dangerous full access without
@@ -189,8 +192,15 @@ from the currently focused UI item: the user may be viewing another workspace.
 - Only when the user explicitly requests unattended execution, use
   `wmcterm agent --mode unattended claude`; this selects Claude's native `auto`
   permission mode. Never pass `bypassPermissions` or dangerous-skip flags.
-- Managed Claude interactive launches default to `--permission-mode default`;
+- Managed Claude interactive launches default to `--permission-mode manual`;
   an explicitly supplied safe permission mode takes precedence.
+- Codex 0.160.0 and Claude Code 2.1.289 are the checked integration versions.
+- Managed Claude rejects `--bare`, `--safe-mode`, `--restricted`, custom
+  `--setting-sources`, and additional or discovered settings that enable
+  `disableAllHooks` or `allowManagedHooksOnly`. Enabled `CLAUDE_CODE_SIMPLE` and
+  `CLAUDE_CODE_SAFE_MODE` environment flags are rejected as well. Install the
+  wmcterm hooks explicitly; launch validation does not install or change them
+  and cannot guarantee execution under administrator policy or later config changes.
 - Claude MCP elicitation dialogs and stale quota auto-resume notifications mean
   waiting for input. A disabled quota wait returns to idle without ending the session.
   Input telemetry creates no actionable request; subsequent activity clears the wait.
@@ -225,6 +235,21 @@ as `wmcterm status`, `wmcterm capabilities`, `wmcterm pane list`,
 `wmcterm surface list`, `wmcterm screen read` (the caller only), and
 `wmcterm agent-request list` available without recursively approving the
 command used to inspect an approval.
+
+Claude 2.1.295+ approval hooks use `onFailure: "block"`; ordinary telemetry hooks
+remain non-blocking. Prompt submission updates activity without storing prompt
+text. Managed launches reject `--bg`, `--background`, `--cloud`, `--desktop`, and
+`--tmux`; native background sessions are outside managed restore ownership.
+
+Codex ordinary questions and simple MCP forms appear as `input` requests. Use
+the panel's Answer action or `agent-request reply ID --text` with a JSON object
+mapping field ids to string answers. Numeric/boolean values are validated and
+converted. Secrets, URL/device verification and complex schemas stay in the
+native Codex UI. Never answer a human's question on their behalf without their
+instruction. Cancelled, expired, externally answered or disconnected requests
+must not be retried as new approvals. Codex permissions alone support the
+`strict` choice: turn-scoped grants with strict subsequent command review.
+OSC 7501 is status-only fallback telemetry and cannot resolve a request.
 
 - Read `wmcterm pane list` after creation and use the returned pane and surface
   IDs for later operations. Do not infer the new target from UI focus.
@@ -289,6 +314,8 @@ Let installed Agent Hooks report lifecycle state. For explicit updates, use
 `wmcterm agent-event JSON`. Notify with
 `wmcterm notify --surface "$WMCTERM_SURFACE_ID" --title TITLE --body BODY` only
 for results, errors, permission requests, or input that needs attention.
+Managed Codex and Hook-connected terminals with current Agent metadata suppress
+generic BEL notifications; explicit Agent and OSC notifications remain available.
 
 Inspect actionable requests with `wmcterm agent-request list`. Reply with
 `wmcterm agent-request reply ID --approve`, `--deny`, `--choice ID`, or
@@ -324,6 +351,8 @@ overrides are currently unsupported by the managed permission bridge.
 Managed Codex also rejects non-null permission, reviewer, and cwd changes through
 `thread/settings/update` or `turn/settings/update`. Restart through wmcterm with
 the desired mode and workspace; ordinary model settings remain available.
+`turn/start` also rejects changes to the verified cwd or `runtimeWorkspaceRoots`.
+Omitted, null, or identical workspace values preserve the server settings.
 
 The sidebar displays interactive, auto-review, or dangerous full access
 independently of idle/running/waiting/completed state. Managed labels follow

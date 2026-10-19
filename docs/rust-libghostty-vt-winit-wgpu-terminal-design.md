@@ -1,7 +1,61 @@
 # Managed Codex Restore
 
+## Agent Release Compatibility (2026-10-10)
+
+The audit uses installed Codex 0.162.1 and Claude Code 2.1.296, GitHub release
+tags, upstream source, and generated app-server schemas. Codex tag
+`rust-v0.162.1` resolves to `092d3acd6bec3e3a14bdc7e7a2810ab628ab759d`.
+Its patch changes async-question rendering and explicit daemon feature overrides,
+not approval wire contracts. Claude's `v2.1.296` tree exposes plugins and mods,
+not the CLI core; core behavior remains a documented/runtime contract.
+
+Claude PermissionRequest command hooks set `onFailure: "block"` (requires
+2.1.295+). Telemetry hooks retain non-blocking failures. UserPromptSubmit
+projects activity without storing prompt text. Managed launches reject detached,
+cloud, Desktop and tmux entry points. Background service sessions need a future
+explicit ownership/resume design before they can be managed safely.
+
+The OSC 7501 scanner keeps at most 64 records, evicts the least recently updated,
+validates hierarchical ids and base64/control-character limits, supports clear,
+shell-prompt cleanup and RIS reset, and deduplicates aggregate state. Reports
+travel through the terminal actor. The UI prefers identity-bearing hooks and
+pending actionable requests; OSC never grants permissions or creates requests.
+
+Codex InputBridge handles ordinary question sets and primitive MCP form schemas.
+Secret questions, URL/device verification and unsupported schema constraints
+remain native. `agent.input.register` reuses scoped request storage and UI;
+`agent.input.poll` returns the generic completion record after checking the live
+surface/session generation. Answers are maps of field ids to strings, validated
+before resolution and converted to upstream response shapes. The existing text
+editor collects fields sequentially and draws its caret as an overlay. A maximum
+nine-minute deadline, external-resolution reconciliation, turn completion and
+disconnect cancellation bound request lifetime. Failed registration leaves the
+native TUI response channel intact. Completed replies remain bounded/idempotent.
+
+Permissions requests expose a separate `strict` decision, mapped to
+`strictAutoReview: true, scope: "turn"`. Other approval kinds reject it. Existing
+once/session choices retain their semantics. Test contracts use the installed
+generated schemas rather than copying assumptions from release notes.
+
+Sources: [Codex release diff](https://github.com/openai/codex/compare/rust-v0.162.0...rust-v0.162.1),
+[permission protocol](https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/app-server-protocol/src/protocol/v2/permissions.rs),
+[Claude public tag](https://github.com/anthropics/claude-code/tree/v2.1.296),
+[OSC 7501](https://www.superlogical.com/rex/docs/build/program-status).
+
 Implementation update: 2026-09-15. The broader terminal architecture is documented
 in [the product design](wmcterm终端产品设计方案.md).
+
+## Managed Codex Turn State
+
+The permission proxy projects verified app-server `turn/started` and
+`turn/completed` notifications into the shared Agent event reducer. The UI
+validates the explicit surface, terminal lifecycle and registered session.
+Completion must match the active turn ID; unverified threads and stale
+completions cannot overwrite the current state. This covers remote TUI launches
+whose task-start Hook is unavailable, including command-palette auto review.
+Ephemeral reviewer threads remain permission-verified but cannot claim the
+surface session or project turn telemetry. Codex hooks carry their native
+session ID, and managed surfaces reject hooks for a different registered thread.
 
 ## SSH CLI Help
 
@@ -84,15 +138,34 @@ the managed launch profile remains authoritative until restart. This prevents
 live reviewer changes and stale cached workspace roots. Ordinary settings and
 null permission no-ops pass through without disconnecting the client.
 
-Managed Claude interactive launches explicitly select `--permission-mode default`
+The permission proxy also records the verified response's cwd and runtime
+workspace roots. `turn/start` accepts omitted, null, or identical workspace
+fields, removes them before forwarding, and rejects changes. A legacy response
+without runtime roots is treated as an empty list. Settings updates also reject
+runtime workspace root overrides. Model and other ordinary settings still pass.
+
+Managed Claude interactive launches explicitly select `--permission-mode manual`
 unless the caller supplies a safe permission mode. Unattended launches default
 to `auto`. This avoids inheriting Claude 2.1.283/284's changed interactive default.
+The legacy `default` name remains accepted when explicitly supplied. The launcher
+rejects bare, safe, restricted, and custom setting-source modes that suppress
+settings-file hooks. Additional JSON/file settings and discovered user/project
+settings are checked for hook-disabling fields, and inherited SIMPLE/SAFE_MODE
+flags are rejected without modifying the environment. This is launch validation,
+not proof of hook execution: installed hooks and administrator policy still
+determine actual delivery, and configuration can change after launch.
 
-Codex 0.154.0 exposes these fields in its generated protocol schema. The real
-provider smoke test checks all three modes without starting a model turn. A
+Codex 0.160.0's generated protocol schema and Claude Code 2.1.289's CLI and
+official changelog are the integration baseline. The real provider smoke test
+checks all three modes, saved permission resumes, explicit mode changes, and
+restoration without starting a model turn. A
 provider that rejects or fails to apply the fields fails closed; startup does
 not silently fall back to native Codex. Custom named permission profiles,
 `--add-dir`, and external remote endpoints are rejected by this managed path.
+In 0.160.0, resuming an already-loaded thread retains its live permissions even
+when overrides are supplied. The proxy rejects a mismatched response. The real
+permission smoke unsubscribes before testing changed restore profiles, while the
+managed GUI restart smoke verifies restoration with a new app-server process.
 
 ## Launch Authority and Routing
 
@@ -159,6 +232,10 @@ Shift+right click opens the local terminal menu.
 Claude input-wait telemetry observes state without registering an actionable
 request. Informational `notification` events preserve both reducer and core
 session state; only explicit quota resume activity marks the turn running.
+Managed Codex terminals and Hook-connected terminals with current Agent metadata
+suppress generic BEL notifications: explicit Agent notifications own completion
+and attention delivery, avoiding a second terminal-bell entry regardless of event
+ordering. Ordinary terminals retain the configured BEL policy and debounce.
 Real approval registrations remain independent and retain surface precedence.
 Claude mode metadata uses native flags until a validated root Hook supplies
 `permission_mode`, cached by terminal lifecycle and session. Unknown modes and
@@ -174,6 +251,24 @@ state and mode transitions through a GUI with temporary config and RPC socket.
 
 - Unit tests cover mode parsing, verification failures, blocked premature turns,
   exact-once launch claims, stale lifecycle routing, and legacy serialization.
+- Input regression tests cover RPC/socket failures, concurrent reply/disconnect,
+  64 bridge requests, 256 retained forms, bounded completion-history eviction,
+  duplicate scope validation, numeric retries, optional fields, IME preedit/commit,
+  and 32-option geometry at 1x/1.5x/2x scales. Duplicate input registration checks
+  workspace membership before returning an existing request and ignores form
+  records whose pending/completed request has already been evicted.
+- `xvfb-run -a node scripts/codex-input-smoke.mjs target/debug/wmcterm` checks
+  real PTY OSC fallback/Hook precedence, pending-request precedence, sequential
+  forms, Unicode paste, keyboard/mouse selection, cancellation and expiry while
+  editing. Repeat with `WINIT_X11_SCALE_FACTOR=2` and a 2560x1440 Xvfb screen for
+  physical high-DPI rendering; screenshots are written under `/tmp` by default.
+- `xvfb-run -a python3 scripts/agent-live-contract-smoke.py target/debug/wmcterm`
+  drives installed Codex/Claude CLIs against a loopback-only model fixture.
+  Codex traverses app-server, watcher and GUI before verifying the answer in the
+  next upstream tool output and turn completion. Claude verifies a working allow
+  control and denied execution for crashing, missing, timed-out and invalid-JSON
+  PermissionRequest hooks. Configuration and tool marker files are disposable;
+  these tests never call a paid model API or modify user Hook installations.
 - `python3 scripts/codex-permissions-smoke.py` uses an isolated Codex home and
   real app-server to check permission round trips, with no model turns.
 - `xvfb-run -a --server-args='-screen 0 1280x800x24' python3 scripts/codex-managed-restore-smoke.py`
