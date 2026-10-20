@@ -469,6 +469,7 @@ resume 标识符会按启动来源恢复。由 wmcterm Agent 入口启动并已�
 会话恢复原线程，不会重新执行初始提示词；Shell 中手动
 启动的 Agent 仅在 wmcterm 关闭时生命周期仍在运行且前台进程仍是该 Agent 才恢复；
 已经退出回到 Shell、明确结束或失败的手动 Agent 重开后回到普通终端。
+已恢复的手动会话在没有新交互或 Hook 时继续保留恢复命令，连续重启不会因此丢失会话。
 仍在运行的手动 Agent 恢复时保留交互式 Shell 语义：resume 作为 Shell 子命令运行，
 退出 Agent 后回到 Shell，Surface、滚动历史和终端会话不会随 Agent 一同退出。
 新版本会保存托管 Codex 的线程 ID、权限模式、权限配置、工作目录与 Teams 父子关系。

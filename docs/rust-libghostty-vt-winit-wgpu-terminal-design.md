@@ -101,6 +101,11 @@ detection and sidebar metadata do not authorize a launch. The additive field
 preserves session format version 1. Legacy records use the previous interactive
 resume policy. Missing rollouts clear stale resume data.
 
+Restored manual Agent commands remain eligible for persistence without a new
+interaction or hook. Retained surface session identity bridges consecutive
+restarts; an exited/failed lifecycle or foreground detection clearing the Agent
+prevents replay after the Agent has returned to the shell.
+
 All three managed root modes survive a restart. Full access uses the original
 GUI confirmation, whose text now states that restart preserves this choice.
 Restoring never replays the initial prompt. A root gets a fresh app-server and a

@@ -839,7 +839,14 @@ pub fn run() -> Result<()> {
                         None => app
                             .commands
                             .get(&terminal_id)
-                            .filter(|command| !command.contains(MANUAL_AGENT_RESUME_MARKER))
+                            .filter(|command| {
+                                !is_manual_agent_resume_command(command)
+                                    || can_preserve_manual_resume(
+                                        &app.state,
+                                        &app.agent_sessions,
+                                        terminal_id,
+                                    )
+                            })
                             .cloned(),
                     },
                     agent: resume.map(|resume| resume.agent),
@@ -15534,6 +15541,28 @@ struct PersistedAgentResume {
     managed: bool,
 }
 
+fn can_preserve_manual_resume(
+    state: &AppState,
+    sessions: &HashMap<SurfaceId, AgentSession>,
+    terminal: TerminalId,
+) -> bool {
+    // A restored process may not emit another hook before the next shutdown.
+    // Keep its resume command until process detection or a hook ends it.
+    state.surfaces.values().any(|surface| {
+        matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal)
+            && surface
+                .agent
+                .as_ref()
+                .is_some_and(|agent| agent.session_id.as_ref().is_some_and(|id| !id.is_empty()))
+            && sessions.get(&surface.id).is_none_or(|session| {
+                !matches!(
+                    session.lifecycle.phase,
+                    AgentLifecyclePhase::Exited | AgentLifecyclePhase::Failed
+                )
+            })
+    })
+}
+
 fn resume_info(
     state: &AppState,
     sessions: &HashMap<SurfaceId, AgentSession>,
@@ -16870,6 +16899,37 @@ mod tests {
                 assert_eq!(metadata.state, AgentState::Running);
             }
         }
+    }
+
+    #[test]
+    fn manual_resume_survives_repeated_restart_without_new_hooks() {
+        let mut state = AppState::new("restore", PathBuf::from("/tmp"));
+        let surface = state.surfaces.values_mut().next().unwrap();
+        let SurfaceKind::Terminal(terminal) = surface.kind else {
+            panic!("terminal")
+        };
+        let surface_id = surface.id;
+        surface.agent = Some(wmcterm_core::AgentMetadata {
+            name: "codex".into(),
+            state: AgentState::Idle,
+            session_id: Some("existing-thread".into()),
+            run_mode: AgentRunMode::Interactive,
+        });
+        let mut sessions = HashMap::new();
+        for _ in 0..2 {
+            assert!(resume_info(&state, &sessions, &HashMap::new(), terminal).is_none());
+            assert!(can_preserve_manual_resume(&state, &sessions, terminal));
+            state = serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+        }
+        let mut session = AgentSession::new(surface_id);
+        for phase in [AgentLifecyclePhase::Exited, AgentLifecyclePhase::Failed] {
+            session.lifecycle.phase = phase;
+            sessions.insert(surface_id, session.clone());
+            assert!(!can_preserve_manual_resume(&state, &sessions, terminal));
+        }
+        sessions.clear();
+        state.surfaces.get_mut(&surface_id).unwrap().agent = None;
+        assert!(!can_preserve_manual_resume(&state, &sessions, terminal));
     }
 
     #[test]
