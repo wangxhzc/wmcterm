@@ -8,16 +8,21 @@ use wmcterm_terminal::{
 
 fn wait_for_text(session: &TerminalSession, needle: &str) -> bool {
     let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last = String::new();
     while Instant::now() < deadline {
         match session.events().recv_timeout(Duration::from_millis(100)) {
-            Ok(SessionEvent::Snapshot(snapshot)) if snapshot.to_plain_text().contains(needle) => {
-                return true;
+            Ok(SessionEvent::Snapshot(snapshot)) => {
+                last = snapshot.to_plain_text();
+                if last.contains(needle) {
+                    return true;
+                }
             }
             Ok(SessionEvent::Error(error)) => panic!("terminal error: {error}"),
             Ok(_) | Err(flume::RecvTimeoutError::Timeout) => {}
             Err(flume::RecvTimeoutError::Disconnected) => break,
         }
     }
+    eprintln!("missing {needle:?}; last terminal snapshot: {last:?}");
     false
 }
 
@@ -127,4 +132,77 @@ printf '\r\nKITTY-ROUNDTRIP-OK'
         }))
         .unwrap();
     assert!(wait_for_text(&session, "KITTY-ROUNDTRIP-OK"));
+}
+
+#[test]
+fn codex_interrupt_leader_and_f9_round_trip_in_legacy_and_kitty_modes() {
+    let script = r#"
+stty raw -echo
+printf 'LEGACY-CONTROLS-READY'
+reply=$(timeout --foreground 3 dd bs=1 count=7 status=none | od -An -v -tx1 | tr -d ' \n')
+[[ "$reply" == '03181b5b32307e' ]] || { printf 'LEGACY-MISMATCH:%s' "$reply"; sleep 0.1; exit 2; }
+printf '\033[>1uKITTY-CONTROLS-READY'
+IFS= read -r -d u -t 3 reply || exit 3
+[[ "$reply" == $'\e[99;5' ]] || exit 4
+IFS= read -r -d u -t 3 reply || exit 5
+[[ "$reply" == $'\e[120;5' ]] || exit 6
+IFS= read -r -d '~' -t 3 reply || exit 7
+[[ "$reply" == $'\e[20' ]] || exit 8
+printf '\033[<u\r\nCODEX-CONTROLS-OK'
+"#;
+    let session = TerminalSession::spawn(
+        CommandSpec::new("bash").args(["--noprofile", "--norc", "-c", script]),
+        TerminalSize::new(80, 24).unwrap(),
+    )
+    .unwrap();
+    for ready in ["LEGACY-CONTROLS-READY", "KITTY-CONTROLS-READY"] {
+        assert!(wait_for_text(&session, ready));
+        for key in [
+            InputKey::Character('c'),
+            InputKey::Character('x'),
+            InputKey::Function(9),
+        ] {
+            session
+                .send(SessionCommand::Key(KeyInput {
+                    key,
+                    // Windows can include printable text on Control key events.
+                    text: match key {
+                        InputKey::Character(character) => Some(character.to_string()),
+                        _ => None,
+                    },
+                    modifiers: KeyModifiers {
+                        control: matches!(key, InputKey::Character(_)),
+                        ..Default::default()
+                    },
+                    repeat: false,
+                    unshifted_codepoint: None,
+                }))
+                .unwrap();
+        }
+    }
+    assert!(wait_for_text(&session, "CODEX-CONTROLS-OK"));
+}
+
+#[test]
+fn windows_line_endings_and_unicode_survive_bracketed_paste_through_pty() {
+    let text = "CJK \u{4e2d}\u{6587} \u{1f642}\r\nnext\rfinal";
+    let script = r#"
+stty raw -echo
+printf '\033[?2004hWINDOWS-PASTE-READY'
+IFS= read -r -d '~' -t 3 prefix || exit 1
+[[ "$prefix" == $'\e[200' ]] || exit 2
+IFS= read -r -d '~' -t 3 content || exit 3
+[[ "$content" == "$EXPECTED"$'\e[201' ]] || { printf 'PASTE-MISMATCH:%q' "$content"; sleep 0.1; exit 4; }
+printf '\033[?2004l\r\nWINDOWS-PASTE-OK'
+"#;
+    let session = TerminalSession::spawn(
+        CommandSpec::new("bash")
+            .args(["--noprofile", "--norc", "-c", script])
+            .env("EXPECTED", text.replace("\r\n", "\n").replace('\r', "\n")),
+        TerminalSize::new(80, 24).unwrap(),
+    )
+    .unwrap();
+    assert!(wait_for_text(&session, "WINDOWS-PASTE-READY"));
+    session.send(SessionCommand::Paste(text.into())).unwrap();
+    assert!(wait_for_text(&session, "WINDOWS-PASTE-OK"));
 }

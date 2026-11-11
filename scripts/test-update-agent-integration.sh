@@ -37,6 +37,7 @@ cat >"$CLAUDE_CONFIG_DIR/settings.json" <<'JSON'
   "hooks": {
     "Stop": [
       {"hooks": [{"type": "command", "command": "/old/wmcterm hook receive --agent claude"}]},
+      {"hooks": [{"type": "command", "command": "/old/wmcterm", "args": ["hook", "receive", "--agent", "claude", "--event", "Stop"]}]},
       {"hooks": [{"type": "command", "command": "keep-claude-hook"}]}
     ],
     "StopFailure": [
@@ -99,15 +100,25 @@ assert "keep-codex-interrupt" in codex_text
 assert "keep-claude-hook" in claude_text
 assert "keep-claude-failure-hook" in claude_text
 assert codex_hooks["hooks"]["Interrupt"]
+for event in ("PreToolUse", "PostToolUse", "PreModelRequest"):
+    receivers = [hook for entry in codex_hooks["hooks"][event] for hook in entry.get("hooks", [])]
+    assert len(receivers) == 1, (event, receivers)
+    assert receivers[0]["command"].endswith("--event " + event)
 failure_hooks = claude_settings["hooks"]["StopFailure"]
 failure_receivers = [
-    hook["command"]
+    hook
     for entry in failure_hooks
     for hook in entry.get("hooks", [])
-    if "wmcterm hook receive --agent claude" in hook.get("command", "")
+    if hook.get("args", [])[:4] == ["hook", "receive", "--agent", "claude"]
 ]
 assert len(failure_receivers) == 1, failure_receivers
-assert "--event StopFailure" in failure_receivers[0]
+assert failure_receivers[0]["args"][-2:] == ["--event", "StopFailure"]
+for event in ("PermissionDenied", "CwdChanged", "DirectoryAdded", "Elicitation", "ElicitationResult"):
+    receivers = [hook for entry in claude_settings["hooks"][event] for hook in entry.get("hooks", [])
+                 if hook.get("args", [])[:4] == ["hook", "receive", "--agent", "claude"]]
+    assert len(receivers) == 1, (event, receivers)
+    assert receivers[0]["args"][-2:] == ["--event", event]
+assert claude_settings["hooks"]["PermissionRequest"][0]["hooks"][0]["onFailure"] == "block"
 
 skill_paths = (
     home / ".agents/skills/wmcterm/SKILL.md",

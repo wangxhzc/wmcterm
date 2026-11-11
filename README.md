@@ -61,6 +61,11 @@ cargo run
 - `Mark all read` / `全部已读`：清除普通未读标记，但不删除通知，也不处理待定的
   Agent 授权请求
 - `Ctrl+Alt+F`：搜索全部终端回滚历史（使用 `Enter`/`Shift+Enter` 导航）；`Ctrl+Alt+G` 查找下一处
+- 搜索栏打开时，点击终端可恢复终端输入并保留搜索高亮；点击搜索栏可继续编辑。
+  在其他窗格的标签栏上滚动只切换其标签，不转移当前键盘焦点。通知、审批面板和菜单
+  占用键盘时，输入法提交不会写入底层终端。
+- 将文件拖入终端会插入经过 shell 转义的路径，并自动聚焦接收路径的窗格，便于继续
+  输入；不会自动执行命令。落点被菜单或模态弹窗遮挡时不会写入底层终端。
 - `Ctrl+Shift+L`：筛选活动日志表面（`level:error,warn text`）
 - `Ctrl+Shift+F`：使用 `rg` 搜索活动工作区中的文件
 - `Ctrl++` / `Ctrl+-` / `Ctrl+0`：增大、减小或重置终端字号
@@ -288,7 +293,7 @@ CLI 也是稳定的 Agent 控制接口。在 wmcterm 终端内启动的命令会
 窗格在右侧打开，后续 Agent 向下打开。自动展开默认最多两层，可通过
 `WMCTERM_CODEX_MAX_AUTO_DEPTH` 限制。此集成要求 Codex CLI 提供
 `app-server --listen` 和 `--remote` 选项，以及带 `approvalsReviewer` 的线程恢复协议
-（已核验 Codex 0.160.0）。集成或权限核验失败会显示错误，不再自动回退到普通 TUI。
+（已核验 Codex 0.163.0）。集成或权限核验失败会显示错误，不再自动回退到普通 TUI。
 退出后的终端可按 Enter 重试；需要独立恢复时，用户可另开 Shell 执行
 `codex resume <会话ID>`，或显式添加 `--approve-for-me` 选择自动审查。
 如果长时间运行期间最后创建的子 Agent 窗格已被关闭，后续线程会自动回退到仍存活的
@@ -307,7 +312,7 @@ transcript 加载到监视器。它识别所有携带线程 ID 的 `thread/*` �
 Claude Code 2.1.268 起，`-p`/`--print` 也会触发 `PermissionRequest` Hook。
 托管 Claude 交互启动默认显式传入 `--permission-mode manual`，避免新版 Claude
 默认 auto 模式改变交互入口的行为；用户显式指定的安全权限模式仍保留。
-已核验 Claude Code 2.1.296；旧名称 `default` 仍可显式使用。
+已核验 Claude Code 2.1.304；旧名称 `default` 仍可显式使用。
 Claude 2.1.295+ 的审批 Hook 使用 `onFailure: "block"`，启动失败、崩溃或超时会
 拒绝请求；普通状态 Hook 不阻断操作。`UserPromptSubmit` 会及时更新运行状态，
 不保存用户提示内容。托管入口拒绝 `--bg` / `--background`、`--cloud`、`--desktop`
@@ -324,12 +329,24 @@ Hook `permission_mode` 优先于启动参数，反映运行期间的切换，仅
 输入等待通知不会创建审批按钮，恢复执行后会退出等待；`agent_completed`、认证成功
 等普通通知保留任务状态。真实权限请求仍由独立审批通道处理，不会被这些通知清除。
 
-Codex 0.162.1 的普通 `requestUserInput` 问题和简单 MCP `form` 请求可在请求面板
+Codex 0.163.0 的普通 `requestUserInput` 问题和简单 MCP `form` 请求可在请求面板
 点击“回答”，逐字段提交；字段支持文本、整数、有限数字、布尔值和字符串枚举。
 密文问题、URL/设备验证及带额外约束的复杂表单继续使用 Codex 原生界面。
 可用 `wmcterm agent-request reply ID --text '{"字段ID":"答案"}'` 回答，所有值
 均为字符串；数值和布尔字段会在提交时校验并转换。取消、过期、原生界面已回答、
 轮次结束或断连都会清理面板请求；普通通知的已读状态不会影响它们。
+Claude Code 的简单 MCP `form` 同样可在请求面板回答，使用 `Elicitation` Hook
+接管受支持的表单，回复格式与上述 CLI 相同。该 Hook 阻塞等待面板回答，成功后替代
+原生对话框；取消、超时或 IPC 失败返回 `cancel`，不会继续提交。URL、密文和复杂
+schema 不接管，直接保留原生界面。`ElicitationResult` 仅在携带明确的 elicitation ID
+时校对同一 session、server、Surface 和 lifecycle 的未完成请求，不能按服务器名称
+批量取消其他表单。受支持表单被 Hook 回答后，Claude 不再触发 `ElicitationResult`。
+Claude `PermissionDenied` 记录 auto 模式拒绝的工具及原因，只生成普通通知，不创建
+审批按钮，也不会自动要求重试。`CwdChanged` 和 `DirectoryAdded` 更新主会话目录元数据；
+子 Agent 的目录不改写主会话。额外目录按会话去重并最多保留 128 项，会话替换时清空，
+`wmcterm diagnostics` 可查看 `agent_session.cwd` 和 `additional_directories`。
+这些 Hook 需要显式重新安装；Claude 计划使用可执行文件与 `args` 直接启动，无需 shell，
+重装会清理旧 wmcterm shell 条目并保留其他 Hook。不会安装接管 worktree 创建/删除的 Hook。
 Codex 权限申请另提供“严格审核”按钮（`--choice strict`）：授权仅作用于本轮，
 后续命令继续接受审核；它与会话级“始终允许”和启动时自动审批模式独立。
 
@@ -362,13 +379,20 @@ Codex 0.158.0 的 `thread/settings/update` 和 `turn/settings/update` 同样受�
 工作目录重新启动。模型等普通设置仍可更新；未核验的线程不能更新设置。
 `turn/start` 同样不能改变已核验的 cwd 和 `runtimeWorkspaceRoots`；相同值和 null
 会在转发前移除，保留服务端已核验的线程设置。旧协议未返回根路径时按空列表处理。
-已对照 Codex 0.160.0 协议核验恢复订阅：watcher 不覆盖线程保存的 cwd、权限或
+已对照 Codex 0.163.0 协议核验恢复订阅：watcher 不覆盖线程保存的 cwd、权限或
 worktree 配置。子 Agent 窗格使用其线程的 cwd，保持 `focus: false`；只读线程
-仍交由原生 TUI 展示。提问由 Codex TUI 处理，不映射为允许/拒绝审批。
+仍交由原生 TUI 展示。受支持的提问使用独立输入表单，不映射为允许/拒绝审批。
 对于这些托管 app-server 会话，通用 Codex `PermissionRequest` Hook 被视为重复遥测，
 不会创建第二个可操作请求。手动启动的非托管 Codex 没有审批回复通道，因此其
 `PermissionRequest` Hook 只更新等待状态并发送普通通知；用户仍需回到 Codex TUI
 完成原生审批，通知中心不会显示无法生效的允许/拒绝按钮。
+Codex 0.167.0 的原生会话还通过 `PreToolUse` / `PostToolUse` Hook 跟踪工具活动：
+匹配的工具返回后会清除原生权限等待，并恢复运行状态。并行工具不会清除其他工具的
+等待，真实审批请求始终优先；旧会话、旧生命周期、子 Agent 和迟到事件不能覆盖当前状态。
+拒绝审批时 Codex 不触发工具完成 Hook，后续同轮次的 `PreModelRequest` 会结束原生等待；
+中断则由 `Interrupt` 结束当前轮次，保留会话。
+升级后需显式运行 `wmcterm hook install --agent codex --scope user`，并在 Codex 中
+审阅新增 Hook。已运行的旧实例需保存会话后重新启动，安装包不会自动更新个人 Hook。
 `codex update/login/logout`、帮助、版本查询及 Claude 的更新、认证、诊断、
 MCP/插件管理命令不会被标记为空闲 Agent；普通会话、resume 和 exec 仍参与识别。
 前台进程识别会把手动 `codex --approve-for-me` 标记为“自动审查”，把手动
@@ -584,9 +608,11 @@ scripts/package-release.sh
 scripts/ui-smoke.sh
 scripts/runtime-control-smoke.sh
 python3 scripts/codex-permissions-smoke.py
-# Checked with Codex 0.160.0; launch and restore tests never start model turns:
+python3 scripts/codex-release-smoke.py
+# Checked with Codex 0.163.0; launch and restore tests never start model turns:
 xvfb-run -a python3 scripts/codex-tui-launch-smoke.py
 xvfb-run -a node scripts/claude-notifications-smoke.mjs target/debug/wmcterm
+xvfb-run -a node scripts/claude-input-smoke.mjs target/debug/wmcterm
 # 输入桥故障/容量/IME 事件由 workspace 单测覆盖；真实 PTY、表单和 GUI：
 xvfb-run -a node scripts/codex-input-smoke.mjs target/debug/wmcterm
 WINIT_X11_SCALE_FACTOR=2 xvfb-run -a --server-args='-screen 0 2560x1440x24' node scripts/codex-input-smoke.mjs target/debug/wmcterm /tmp/wmcterm-input-hidpi.png

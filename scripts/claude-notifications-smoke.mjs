@@ -67,7 +67,7 @@ try {
       env: launchEnv, cwd: join(directory, 'workspace'), timeout: 5000, stdio: ['ignore', 'pipe', 'pipe'],
     }), /detaches from the managed terminal/);
   }
-  const receive = (event, payload) => execFileSync('/bin/sh', ['-c', hooks[event][0].hooks[0].command], {
+  const receive = (event, payload) => execFileSync(hooks[event][0].hooks[0].command, hooks[event][0].hooks[0].args, {
     env: hookEnv, input: JSON.stringify({ session_id: 'smoke-session', ...payload }), timeout: 5000,
   });
   const hook = (notification_type, _event, _extra, permission_mode = 'auto') => receive('Notification', {
@@ -75,6 +75,21 @@ try {
   });
   receive('SessionStart', { permission_mode: 'default' });
   receive('UserPromptSubmit', { prompt: 'smoke prompt', permission_mode: 'default' });
+  assert.equal(metadata().state, 'running');
+  receive('PermissionDenied', { permission_mode: 'auto', tool_name: 'Bash', tool_use_id: 'denied-tool',
+    reason: 'Classifier unavailable' });
+  assert.equal(metadata().state, 'running');
+  assert.deepEqual(rpc('agent.request.list'), []);
+  const session = () => rpc('app.diagnostics').terminals.find(item => item.surface_id === surface).agent_session;
+  receive('CwdChanged', { old_cwd: join(directory, 'workspace'), new_cwd: join(directory, 'data'),
+    cwd: join(directory, 'data') });
+  assert.equal(session().cwd, join(directory, 'data'));
+  receive('DirectoryAdded', { directory: join(directory, 'workspace'), source: 'slash_command' });
+  assert.deepEqual(session().additional_directories, [join(directory, 'workspace')]);
+  receive('CwdChanged', { agent_id: 'child', old_cwd: join(directory, 'data'), new_cwd: '/child-only', cwd: '/child-only' });
+  receive('DirectoryAdded', { agent_id: 'child', directory: '/child-only', source: 'register_repo_root' });
+  assert.equal(session().cwd, join(directory, 'data'));
+  assert.deepEqual(session().additional_directories, [join(directory, 'workspace')]);
   assert.equal(metadata().state, 'running');
   receive('Stop', { permission_mode: 'default' });
   hook('agent_completed', 'notification', { message: 'smoke notification' });
@@ -108,7 +123,7 @@ try {
   assert.equal(metadata().session_id, 'second-session');
   receive('SessionStart', { permission_mode: 'auto' });
   assert.equal(metadata().session_id, 'smoke-session');
-  permission = spawn('/bin/sh', ['-c', `exec ${hooks.PermissionRequest[0].hooks[0].command}`], {
+  permission = spawn(hooks.PermissionRequest[0].hooks[0].command, hooks.PermissionRequest[0].hooks[0].args, {
     env: hookEnv, stdio: ['pipe', 'pipe', 'pipe'],
   });
   let permissionOutput = '';

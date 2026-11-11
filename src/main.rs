@@ -160,7 +160,10 @@ fn print_help() {
          \x20   reply ID --choice strict: turn-scoped Codex permissions with strict command review\n\
          \x20   reply ID --text JSON: input field IDs mapped to string answers\n\
          \x20 wmcterm hook receive|plan|install --agent KIND [--event NAME]\n\
+         \x20   Native Codex PreToolUse/PostToolUse hooks recover permission wait state (0.167.0+)\n\
          \x20   Claude StopFailure reports a failed turn without ending the session\n\
+         \x20   Claude simple MCP forms use the request panel; unsupported forms stay native\n\
+         \x20   Claude PermissionDenied is informational; root directory hooks update session metadata\n\
          \x20 wmcterm skill print|install [--scope project|user] [--force]\n\
          \x20   User hook/skill directories honor CODEX_HOME and CLAUDE_CONFIG_DIR\n\
          \x20 wmcterm agent [--mode interactive|unattended|full-access] claude|codex [ARG...]\n\
@@ -1733,12 +1736,18 @@ fn run_hook(mut args: impl Iterator<Item = String>) -> Result<()> {
                 && event
                     .as_deref()
                     .is_some_and(|name| name.eq_ignore_ascii_case("PermissionRequest"));
+            let explicitly_elicitation = agent == AgentKind::Claude
+                && event
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case("Elicitation"));
             let mut input = String::new();
             if std::io::stdin().read_to_string(&mut input).is_err() {
                 if explicitly_permission && inside_wmcterm {
                     print_claude_permission_result(wmcterm_claude::deny_response(
                         "wmcterm could not read the permission request",
                     ));
+                } else if explicitly_elicitation && inside_wmcterm {
+                    print_claude_permission_result(wmcterm_claude::cancel_elicitation_response());
                 } else {
                     acknowledge_hook();
                 }
@@ -1749,6 +1758,8 @@ fn run_hook(mut args: impl Iterator<Item = String>) -> Result<()> {
                     print_claude_permission_result(wmcterm_claude::deny_response(
                         "wmcterm received invalid permission JSON",
                     ));
+                } else if explicitly_elicitation && inside_wmcterm {
+                    print_claude_permission_result(wmcterm_claude::cancel_elicitation_response());
                 } else {
                     acknowledge_hook();
                 }
@@ -1813,6 +1824,56 @@ fn run_hook(mut args: impl Iterator<Item = String>) -> Result<()> {
                 print_claude_permission_result(outcome.output);
                 return Ok(());
             }
+            if agent == AgentKind::Claude
+                && (claude_named_hook_event(event.as_deref(), &payload, "Elicitation")
+                    || claude_named_hook_event(event.as_deref(), &payload, "ElicitationResult"))
+            {
+                if !inside_wmcterm {
+                    acknowledge_hook();
+                    return Ok(());
+                }
+                let context = nonempty_env("WMCTERM_WORKSPACE_ID")
+                    .zip(surface.clone())
+                    .zip(nonempty_env("WMCTERM_TERMINAL_LIFECYCLE_ID"))
+                    .and_then(|((workspace, surface), lifecycle)| {
+                        control_socket_path().ok().map(|socket| {
+                            wmcterm_claude::BridgeConfig::new(socket, workspace, surface, lifecycle)
+                        })
+                    });
+                if claude_named_hook_event(event.as_deref(), &payload, "ElicitationResult") {
+                    // Result hooks observe native responses without changing
+                    // their action, including native decline and cancellation.
+                    acknowledge_hook();
+                    if let Some(config) = context
+                        && let Err(error) =
+                            wmcterm_claude::reconcile_elicitation_result(&payload, &config)
+                    {
+                        eprintln!("wmcterm: Claude elicitation result: {error}");
+                    }
+                    return Ok(());
+                }
+                // Unsupported forms and URL authorization remain in Claude's
+                // native dialog. Supported forms are owned by this hook and
+                // return an explicit cancellation on bridge failure.
+                if wmcterm_claude::ElicitationRequest::parse(&payload).is_none() {
+                    acknowledge_hook();
+                    return Ok(());
+                }
+                let outcome = context
+                    .and_then(|config| wmcterm_claude::handle_elicitation(&payload, &config));
+                match outcome {
+                    Some(outcome) => {
+                        if let Some(diagnostic) = outcome.diagnostic {
+                            eprintln!("wmcterm: Claude elicitation cancelled: {diagnostic}");
+                        }
+                        print_claude_permission_result(outcome.output);
+                    }
+                    None => {
+                        print_claude_permission_result(wmcterm_claude::cancel_elicitation_response())
+                    }
+                }
+                return Ok(());
+            }
             let claude_hook = (agent == AgentKind::Claude)
                 .then(|| normalize_claude_hook_event(event.as_deref(), &payload).ok())
                 .flatten();
@@ -1821,7 +1882,21 @@ fn run_hook(mut args: impl Iterator<Item = String>) -> Result<()> {
             // bounded telemetry delivery. PermissionRequest is handled above
             // because Claude must receive the user's actual decision.
             acknowledge_hook();
+            if agent == AgentKind::Codex
+                && matches!(
+                    event
+                        .as_deref()
+                        .or_else(|| payload["hook_event_name"].as_str()),
+                    Some("PreToolUse" | "PostToolUse" | "PreModelRequest")
+                )
+                && codex_hook.tool.is_none()
+            {
+                return Ok(());
+            }
             let normalized = match (claude_hook.as_ref(), codex_hook.subagent.as_ref()) {
+                _ if codex_hook.tool.is_some() => {
+                    codex_hook.tool.as_ref().unwrap().to_agent_event()
+                }
                 (Some(hook), _) => hook.to_agent_event(),
                 (_, Some(hook)) => hook.to_agent_event(),
                 (None, None) => match normalize_hook_event(agent, event.as_deref(), &payload) {
@@ -1893,7 +1968,9 @@ fn run_hook(mut args: impl Iterator<Item = String>) -> Result<()> {
 
 #[derive(Debug, Default)]
 struct CodexHookContext {
+    event_name: Option<String>,
     session_id: Option<String>,
+    tool: Option<wmcterm_agent::CodexToolHookEvent>,
     subagent: Option<wmcterm_agent::CodexSubagentHookEvent>,
     session_end: Option<String>,
 }
@@ -1909,12 +1986,16 @@ fn codex_hook_context(
     let event = event.or_else(|| payload.get("hook_event_name").and_then(Value::as_str));
     let mut context = match event {
         Some("SubagentStart" | "SubagentStop") => CodexHookContext {
+            event_name: None,
             session_id: None,
+            tool: None,
             subagent: wmcterm_agent::normalize_codex_subagent_hook_event(event, payload).ok(),
             session_end: None,
         },
         Some("SessionEnd") => CodexHookContext {
+            event_name: None,
             session_id: None,
+            tool: None,
             subagent: None,
             session_end: payload
                 .get("session_id")
@@ -1924,6 +2005,13 @@ fn codex_hook_context(
         },
         _ => CodexHookContext::default(),
     };
+    context.event_name = event.map(str::to_owned);
+    if matches!(
+        event,
+        Some("PreToolUse" | "PostToolUse" | "PermissionRequest" | "PreModelRequest")
+    ) {
+        context.tool = wmcterm_agent::normalize_codex_tool_hook_event(event, payload).ok();
+    }
     context.session_id = payload
         .get("session_id")
         .and_then(Value::as_str)
@@ -1935,11 +2023,15 @@ fn codex_hook_context(
 const HOOK_DELIVERY_BUDGET: Duration = Duration::from_millis(75);
 
 fn claude_permission_event(event: Option<&str>, payload: &Value) -> bool {
-    event.is_some_and(|name| name.eq_ignore_ascii_case("PermissionRequest"))
+    claude_named_hook_event(event, payload, "PermissionRequest")
+}
+
+fn claude_named_hook_event(event: Option<&str>, payload: &Value, expected: &str) -> bool {
+    event.is_some_and(|name| name.eq_ignore_ascii_case(expected))
         || payload
             .get("hook_event_name")
             .and_then(Value::as_str)
-            .is_some_and(|name| name.eq_ignore_ascii_case("PermissionRequest"))
+            .is_some_and(|name| name.eq_ignore_ascii_case(expected))
 }
 
 fn suppress_bridged_codex_permission_hook(
@@ -1950,11 +2042,20 @@ fn suppress_bridged_codex_permission_hook(
 ) -> bool {
     approval_bridge_active
         && agent == wmcterm_agent::AgentKind::Codex
-        && (event.is_some_and(|name| name.eq_ignore_ascii_case("PermissionRequest"))
-            || payload
-                .get("hook_event_name")
-                .and_then(Value::as_str)
-                .is_some_and(|name| name.eq_ignore_ascii_case("PermissionRequest")))
+        && (event.is_some_and(|name| {
+            matches!(
+                name,
+                "PreToolUse" | "PostToolUse" | "PermissionRequest" | "PreModelRequest"
+            )
+        }) || payload
+            .get("hook_event_name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| {
+                matches!(
+                    name,
+                    "PreToolUse" | "PostToolUse" | "PermissionRequest" | "PreModelRequest"
+                )
+            }))
 }
 
 fn acknowledge_hook() {
@@ -2011,6 +2112,14 @@ fn deliver_hook_bounded(
         object.insert("claude_hook".into(), hook);
     }
     if let Some(object) = params.as_object_mut() {
+        if let Some(event) = codex_hook.event_name {
+            object.insert("codex_hook_event".into(), event.into());
+        }
+        if let Some(hook) = codex_hook.tool
+            && let Ok(hook) = serde_json::to_value(hook)
+        {
+            object.insert("codex_tool_hook".into(), hook);
+        }
         if let Some(session_id) = codex_hook.session_id {
             object.insert("codex_session_id".into(), session_id.into());
         }
@@ -2166,6 +2275,18 @@ fn is_wmcterm_receiver(value: &Value, agent: wmcterm_agent::AgentKind) -> bool {
     let Some(command) = value.get("command").and_then(Value::as_str) else {
         return false;
     };
+    if let Some(args) = value.get("args") {
+        let Some(args) = args.as_array() else {
+            return false;
+        };
+        let executable = command.rsplit(['/', '\\']).next().unwrap_or(command);
+        return matches!(executable, "wmcterm" | "wmcterm.exe")
+            && args.first().and_then(Value::as_str) == Some("hook")
+            && args.get(1).and_then(Value::as_str) == Some("receive")
+            && args.windows(2).any(|pair| {
+                pair[0].as_str() == Some("--agent") && pair[1].as_str() == Some(agent.as_str())
+            });
+    }
     command.contains("wmcterm")
         && command.contains("hook receive")
         && command.contains(&format!("--agent {agent}"))
@@ -2724,6 +2845,29 @@ fn default_dump_command() -> CommandSpec {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn claude_elicitation_hook_matching_preserves_result_distinction() {
+        let request = serde_json::json!({"hook_event_name":"Elicitation"});
+        let result = serde_json::json!({"hook_event_name":"ElicitationResult"});
+        assert!(super::claude_named_hook_event(
+            None,
+            &request,
+            "Elicitation"
+        ));
+        assert!(!super::claude_named_hook_event(
+            None,
+            &result,
+            "Elicitation"
+        ));
+        assert!(super::claude_named_hook_event(
+            Some("elicitation"),
+            &serde_json::json!({}),
+            "Elicitation"
+        ));
+        assert!(!super::claude_permission_event(None, &request));
+        assert!(!super::claude_permission_event(None, &result));
+    }
+
+    #[test]
     fn ssh_script_input_preserves_bytes_and_rejects_invalid_payloads() {
         let script = "printf '%s\\n' \"a'b\" \"$PWD\"\n# \u{4e2d}\u{6587}\n";
         assert_eq!(super::read_ssh_command(script.as_bytes()).unwrap(), script);
@@ -2981,6 +3125,29 @@ mod tests {
                 .any(|entry| entry == &serde_json::json!({"hooks": [], "disabled": true}))
         );
         assert_eq!(document["theme"], "dark");
+    }
+
+    #[test]
+    fn hook_upgrade_recognizes_exec_receivers_and_preserves_unrelated_args() {
+        let mut document = serde_json::json!({"hooks":{"Stop":[{"hooks":[
+            {"command":"C:\\Program Files\\wmcterm.exe", "args":["hook","receive","--agent","claude","--event","Stop"]},
+            {"command":"/opt/old wmcterm/wmcterm", "args":["hook","receive","--agent","claude","--event","Stop"]},
+            {"command":"wmcterm", "args":["hook","receive","--agent","codex"]},
+            {"command":"other-wmcterm", "args":["hook","receive","--agent","claude"]},
+            {"command":"wmcterm", "args":["send","--text","hook receive --agent claude"]},
+            {"command":"wmcterm", "args":["hook","receive","--agent","claude-other"]}
+        ]}]}});
+        assert_eq!(
+            remove_wmcterm_hook_entries(&mut document, wmcterm_agent::AgentKind::Claude),
+            2
+        );
+        assert_eq!(
+            document["hooks"]["Stop"][0]["hooks"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4
+        );
     }
 
     #[test]

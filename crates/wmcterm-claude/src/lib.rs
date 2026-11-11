@@ -15,6 +15,12 @@ use serde_json::{Map, Value, json};
 use thiserror::Error;
 use wmcterm_ipc::{Request, call};
 
+mod input;
+pub use input::{
+    ElicitationRequest, InputControl, InputControlStatus, cancel_elicitation_response,
+    handle_elicitation, handle_elicitation_with, reconcile_elicitation_result,
+};
+
 pub const APPROVAL_REGISTER_METHOD: &str = "agent.approval.register";
 pub const APPROVAL_POLL_METHOD: &str = "agent.approval.poll";
 pub const APPROVAL_CANCEL_METHOD: &str = "agent.request.cancel";

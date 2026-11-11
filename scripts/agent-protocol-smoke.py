@@ -38,8 +38,20 @@ def main():
         permission = hooks["PermissionRequest"][0]["hooks"][0]
         if agent == "claude":
             assert permission["onFailure"] == "block"
+            for event in ("PermissionDenied", "CwdChanged", "DirectoryAdded", "Elicitation", "ElicitationResult"):
+                receiver = hooks[event][0]["hooks"][0]
+                assert receiver["type"] == "command"
+                assert receiver["command"] == binary
+                assert receiver["args"] == ["hook", "receive", "--agent", "claude", "--event", event]
+                if event == "Elicitation":
+                    assert receiver["onFailure"] == "block"
+                    assert receiver["timeout"] >= 540
+                else:
+                    assert "onFailure" not in receiver
+            assert "WorktreeCreate" not in hooks and "WorktreeRemove" not in hooks
         else:
             assert "onFailure" not in permission
+            assert all(event in hooks for event in ("PreToolUse", "PostToolUse", "PreModelRequest"))
     print("PASS installed Codex schemas and generated Claude/Codex Hook contracts")
 
 

@@ -1,13 +1,6 @@
 use super::*;
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct InputField {
-    pub id: String,
-    pub label: String,
-    pub kind: String,
-    pub required: bool,
-    pub options: Vec<String>,
-}
+pub use wmcterm_ipc::InputField;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InputRequest {
@@ -21,36 +14,26 @@ pub struct InputRequest {
 }
 
 impl InputRequest {
+    fn shared_form(&self) -> wmcterm_ipc::InputFormRequest {
+        wmcterm_ipc::InputFormRequest {
+            id: self.id.clone(),
+            method: self.method.clone(),
+            thread_id: self.thread_id.clone(),
+            turn_id: self.turn_id.clone(),
+            item_id: self.item_id.clone(),
+            message: self.message.clone(),
+            fields: self.fields.clone(),
+        }
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         if !matches!(
             self.method.as_str(),
             "item/tool/requestUserInput" | "mcpServer/elicitation/request"
-        ) || (!self.id.is_string() && !self.id.is_number())
-            || self.thread_id.is_empty()
-            || self.turn_id.is_empty()
-            || self.item_id.is_empty()
-            || self.fields.is_empty()
-            || self.fields.len() > 32
-        {
-            return Err("invalid input request identity".into());
+        ) {
+            return Err("invalid Codex input method".into());
         }
-        let mut ids = HashSet::new();
-        for field in &self.fields {
-            if field.id.is_empty()
-                || field.id.len() > 256
-                || field.label.len() > 4096
-                || field.options.len() > 32
-                || field.options.iter().any(|value| value.len() > 4096)
-                || !ids.insert(&field.id)
-                || !matches!(
-                    field.kind.as_str(),
-                    "answer" | "string" | "number" | "integer" | "boolean"
-                )
-            {
-                return Err("invalid input field".into());
-            }
-        }
-        Ok(())
+        self.shared_form().validate()
     }
     /// Unsupported forms stay in the native Codex UI, including secret fields.
     pub fn parse(value: &Value) -> Option<Self> {
@@ -98,66 +81,7 @@ impl InputRequest {
                 return None;
             }
             message = params["message"].as_str()?.to_owned();
-            let schema = &params["requestedSchema"];
-            if schema["type"] != "object" {
-                return None;
-            }
-            // Only render schemas whose constraints this client can enforce exactly.
-            if schema
-                .as_object()?
-                .keys()
-                .any(|key| !matches!(key.as_str(), "type" | "properties" | "required" | "$schema"))
-            {
-                return None;
-            }
-            let properties = schema["properties"].as_object()?;
-            if let Some(required) = schema.get("required") {
-                for name in required.as_array()? {
-                    if !properties.contains_key(name.as_str()?) {
-                        return None;
-                    }
-                }
-            }
-            for (name, property) in properties {
-                if property.as_object()?.keys().any(|key| {
-                    !matches!(
-                        key.as_str(),
-                        "type" | "title" | "description" | "enum" | "default"
-                    )
-                }) {
-                    return None;
-                }
-                let kind = property["type"].as_str()?;
-                if !matches!(kind, "string" | "number" | "integer" | "boolean") {
-                    return None;
-                }
-                let options = if let Some(values) = property.get("enum") {
-                    if kind != "string" {
-                        return None;
-                    }
-                    if values.as_array()?.is_empty() {
-                        return None;
-                    }
-                    values
-                        .as_array()?
-                        .iter()
-                        .map(|value| value.as_str().map(str::to_owned))
-                        .collect::<Option<Vec<_>>>()?
-                } else if kind == "boolean" {
-                    vec!["true".into(), "false".into()]
-                } else {
-                    Vec::new()
-                };
-                fields.push(InputField {
-                    id: name.clone(),
-                    label: property["title"].as_str().unwrap_or(name).into(),
-                    kind: kind.into(),
-                    required: schema["required"].as_array().is_some_and(|required| {
-                        required.iter().any(|value| value.as_str() == Some(name))
-                    }),
-                    options,
-                });
-            }
+            fields = wmcterm_ipc::InputFormRequest::parse_schema(&params["requestedSchema"])?;
         }
         if fields.is_empty() || fields.len() > 32 {
             return None;
@@ -190,80 +114,11 @@ impl InputRequest {
     }
 
     pub fn field_value(&self, index: usize, text: &str) -> Result<Value, String> {
-        let field = self.fields.get(index).ok_or("input field not found")?;
-        if text.len() > 4096 {
-            return Err("answer exceeds 4096 bytes".into());
-        }
-        if field.required && text.is_empty() {
-            return Err("answer is required".into());
-        }
-        if !field.required && text.is_empty() {
-            return Ok(Value::Null);
-        }
-        if !field.options.is_empty()
-            && field.kind != "answer"
-            && !field.options.iter().any(|option| option == text)
-        {
-            return Err("answer must match an available option".into());
-        }
-        match field.kind.as_str() {
-            "answer" | "string" => Ok(json!(text)),
-            "boolean" => match text {
-                "true" => Ok(json!(true)),
-                "false" => Ok(json!(false)),
-                _ => Err("expected true or false".into()),
-            },
-            "integer" => text
-                .parse::<i64>()
-                .map(|value| json!(value))
-                .map_err(|_| "expected an integer".into()),
-            "number" => text
-                .parse::<f64>()
-                .ok()
-                .filter(|value| value.is_finite())
-                .map(|value| json!(value))
-                .ok_or_else(|| "expected a finite number".into()),
-            _ => Err("unsupported field type".into()),
-        }
+        self.shared_form().field_value(index, text)
     }
 
     pub fn response(&self, text: Option<&str>) -> Result<Value, String> {
-        let result = if let Some(text) = text {
-            if text.len() > 64 * 1024 {
-                return Err("answers exceed 64 KiB".into());
-            }
-            let answers: serde_json::Map<String, Value> =
-                serde_json::from_str(text).map_err(|_| "answers must be an object".to_owned())?;
-            if answers.values().any(|value| !value.is_string()) {
-                return Err("answer values must be strings".into());
-            }
-            if answers
-                .keys()
-                .any(|key| !self.fields.iter().any(|field| &field.id == key))
-            {
-                return Err("unknown answer field".into());
-            }
-            let mut content = serde_json::Map::new();
-            for (index, field) in self.fields.iter().enumerate() {
-                let answer = answers.get(&field.id).and_then(Value::as_str).unwrap_or("");
-                let value = self.field_value(index, answer)?;
-                if field.kind == "answer" {
-                    content.insert(field.id.clone(), json!({"answers": [answer]}));
-                } else if !value.is_null() {
-                    content.insert(field.id.clone(), value);
-                }
-            }
-            if self.method == "item/tool/requestUserInput" {
-                json!({"answers": content})
-            } else {
-                json!({"action": "accept", "content": content, "_meta": null})
-            }
-        } else if self.method == "item/tool/requestUserInput" {
-            json!({"answers": {}})
-        } else {
-            json!({"action": "cancel", "content": null, "_meta": null})
-        };
-        Ok(json!({"id": self.id, "result": result}))
+        self.shared_form().response(text)
     }
 
     fn registration(&self, config: &BridgeConfig) -> Value {

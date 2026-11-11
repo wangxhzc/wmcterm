@@ -51,7 +51,8 @@ def commands(value):
     if isinstance(value, dict):
         command = value.get("command")
         if isinstance(command, str):
-            yield command
+            args = value.get("args")
+            yield (command, tuple(args) if isinstance(args, list) else None)
         for child in value.values():
             yield from commands(child)
     elif isinstance(value, list):
@@ -77,22 +78,29 @@ def validate(agent, filename):
         if missing:
             raise SystemExit(
                 f"missing current wmcterm receiver for {agent} event {event}: "
-                + ", ".join(sorted(missing))
+                + ", ".join(repr(item) for item in sorted(missing, key=repr))
             )
 
     stale = {
         command
         for command in commands(document)
-        if "wmcterm" in command
-        and "hook receive" in command
-        and f"--agent {agent}" in command
+        if is_receiver(command, agent)
         and command not in expected_receivers
     }
     if stale:
         raise SystemExit(
             f"stale {agent} wmcterm hook receivers remain: "
-            + ", ".join(sorted(stale))
+            + ", ".join(repr(item) for item in sorted(stale, key=repr))
         )
+
+def is_receiver(receiver, agent):
+    command, args = receiver
+    if args is not None:
+        executable = command.replace("\\", "/").rsplit("/", 1)[-1]
+        return executable in ("wmcterm", "wmcterm.exe") and args[:2] == ("hook", "receive") and any(
+            args[index:index + 2] == ("--agent", agent) for index in range(len(args) - 1)
+        )
+    return "wmcterm" in command and "hook receive" in command and f"--agent {agent}" in command
 
 validate("codex", sys.argv[2])
 validate("claude", sys.argv[3])

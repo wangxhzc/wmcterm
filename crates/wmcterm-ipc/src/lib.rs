@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use thiserror::Error;
 
+mod input;
+pub use input::{InputField, InputFormRequest};
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
     pub id: String,

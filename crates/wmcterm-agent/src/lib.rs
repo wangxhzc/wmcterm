@@ -617,6 +617,95 @@ pub enum AgentEvent {
     },
 }
 
+/// Native tool telemetry retains correlation data, but never tool responses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodexToolHookEvent {
+    pub hook_event_name: String,
+    pub session_id: String,
+    pub turn_id: String,
+    #[serde(default)]
+    pub tool_name: String,
+    #[serde(default)]
+    pub tool_input: Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_use_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<String>,
+}
+
+impl CodexToolHookEvent {
+    pub fn validate(&self) -> Result<(), String> {
+        if !matches!(
+            self.hook_event_name.as_str(),
+            "PreToolUse" | "PostToolUse" | "PermissionRequest" | "PreModelRequest"
+        ) || [&self.session_id, &self.turn_id]
+            .iter()
+            .any(|value| value.trim().is_empty() || value.len() > 1024)
+            || (self.hook_event_name != "PreModelRequest"
+                && (self.tool_name.trim().is_empty() || self.tool_name.len() > 1024))
+            || (matches!(self.hook_event_name.as_str(), "PreToolUse" | "PostToolUse")
+                && self
+                    .tool_use_id
+                    .as_ref()
+                    .is_none_or(|id| id.trim().is_empty() || id.len() > 1024))
+            || serde_json::to_vec(&self.tool_input)
+                .map_err(|e| e.to_string())?
+                .len()
+                > 65536
+        {
+            return Err("invalid Codex tool hook identity or input".into());
+        }
+        Ok(())
+    }
+
+    pub fn to_agent_event(&self) -> AgentEvent {
+        if self.hook_event_name == "PermissionRequest" {
+            AgentEvent::PermissionRequest {
+                message: "Agent is waiting for permission".into(),
+            }
+        } else {
+            AgentEvent::ToolUse {
+                tool: if self.hook_event_name == "PreModelRequest" {
+                    "Codex model request".into()
+                } else {
+                    self.tool_name.clone()
+                },
+            }
+        }
+    }
+}
+
+pub fn normalize_codex_tool_hook_event(
+    event: Option<&str>,
+    payload: &Value,
+) -> Result<CodexToolHookEvent, String> {
+    let mut payload = payload.clone();
+    if let Some(event) = event {
+        if payload
+            .get("hook_event_name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name != event)
+        {
+            return Err("Codex tool hook event name mismatch".into());
+        }
+        payload
+            .as_object_mut()
+            .ok_or("invalid Codex tool hook")?
+            .insert("hook_event_name".into(), event.into());
+    }
+    let mut hook: CodexToolHookEvent =
+        serde_json::from_value(payload).map_err(|e| e.to_string())?;
+    hook.validate()?;
+    // Codex adds approval-only prose here; execution hooks omit it.
+    if hook.tool_name == "Bash"
+        && let Some(input) = hook.tool_input.as_object_mut()
+        && input.get("command").is_some_and(Value::is_string)
+    {
+        input.remove("description");
+    }
+    Ok(hook)
+}
+
 /// Codex subagent lifecycle data from the native 0.151 hook protocol.
 ///
 /// These identities are intentionally read only from top-level native fields.
@@ -746,6 +835,14 @@ pub struct ClaudeHookEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub new_cwd: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub directory: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transcript_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_transcript_path: Option<String>,
@@ -778,6 +875,11 @@ pub enum ClaudeHookKind {
     PostToolUse,
     PostToolUseFailure,
     PermissionRequest,
+    PermissionDenied,
+    CwdChanged,
+    DirectoryAdded,
+    Elicitation,
+    ElicitationResult,
     Notification,
     Stop,
     StopFailure,
@@ -822,6 +924,11 @@ impl ClaudeHookEvent {
             | ClaudeHookKind::PostToolUse
             | ClaudeHookKind::PostToolUseFailure
             | ClaudeHookKind::PermissionRequest
+            | ClaudeHookKind::PermissionDenied
+            | ClaudeHookKind::CwdChanged
+            | ClaudeHookKind::DirectoryAdded
+            | ClaudeHookKind::Elicitation
+            | ClaudeHookKind::ElicitationResult
             | ClaudeHookKind::Notification
             | ClaudeHookKind::Stop
             | ClaudeHookKind::StopFailure => ClaudePaneAction::UpdateAgentStatus,
@@ -862,6 +969,34 @@ impl ClaudeHookEvent {
                     .message
                     .clone()
                     .unwrap_or_else(|| "Agent is waiting for permission".into()),
+            },
+            ClaudeHookKind::PermissionDenied => AgentEvent::Notification {
+                message: format!(
+                    "Auto review denied {}: {}",
+                    self.tool_name.as_deref().unwrap_or("Claude tool"),
+                    self.reason.as_deref().unwrap_or("No reason provided")
+                ),
+            },
+            ClaudeHookKind::CwdChanged => AgentEvent::Notification {
+                message: format!(
+                    "Claude working directory changed: {}",
+                    self.new_cwd.as_deref().unwrap_or_default()
+                ),
+            },
+            ClaudeHookKind::DirectoryAdded => AgentEvent::Notification {
+                message: format!(
+                    "Claude working directory added: {}",
+                    self.directory.as_deref().unwrap_or_default()
+                ),
+            },
+            ClaudeHookKind::Elicitation => AgentEvent::NeedsInput {
+                message: self
+                    .message
+                    .clone()
+                    .unwrap_or_else(|| "MCP server is waiting for input".into()),
+            },
+            ClaudeHookKind::ElicitationResult => AgentEvent::Notification {
+                message: "MCP elicitation answered".into(),
             },
             ClaudeHookKind::Notification => {
                 let notification = self
@@ -961,6 +1096,11 @@ pub fn normalize_claude_hook_event(
         "posttooluse" => ClaudeHookKind::PostToolUse,
         "posttoolusefailure" => ClaudeHookKind::PostToolUseFailure,
         "permissionrequest" => ClaudeHookKind::PermissionRequest,
+        "permissiondenied" => ClaudeHookKind::PermissionDenied,
+        "cwdchanged" => ClaudeHookKind::CwdChanged,
+        "directoryadded" => ClaudeHookKind::DirectoryAdded,
+        "elicitation" => ClaudeHookKind::Elicitation,
+        "elicitationresult" => ClaudeHookKind::ElicitationResult,
         "notification" => ClaudeHookKind::Notification,
         "stop" => ClaudeHookKind::Stop,
         "stopfailure" => ClaudeHookKind::StopFailure,
@@ -972,6 +1112,14 @@ pub fn normalize_claude_hook_event(
         }
     };
     let session_id = required_hook_string(payload, "session_id", AgentKind::Claude, &raw_event)?;
+    let required_fields: &[&'static str] = match kind {
+        ClaudeHookKind::CwdChanged => &["old_cwd", "new_cwd"],
+        ClaudeHookKind::DirectoryAdded => &["directory", "source"],
+        _ => &[],
+    };
+    for field in required_fields {
+        required_hook_string(payload, field, AgentKind::Claude, &raw_event)?;
+    }
     let agent_id = direct_string(payload, "agent_id");
     if matches!(
         kind,
@@ -990,6 +1138,10 @@ pub fn normalize_claude_hook_event(
         agent_id,
         agent_type: direct_string(payload, "agent_type"),
         cwd: direct_string(payload, "cwd"),
+        old_cwd: direct_string(payload, "old_cwd"),
+        new_cwd: direct_string(payload, "new_cwd"),
+        directory: direct_string(payload, "directory"),
+        source: direct_string(payload, "source"),
         transcript_path: direct_string(payload, "transcript_path"),
         agent_transcript_path: direct_string(payload, "agent_transcript_path"),
         tool_name: direct_string(payload, "tool_name"),
@@ -1197,9 +1349,19 @@ pub fn normalize_hook_event(
         .ok_or(NormalizeHookError::MissingEventName)?;
     let event = canonical(&raw_event);
 
-    // This native failure hook must retain its session identity, including
-    // when a legacy adapter calls the generic normalizer.
-    if matches!(agent, AgentKind::Claude) && event == "stopfailure" {
+    // These native events require session identity even through a legacy
+    // adapter, so malformed metadata cannot fall through to loose routing.
+    if matches!(agent, AgentKind::Claude)
+        && matches!(
+            event.as_str(),
+            "stopfailure"
+                | "permissiondenied"
+                | "cwdchanged"
+                | "directoryadded"
+                | "elicitation"
+                | "elicitationresult"
+        )
+    {
         return normalize_claude_hook_event(Some(&raw_event), payload)
             .map(|event| event.to_agent_event());
     }
@@ -1563,6 +1725,11 @@ pub fn hook_install_plan(agent: AgentKind, wmcterm_binary: impl Into<String>) ->
                     "PostToolUse",
                     "PostToolUseFailure",
                     "PermissionRequest",
+                    "PermissionDenied",
+                    "CwdChanged",
+                    "DirectoryAdded",
+                    "Elicitation",
+                    "ElicitationResult",
                     "Notification",
                     "SubagentStart",
                     "SubagentStop",
@@ -1571,6 +1738,7 @@ pub fn hook_install_plan(agent: AgentKind, wmcterm_binary: impl Into<String>) ->
                     "SessionEnd",
                 ],
                 &command,
+                Some(&receiver_command),
                 true,
                 &[
                     "Bash(wmcterm --help)",
@@ -1592,7 +1760,10 @@ pub fn hook_install_plan(agent: AgentKind, wmcterm_binary: impl Into<String>) ->
                 &[
                     "SessionStart",
                     "UserPromptSubmit",
+                    "PreToolUse",
+                    "PostToolUse",
                     "PermissionRequest",
+                    "PreModelRequest",
                     "Interrupt",
                     "SubagentStart",
                     "SubagentStop",
@@ -1600,6 +1771,7 @@ pub fn hook_install_plan(agent: AgentKind, wmcterm_binary: impl Into<String>) ->
                     "SessionEnd",
                 ],
                 &command,
+                None,
                 true,
                 &[],
                 false,
@@ -1632,15 +1804,25 @@ pub fn hook_install_plan(agent: AgentKind, wmcterm_binary: impl Into<String>) ->
 fn json_hook_fragment(
     events: &[&str],
     command: &str,
+    exec_command: Option<&[String]>,
     nested_hooks: bool,
     permission_allow: &[&str],
     block_permission_failure: bool,
 ) -> String {
     let hooks = events.iter().map(|event| {
         let event_command = format!("{command} --event {event}");
-        let mut command_hook = serde_json::json!({ "type": "command", "command": event_command });
-        if *event == "PermissionRequest" && block_permission_failure {
+        let mut command_hook = if let Some(arguments) = exec_command {
+            let mut args = arguments[1..].to_vec();
+            args.extend(["--event".to_owned(), (*event).to_owned()]);
+            serde_json::json!({ "type": "command", "command": arguments[0], "args": args })
+        } else {
+            serde_json::json!({ "type": "command", "command": event_command })
+        };
+        if matches!(*event, "PermissionRequest" | "Elicitation") && block_permission_failure {
             command_hook["onFailure"] = serde_json::json!("block");
+        }
+        if *event == "Elicitation" {
+            command_hook["timeout"] = serde_json::json!(600);
         }
         let entries = if nested_hooks {
             serde_json::json!([{ "hooks": [command_hook] }])
@@ -3088,6 +3270,11 @@ mod tests {
             "PostToolUse",
             "PostToolUseFailure",
             "PermissionRequest",
+            "PermissionDenied",
+            "CwdChanged",
+            "DirectoryAdded",
+            "Elicitation",
+            "ElicitationResult",
             "Notification",
             "SubagentStart",
             "SubagentStop",
@@ -3100,6 +3287,14 @@ mod tests {
         assert_eq!(
             claude_json["hooks"]["PermissionRequest"][0]["hooks"][0]["onFailure"],
             "block"
+        );
+        assert_eq!(
+            claude_json["hooks"]["Elicitation"][0]["hooks"][0]["onFailure"],
+            "block"
+        );
+        assert_eq!(
+            claude_json["hooks"]["Elicitation"][0]["hooks"][0]["timeout"],
+            600
         );
         assert!(
             claude_json["hooks"]["Notification"][0]["hooks"][0]
@@ -3122,7 +3317,20 @@ mod tests {
             );
         }
         let quoted = hook_install_plan(AgentKind::Claude, "/opt/wmc \"term\"/wmc'term");
-        serde_json::from_str::<Value>(&quoted.snippets[0].content).unwrap();
+        let quoted: Value = serde_json::from_str(&quoted.snippets[0].content).unwrap();
+        let receiver = &quoted["hooks"]["PermissionRequest"][0]["hooks"][0];
+        assert_eq!(receiver["command"], "/opt/wmc \"term\"/wmc'term");
+        assert_eq!(
+            receiver["args"],
+            serde_json::json!([
+                "hook",
+                "receive",
+                "--agent",
+                "claude",
+                "--event",
+                "PermissionRequest"
+            ])
+        );
         let codex = hook_install_plan(AgentKind::Codex, "wmcterm");
         assert_eq!(codex.snippets[0].format, HookConfigFormat::Json);
         assert_eq!(
@@ -3140,6 +3348,84 @@ mod tests {
         assert!(codex_json["hooks"]["SubagentStart"].is_array());
         assert!(codex_json["hooks"]["SubagentStop"].is_array());
         assert!(codex_json["hooks"]["Stop"].is_array());
+        assert!(codex_json["hooks"]["PreToolUse"].is_array());
+        assert!(codex_json["hooks"]["PostToolUse"].is_array());
+        assert!(codex_json["hooks"]["PreModelRequest"].is_array());
+        assert!(
+            codex_json["hooks"]["PermissionRequest"][0]["hooks"][0]
+                .get("args")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn claude_auto_denial_is_an_observation_without_waiting_or_retry() {
+        let payload = serde_json::json!({
+            "hook_event_name": "PermissionDenied", "session_id": "session",
+            "tool_name": "Bash", "tool_use_id": "tool-1", "reason": "Classifier unavailable",
+            "permission_mode": "auto", "tool_input": {"command": "private command"}
+        });
+        let hook = normalize_claude_hook_event(None, &payload).unwrap();
+        assert_eq!(hook.kind, ClaudeHookKind::PermissionDenied);
+        assert_eq!(hook.tool_use_id.as_deref(), Some("tool-1"));
+        assert_eq!(hook.reason.as_deref(), Some("Classifier unavailable"));
+        let event = hook.to_agent_event();
+        assert!(matches!(&event, AgentEvent::Notification { message }
+            if message.contains("Bash") && message.contains("Classifier unavailable")));
+        assert_eq!(reduce(&event).state, None);
+        let encoded = serde_json::to_string(&hook).unwrap();
+        assert!(!encoded.contains("private command"));
+        assert!(!encoded.contains("retry"));
+        assert!(
+            normalize_hook_event(
+                AgentKind::Claude,
+                Some("PermissionDenied"),
+                &serde_json::json!({"reason":"denied"})
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn claude_directory_events_preserve_metadata_and_child_routing() {
+        let changed = normalize_claude_hook_event(
+            None,
+            &serde_json::json!({
+                "hook_event_name": "CwdChanged", "session_id": "session", "agent_id": "child",
+                "cwd": "/new", "old_cwd": "/old", "new_cwd": "/new"
+            }),
+        )
+        .unwrap();
+        assert_eq!(changed.kind, ClaudeHookKind::CwdChanged);
+        assert_eq!(changed.old_cwd.as_deref(), Some("/old"));
+        assert_eq!(changed.new_cwd.as_deref(), Some("/new"));
+        assert_eq!(changed.route_key(), "claude:session:child");
+        assert_eq!(reduce(&changed.to_agent_event()).state, None);
+        let added = normalize_claude_hook_event(
+            None,
+            &serde_json::json!({
+                "hook_event_name": "DirectoryAdded", "session_id": "session",
+                "directory": "/added", "source": "register_repo_root"
+            }),
+        )
+        .unwrap();
+        assert_eq!(added.kind, ClaudeHookKind::DirectoryAdded);
+        assert_eq!(added.directory.as_deref(), Some("/added"));
+        assert_eq!(added.source.as_deref(), Some("register_repo_root"));
+        for (event, fields) in [
+            ("CwdChanged", serde_json::json!({"old_cwd":"/old"})),
+            (
+                "DirectoryAdded",
+                serde_json::json!({"source":"slash_command"}),
+            ),
+        ] {
+            let mut payload = serde_json::json!({"session_id":"session", "hook_event_name":event});
+            payload
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            assert!(normalize_hook_event(AgentKind::Claude, None, &payload).is_err());
+        }
     }
 
     #[test]

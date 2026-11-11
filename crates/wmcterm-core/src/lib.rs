@@ -383,6 +383,9 @@ pub enum AgentTelemetry {
     CwdObserved {
         cwd: PathBuf,
     },
+    DirectoryObserved {
+        directory: PathBuf,
+    },
     TranscriptObserved {
         transcript: PathBuf,
     },
@@ -455,6 +458,8 @@ pub struct AgentSession {
     #[serde(alias = "process_start_unix_ms")]
     pub process_started_at_unix_ms: Option<u64>,
     pub cwd: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_directories: Vec<PathBuf>,
     pub transcript: Option<PathBuf>,
     #[serde(alias = "command")]
     pub launch_command: Option<String>,
@@ -481,6 +486,7 @@ impl Default for AgentSession {
             pid: None,
             process_started_at_unix_ms: None,
             cwd: None,
+            additional_directories: Vec::new(),
             transcript: None,
             launch_command: None,
             state: AgentState::Unknown,
@@ -581,6 +587,7 @@ impl AgentSession {
                 self.pid = launch.pid;
                 self.process_started_at_unix_ms = launch.process_started_at_unix_ms;
                 self.cwd.clone_from(&launch.cwd);
+                self.additional_directories.clear();
                 self.transcript.clone_from(&launch.transcript);
                 self.launch_command.clone_from(&launch.launch_command);
                 self.pending_requests.clear();
@@ -724,6 +731,13 @@ impl AgentSession {
                 self.process_started_at_unix_ms = Some(*started_at_unix_ms);
             }
             AgentTelemetry::CwdObserved { cwd } => self.cwd = Some(cwd.clone()),
+            AgentTelemetry::DirectoryObserved { directory } => {
+                if self.additional_directories.len() < 128
+                    && !self.additional_directories.contains(directory)
+                {
+                    self.additional_directories.push(directory.clone());
+                }
+            }
             AgentTelemetry::TranscriptObserved { transcript } => {
                 self.transcript = Some(transcript.clone())
             }
@@ -1672,6 +1686,61 @@ mod tests {
                 },
             }),
         )
+    }
+
+    #[test]
+    fn directory_observations_are_bounded_persisted_and_scoped_to_lifecycle() {
+        let mut session = AgentSession::new(SurfaceId::new_v4());
+        session.apply_event(&agent_start("start", 1, 1)).unwrap();
+        for index in 0..140 {
+            let observation = agent_event(
+                &format!("directory-{index}"),
+                1,
+                index + 2,
+                AgentSessionEventKind::Telemetry(AgentTelemetry::DirectoryObserved {
+                    directory: PathBuf::from(format!("/project/{}", index / 2)),
+                }),
+            );
+            session.apply_event(&observation).unwrap();
+        }
+        assert_eq!(session.additional_directories.len(), 70);
+        for index in 70..150 {
+            session
+                .apply_event(&agent_event(
+                    &format!("more-{index}"),
+                    1,
+                    index + 200,
+                    AgentSessionEventKind::Telemetry(AgentTelemetry::DirectoryObserved {
+                        directory: PathBuf::from(format!("/project/{index}")),
+                    }),
+                ))
+                .unwrap();
+        }
+        assert_eq!(session.additional_directories.len(), 128);
+        assert_eq!(session.state, AgentState::Idle);
+        let restored: AgentSession =
+            serde_json::from_value(serde_json::to_value(&session).unwrap()).unwrap();
+        assert_eq!(
+            restored.additional_directories,
+            session.additional_directories
+        );
+        session
+            .apply_event(&agent_start("restart", 2, 1000))
+            .unwrap();
+        assert!(session.additional_directories.is_empty());
+        assert!(
+            session
+                .apply_event(&agent_event(
+                    "stale-directory",
+                    1,
+                    1001,
+                    AgentSessionEventKind::Telemetry(AgentTelemetry::DirectoryObserved {
+                        directory: "/stale".into()
+                    })
+                ))
+                .is_err()
+        );
+        assert!(session.additional_directories.is_empty());
     }
 
     #[test]

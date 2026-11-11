@@ -5,6 +5,8 @@
 
 mod input;
 mod permissions;
+#[cfg(all(test, unix))]
+mod release_regression;
 pub use input::{InputField, InputRequest};
 pub use permissions::CodexPermissions;
 

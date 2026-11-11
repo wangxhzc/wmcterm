@@ -64,9 +64,10 @@ class ModelFixture(BaseHTTPRequestHandler):
         # Anthropic Messages API, deterministic Bash tool followed by final text.
         tool_seen = any(item.get("type") == "tool_result" for message in body.get("messages", [])
                         for item in message.get("content", []) if isinstance(item, dict))
+        mcp_tool = getattr(self.server, "mcp_tool", None)
         content = [{"type": "text", "text": "Local test complete."}] if tool_seen else [{
-            "type": "tool_use", "id": "tool-local", "name": "Bash",
-            "input": {"command": f"touch {shlex.quote(str(self.server.marker))}", "description": "Local permission fixture"},
+            "type": "tool_use", "id": "tool-local", "name": mcp_tool or "Bash",
+            "input": {} if mcp_tool else {"command": f"touch {shlex.quote(str(self.server.marker))}", "description": "Local permission fixture"},
         }]
         message = {"id": "msg_local", "type": "message", "role": "assistant",
             "model": "claude-sonnet-4-6", "content": content,
@@ -204,6 +205,94 @@ def claude_failures(binary, folder, env, server):
         print(f"PASS real Claude PermissionRequest {name}: tool {'executed' if marker.exists() else 'blocked'}")
 
 
+def claude_input_roundtrip(binary, folder, env, server):
+    """Real Claude MCP -> blocking Hook -> isolated GUI -> MCP typed answer."""
+    env = dict(env)
+    for key, suffix in (("XDG_RUNTIME_DIR", "runtime"), ("XDG_CONFIG_HOME", "config"), ("XDG_DATA_HOME", "data")):
+        path = folder / f"claude-input-{suffix}"
+        path.mkdir(mode=0o700)
+        env[key] = str(path)
+    plan = json.loads(subprocess.check_output([str(binary), "hook", "plan", "--agent", "claude"], env=env, text=True))
+    hooks = json.loads(plan["snippets"][0]["content"])["hooks"]
+    home = folder / "claude-input-home"
+    home.mkdir()
+    (home / ".claude.json").write_text(json.dumps({"hasCompletedOnboarding": True,
+        "projects": {str(folder / "workspace"): {"hasTrustDialogAccepted": True}}}))
+    def rpc(method, params=None):
+        return json.loads(subprocess.check_output([str(binary), "rpc", method, json.dumps(params or {})],
+            env=env, stderr=subprocess.DEVNULL, timeout=5))
+    gui_log = open(folder / "claude-input-gui.log", "w+")
+    app = subprocess.Popen([str(binary), "gui"], cwd=folder / "workspace", env=env, stdout=gui_log, stderr=gui_log)
+    claude = None
+    try:
+        def started():
+            try:
+                return rpc("workspace.list")[0]["id"]
+            except (subprocess.CalledProcessError, IndexError):
+                return None
+        workspace = wait_until(started)
+        surface = rpc("surface.list", {"workspace": workspace})[0]["id"]
+        terminal = next(item for item in rpc("app.diagnostics")["terminals"] if item["surface_id"] == surface)
+        cli_env = {key: value for key, value in env.items() if not key.startswith(("CLAUDE", "ANTHROPIC"))}
+        cli_env.update(HOME=str(home), CLAUDE_CONFIG_DIR=str(home), ANTHROPIC_API_KEY="local-fixture-only",
+            ANTHROPIC_BASE_URL=f"http://127.0.0.1:{server.server_port}", CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC="1",
+            DISABLE_AUTOUPDATER="1", WMCTERM="1", WMCTERM_WORKSPACE_ID=workspace,
+            WMCTERM_SURFACE_ID=surface, WMCTERM_TERMINAL_LIFECYCLE_ID=terminal["lifecycle_id"])
+        result_file = folder / "claude-mcp-response.json"
+        native_result = folder / "claude-native-result"
+        hooks["ElicitationResult"].append({"hooks": [{"type": "command", "command": sys.executable,
+            "args": ["-c", f"from pathlib import Path; Path({str(native_result)!r}).touch()"]}]})
+        # Permit only this fixture's tool. The elicitation itself still needs a
+        # real response through the installed command+args Elicitation Hook.
+        settings = {"hooks": hooks, "permissions": {"allow": ["mcp__fixture__ask"]}}
+        mcp = {"mcpServers": {"fixture": {"type": "stdio", "command": sys.executable,
+            "args": [str(ROOT / "scripts/fixtures/claude-mcp-input-smoke.py"), str(result_file)]}}}
+        server.mcp_tool = "mcp__fixture__ask"
+        claude = subprocess.Popen(["claude", "-p", "Call the local fixture ask tool once.", "--model", "claude-sonnet-4-6",
+            "--settings", json.dumps(settings), "--setting-sources", "", "--permission-mode", "default", "--strict-mcp-config",
+            "--mcp-config", json.dumps(mcp), "--tools", "", "--max-turns", "2",
+            "--output-format", "stream-json", "--verbose", "--include-hook-events"],
+            env=cli_env, cwd=folder / "workspace", stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        def pending():
+            requests = rpc("agent.request.list")
+            request = next((item for item in requests if item["kind"] == "input"), None)
+            if request:
+                return request
+            if claude.poll() is not None:
+                stdout, stderr = claude.communicate()
+                raise AssertionError(("Claude exited before requesting input", stdout[-8000:], stderr[-2000:]))
+            return None
+        request = wait_until(pending)
+        rpc("agent.request.reply", {"request_id": request["request_id"], "resolution": {
+            "text": json.dumps({"count": "7", "enabled": "false", "label": "\u4e2d\u6587\U0001f642"})}})
+        stdout, stderr = claude.communicate(timeout=40)
+        assert claude.returncode == 0, (stdout[-8000:], stderr[-2000:])
+        assert result_file.exists(), (stdout[-8000:], stderr[-2000:])
+        response = json.loads(result_file.read_text())
+        assert response["result"]["action"] == "accept", response
+        assert response["result"]["content"] == {"count": 7, "enabled": False, "label": "\u4e2d\u6587\U0001f642"}, response
+        assert not native_result.exists(), "hook-owned responses must skip ElicitationResult"
+        assert not rpc("agent.request.list")
+        print("PASS real Claude MCP -> Elicitation command+args Hook -> centralized typed answer -> MCP response")
+    except Exception:
+        if claude is not None and claude.poll() is None:
+            claude.kill()
+            stdout, stderr = claude.communicate()
+            print(stdout[-10000:], stderr[-3000:])
+        gui_log.flush()
+        print((folder / "claude-input-gui.log").read_text()[-5000:])
+        raise
+    finally:
+        server.mcp_tool = None
+        app.terminate()
+        try:
+            app.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            app.kill()
+            app.wait()
+        gui_log.close()
+
+
 def main():
     binary = Path(sys.argv[1] if len(sys.argv) > 1 else ROOT / "target/debug/wmcterm").resolve()
     with tempfile.TemporaryDirectory(prefix="wmcterm-agent-live-") as directory:
@@ -218,8 +307,10 @@ def main():
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            codex_roundtrip(binary, folder, env, server)
-            claude_failures(binary, folder, env, server)
+            if "--claude-input-only" not in sys.argv:
+                codex_roundtrip(binary, folder, env, server)
+                claude_failures(binary, folder, env, server)
+            claude_input_roundtrip(binary, folder, env, server)
         finally:
             server.shutdown()
             server.server_close()

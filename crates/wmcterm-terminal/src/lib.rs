@@ -652,7 +652,9 @@ impl TerminalEngine {
     }
 
     pub fn encode_paste(&self, text: &str) -> Result<Vec<u8>, TerminalError> {
-        let mut input = text.as_bytes().to_vec();
+        // The encoder maps CR and LF individually; fold Windows line endings
+        // first so each clipboard line produces exactly one terminal newline.
+        let mut input = text.replace("\r\n", "\n").into_bytes();
         let mut output = vec![0_u8; input.len() + 16];
         let bracketed = self.terminal.mode(Mode::BRACKETED_PASTE)?;
         let written = libghostty_vt::paste::encode(&mut input, bracketed, &mut output)?;
@@ -1674,6 +1676,21 @@ mod tests {
             .unwrap();
         let snapshot = terminal.snapshot().unwrap();
         assert_eq!((snapshot.cols, snapshot.rows), (20, 4));
+    }
+
+    #[test]
+    fn paste_normalizes_windows_line_endings_without_inserting_blank_lines() {
+        let mut terminal = TerminalEngine::new(TerminalSize::new(20, 2).unwrap()).unwrap();
+        let text = "\u{4e2d}\u{6587}\r\n\u{1f642}\rfinal\n";
+        assert_eq!(
+            terminal.encode_paste(text).unwrap(),
+            "\u{4e2d}\u{6587}\r\u{1f642}\rfinal\r".as_bytes()
+        );
+        terminal.feed(b"\x1b[?2004h");
+        assert_eq!(
+            terminal.encode_paste(text).unwrap(),
+            "\x1b[200~\u{4e2d}\u{6587}\n\u{1f642}\rfinal\n\x1b[201~".as_bytes()
+        );
     }
 
     #[test]

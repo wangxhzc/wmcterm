@@ -60,17 +60,38 @@ with open(sys.argv[1], 'ab', buffering=0) as output:
                 time.sleep(0.3)
                 xdo("mousemove", "--window", window, "600", "300")
                 wait_for(lambda: b"\x1b[<35;" in data())
-                xdo("key", "ctrl+f", "ctrl+g", "F2", "F3", "F4")
+                xdo("key", "ctrl+f", "ctrl+g", "F2", "F3", "F4", "ctrl+c", "ctrl+x", "F9")
                 wait_for(lambda: b"\x1b[102;5u" in data() and b"\x1b[103;5:3u" in data())
                 assert b"\x1b[1;1:1Q" in data() and b"\x1b[1;1:3Q" in data(), data()
+                wait_for(lambda: all(sequence in data() for sequence in (
+                    b"\x1b[99;5u", b"\x1b[99;5:3u", b"\x1b[120;5u",
+                    b"\x1b[120;5:3u", b"\x1b[20~", b"\x1b[20;1:3~",
+                )))
                 xdo("key", "shift+Return")
                 wait_for(lambda: b"\x1b[13;2u" in data())
                 before = len(data())
                 xdo("key", "ctrl+alt+f")
                 wait_for(lambda: b"\x1b[O" in data()[before:])
                 assert not next(item for item in rpc("app.diagnostics")["terminals"] if item["surface_id"] == target)["input_focused"]
+                xdo("mousemove", "--window", window, "600", "300")
+                xdo("click", "1")
+                wait_for(lambda: b"\x1b[I" in data()[before:])
+                xdo("key", "F8")
+                wait_for(lambda: b"\x1b[19~" in data()[before:])
+                before = len(data())
+                xdo("mousemove", "--window", window, "650", "20")
+                xdo("click", "1")
+                wait_for(lambda: b"\x1b[O" in data()[before:])
                 xdo("key", "Escape")
                 wait_for(lambda: b"\x1b[I" in data()[before:])
+                before = len(data())
+                xdo("key", "ctrl+shift+n")
+                wait_for(lambda: b"\x1b[O" in data()[before:])
+                assert not next(item for item in rpc("app.diagnostics")["terminals"] if item["surface_id"] == target)["input_focused"]
+                xdo("key", "F8", "Escape", "F9")
+                wait_for(lambda: b"\x1b[I" in data()[before:] and b"\x1b[20~" in data()[before:])
+                assert b"\x1b[19~" not in data()[before:], data()[before:]
+                xdo("mousemove", "--window", window, "600", "300")
                 before = len(data())
                 xdo("mousedown", "3")
                 wait_for(lambda: b"\x1b[<2;" in data()[before:])
@@ -96,7 +117,7 @@ with open(sys.argv[1], 'ab', buffering=0) as output:
                 wait_for(lambda: b"\x1b[O" in data()[before:])
                 rpc("surface.activate", {"id": target})
                 wait_for(lambda: b"\x1b[I" in data()[before:])
-                print("Input protocol smoke passed: shortcuts, hover, buttons, wheel, focus")
+                print("Input protocol smoke passed: shortcuts, Codex Ctrl+C/Ctrl+X/F9, hover, buttons, wheel, focus")
             except AssertionError as error:
                 raise AssertionError(f"{error}; PTY received: {data()!r}") from error
             finally:

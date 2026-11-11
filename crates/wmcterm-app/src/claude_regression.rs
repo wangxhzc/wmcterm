@@ -58,6 +58,269 @@ pub(super) fn check(app: &mut WmctermApplication, terminal: TerminalId, surface:
     check_ordering_and_isolation(app, terminal, surface);
     check_lifecycle(app, terminal, surface);
     check_session_approval_isolation(app, terminal, surface);
+    check_forms_and_directories(app, terminal, surface);
+}
+
+fn check_forms_and_directories(
+    app: &mut WmctermApplication,
+    terminal: TerminalId,
+    surface: SurfaceId,
+) {
+    let cwd = env::current_dir().unwrap();
+    let next = cwd.join("claude-worktree");
+    let extra = cwd.join("additional-project");
+    let mut start = hook(
+        app,
+        terminal,
+        "forms-session",
+        "SessionStart",
+        json!({"cwd": cwd}),
+    );
+    start["hook_started_at_unix_ns"] = 100.into();
+    assert!(send(app, start).error.is_none());
+    accept(
+        app,
+        terminal,
+        "forms-session",
+        "CwdChanged",
+        json!({"old_cwd": cwd, "new_cwd": next}),
+    );
+    assert_eq!(app.cwd_for_terminal(terminal), Some(next.clone()));
+    assert_eq!(app.state.workspaces[0].cwd, next);
+    let pane = app
+        .state
+        .panes
+        .values()
+        .find(|pane| pane.surfaces.contains(&surface))
+        .unwrap()
+        .id;
+    let selected = app.state.panes[&pane].active_surface;
+    let other = wmcterm_core::Surface::terminal("directory isolation");
+    let other_id = other.id;
+    app.state.surfaces.insert(other_id, other);
+    let target = app.state.panes.get_mut(&pane).unwrap();
+    target.surfaces.push(other_id);
+    target.active_surface = target.surfaces.len() - 1;
+    accept(
+        app,
+        terminal,
+        "forms-session",
+        "CwdChanged",
+        json!({"old_cwd": next, "new_cwd": cwd}),
+    );
+    assert_eq!(app.cwd_for_terminal(terminal), Some(cwd.clone()));
+    assert_eq!(app.state.workspaces[0].cwd, next);
+    let target = app.state.panes.get_mut(&pane).unwrap();
+    target.surfaces.pop();
+    target.active_surface = selected;
+    app.state.surfaces.remove(&other_id);
+    accept(
+        app,
+        terminal,
+        "forms-session",
+        "CwdChanged",
+        json!({"old_cwd": cwd, "new_cwd": next}),
+    );
+    for _ in 0..2 {
+        accept(
+            app,
+            terminal,
+            "forms-session",
+            "DirectoryAdded",
+            json!({"directory": extra, "source": "slash_command"}),
+        );
+    }
+    assert_eq!(
+        app.agent_sessions[&surface].additional_directories,
+        vec![extra]
+    );
+    accept(
+        app,
+        terminal,
+        "forms-session",
+        "CwdChanged",
+        json!({"old_cwd": next, "new_cwd": cwd, "agent_id": "child"}),
+    );
+    assert_eq!(app.cwd_for_terminal(terminal), Some(next.clone()));
+
+    let registration = |app: &WmctermApplication, server: &str, elicitation: &str| {
+        json!({
+            "source": "claude_hook", "workspace_id": app.state.workspaces[0].id,
+            "surface_id": surface, "lifecycle_id": app.terminals[&terminal].lifecycle_id,
+            "session_id": "forms-session",
+            "request": {"jsonrpc_id": format!("{server}:{elicitation}"), "method": "Elicitation", "kind": "input",
+                "thread_id": "forms-session", "turn_id": server, "item_id": elicitation,
+                "mcp_server_name": server, "elicitation_id": elicitation,
+                "params": {"id": format!("{server}:{elicitation}"), "method": "Elicitation", "thread_id": "forms-session",
+                    "turn_id": server, "item_id": elicitation, "message": "Project options",
+                    "fields": [{"id": "count", "label": "Count", "kind": "integer", "required": true, "options": []}]}},
+            "decisions": ["deny", "once"]
+        })
+    };
+    let params = registration(app, "server-a", "same-id");
+    let id = app.register_agent_input(&params).unwrap()["approval_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        app.register_agent_input(&params).unwrap()["approval_id"],
+        id
+    );
+    assert_eq!(app.pending_agent_request_list().len(), 1);
+    let second = app
+        .register_agent_input(&registration(app, "server-b", "same-id"))
+        .unwrap()["approval_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert_ne!(id, second);
+    accept(
+        app,
+        terminal,
+        "forms-session",
+        "PermissionDenied",
+        json!({"tool_name": "Bash", "tool_use_id": "blocked-tool", "reason": "Classifier unavailable", "permission_mode": "auto"}),
+    );
+    assert_eq!(app.pending_agent_request_list().len(), 2);
+    assert_eq!(
+        app.state.surfaces[&surface].agent.as_ref().unwrap().state,
+        AgentState::WaitingForInput
+    );
+    assert!(
+        app.state
+            .notifications
+            .iter()
+            .any(|notification| notification.body.contains("Classifier unavailable"))
+    );
+    let reply = |app: &mut WmctermApplication, id: &str, text: &str| {
+        app.handle_rpc(Request {
+            id: "form-reply".into(),
+            method: "agent.request.reply".into(),
+            params: json!({"request_id": id, "resolution": {"text": text}}),
+        })
+    };
+    assert!(
+        reply(app, &id, r#"{"count":"not-a-number"}"#)
+            .error
+            .is_some()
+    );
+    assert_eq!(
+        app.poll_agent_input(&json!({"request_id": id})).unwrap()["status"],
+        "pending"
+    );
+    assert!(reply(app, &id, r#"{"count":"3"}"#).error.is_none());
+    assert_eq!(
+        app.poll_agent_input(&json!({"request_id": id})).unwrap()["resolution"]["text"],
+        r#"{"count":"3"}"#
+    );
+    let context = json!({"workspace_id": app.state.workspaces[0].id, "surface_id": surface,
+        "lifecycle_id": app.terminals[&terminal].lifecycle_id, "session_id": "forms-session",
+        "mcp_server_name": "server-b", "elicitation_id": "same-id"});
+    let mut stale = context.clone();
+    stale["lifecycle_id"] = "stale".into();
+    assert!(app.reconcile_claude_input(&stale).is_err());
+    assert_eq!(app.pending_agent_request_list().len(), 1);
+    assert_eq!(
+        app.reconcile_claude_input(&context).unwrap()["cancelled"],
+        1
+    );
+    assert_eq!(
+        app.poll_agent_input(&json!({"request_id": second}))
+            .unwrap()["status"],
+        "cancelled"
+    );
+    assert_eq!(
+        app.poll_agent_input(&json!({"request_id": id})).unwrap()["resolution"]["text"],
+        r#"{"count":"3"}"#
+    );
+    let uncompleted = app
+        .register_agent_input(&registration(app, "server-c", "session-end-pending"))
+        .unwrap()["approval_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let approval = app.register_agent_approval(&json!({
+        "source": "claude_hook", "workspace_id": app.state.workspaces[0].id,
+        "surface_id": surface, "lifecycle_id": app.terminals[&terminal].lifecycle_id,
+        "request": {"jsonrpc_id": "session-end-approval", "method": "PermissionRequest", "kind": "permission",
+            "thread_id": "forms-session", "turn_id": "hook", "item_id": "tool",
+            "params": {"tool_name": "Bash", "tool_input": {"command": "pwd"}}},
+        "decisions": ["deny", "once"]
+    })).unwrap()["approval_id"].as_str().unwrap().to_owned();
+    app.resolve_agent_request_from_ui(approval.clone(), AgentApprovalAction::AllowOnce);
+    let session = app.agent_sessions.get_mut(&surface).unwrap();
+    session.pid = Some(123);
+    session.process_started_at_unix_ms = Some(456);
+    accept(app, terminal, "forms-session", "SessionEnd", json!({}));
+    assert_eq!(
+        app.agent_sessions[&surface].lifecycle.phase,
+        AgentLifecyclePhase::Exited
+    );
+    assert!(app.pending_agent_request_list().is_empty());
+    assert!(app.register_agent_input(&params).is_err());
+    assert_eq!(
+        app.poll_agent_input(&json!({"request_id": uncompleted}))
+            .unwrap()["status"],
+        "cancelled"
+    );
+    assert_eq!(
+        app.poll_agent_approval(&json!({"approval_id": approval}))
+            .unwrap()["decision"]["mode"],
+        "deny"
+    );
+    assert_eq!(
+        app.poll_agent_input(&json!({"request_id": id})).unwrap()["status"],
+        "cancelled"
+    );
+    let mut resumed = hook(
+        app,
+        terminal,
+        "forms-session",
+        "SessionStart",
+        json!({"cwd": next}),
+    );
+    resumed["hook_started_at_unix_ns"] = 105.into();
+    assert!(send(app, resumed).error.is_none());
+    assert_eq!(
+        app.poll_agent_input(&json!({"request_id": id})).unwrap()["status"],
+        "cancelled"
+    );
+    let pending = app
+        .register_agent_input(&registration(app, "server-c", "pending"))
+        .unwrap()["approval_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut changed = hook(
+        app,
+        terminal,
+        "forms-next",
+        "SessionStart",
+        json!({"cwd": cwd}),
+    );
+    changed["hook_started_at_unix_ns"] = 110.into();
+    assert!(send(app, changed).error.is_none());
+    assert!(
+        app.agent_sessions[&surface]
+            .additional_directories
+            .is_empty()
+    );
+    assert_eq!(
+        app.poll_agent_input(&json!({"request_id": pending}))
+            .unwrap()["status"],
+        "cancelled"
+    );
+    assert!(app.register_agent_input(&params).is_err());
+    let before = snapshot(app, surface, terminal);
+    let invalid = hook(
+        app,
+        terminal,
+        "forms-next",
+        "CwdChanged",
+        json!({"old_cwd": cwd, "new_cwd": "relative/path"}),
+    );
+    assert!(send(app, invalid).error.is_some());
+    assert_eq!(snapshot(app, surface, terminal), before);
 }
 
 fn check_session_approval_isolation(

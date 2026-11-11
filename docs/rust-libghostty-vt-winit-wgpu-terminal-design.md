@@ -1,12 +1,46 @@
 # Managed Codex Restore
 
-## Agent Release Compatibility (2026-10-10)
+## Native Codex Permission Wait Recovery (2026-11-10)
 
-The audit uses installed Codex 0.162.1 and Claude Code 2.1.296, GitHub release
-tags, upstream source, and generated app-server schemas. Codex tag
-`rust-v0.162.1` resolves to `092d3acd6bec3e3a14bdc7e7a2810ab628ab759d`.
-Its patch changes async-question rendering and explicit daemon feature overrides,
-not approval wire contracts. Claude's `v2.1.296` tree exposes plugins and mods,
+Native `codex resume` sessions have no managed approval reply channel. Previously
+their `PermissionRequest` hook set a telemetry wait with no tool completion hook
+to clear it, leaving the sidebar waiting while Codex continued working.
+
+The generated Codex plan now includes `PreToolUse` and `PostToolUse`, verified
+against the installed 0.167.0 command input schemas and isolated runtime fixtures.
+The receiver forwards only correlation metadata, never tool responses. Native
+tool events require an explicit surface, current terminal lifecycle, matching
+root session, turn, tool name/input and receiver timestamp. The bounded tracker
+keeps at most 64 native waits, 128 active tools and 128 completion tombstones;
+each tool input is limited to 64 KiB and is not persisted to the session file.
+Codex's Bash approval input adds a description absent from execution hooks;
+normalization removes only that approval prose when comparing command identity.
+Parallel identical calls retain their wait until all candidate calls complete.
+Denied tools do not emit PostToolUse. A root `PreModelRequest` for the same turn
+ends its preceding native waits, with a bounded per-turn timestamp barrier to
+reject late permission/tool delivery. Model request content is not forwarded.
+Duplicate/late deliveries cannot reactivate a completed turn. Prompt submission
+opens a new turn; stop/interruption closes it without ending the session.
+
+Native telemetry cannot complete or hide an actionable request. Managed Codex
+continues to use its app-server watcher; duplicate native tool hooks are ignored.
+Older installed hooks retain their legacy behavior until explicitly reinstalled
+and reviewed in Codex. Packaging never changes the user's Hooks or running PTYs.
+
+Validation includes tracker and RPC regressions plus
+`xvfb-run -a python3 scripts/codex-native-wait-smoke.py target/debug/wmcterm`.
+The smoke uses a disposable Codex home, an independent GUI/socket and a loopback
+model fixture; it does not call paid APIs or modify existing workspaces.
+
+## Agent Release Compatibility (2026-10-20)
+
+The audit uses installed Codex 0.163.0 and Claude Code 2.1.304, GitHub release
+tags, upstream source, and generated app-server schemas. Codex 0.163.0 fixes
+connection-bound request replies and cold resume of saved permissions/network
+grants, and enables instant turn interruption. Regression coverage checks the
+watcher's same-connection replies and stale-connection cancellation. The managed
+permission profile continues to take precedence over restored settings, including
+whole-table sandbox overrides. Claude's public tree exposes plugins and mods,
 not the CLI core; core behavior remains a documented/runtime contract.
 
 Claude PermissionRequest command hooks set `onFailure: "block"` (requires
@@ -37,9 +71,10 @@ Permissions requests expose a separate `strict` decision, mapped to
 once/session choices retain their semantics. Test contracts use the installed
 generated schemas rather than copying assumptions from release notes.
 
-Sources: [Codex release diff](https://github.com/openai/codex/compare/rust-v0.162.0...rust-v0.162.1),
-[permission protocol](https://github.com/openai/codex/blob/rust-v0.162.1/codex-rs/app-server-protocol/src/protocol/v2/permissions.rs),
-[Claude public tag](https://github.com/anthropics/claude-code/tree/v2.1.296),
+Sources: [Codex release](https://github.com/openai/codex/releases/tag/rust-v0.163.0),
+[permission protocol](https://github.com/openai/codex/blob/rust-v0.163.0/codex-rs/app-server-protocol/src/protocol/v2/permissions.rs),
+[Claude release](https://github.com/anthropics/claude-code/releases/tag/v2.1.304),
+[Claude hooks](https://code.claude.com/docs/en/hooks),
 [OSC 7501](https://www.superlogical.com/rex/docs/build/program-status).
 
 Implementation update: 2026-09-15. The broader terminal architecture is documented
@@ -204,6 +239,32 @@ thread. Explicit native resume remains available as a user-selected alternative.
 
 ## Validation
 
+The release baseline is Codex 0.163.0 and Claude Code 2.1.304. Claude command
+hooks use native executable-plus-args invocation, retaining `onFailure: block`
+for permissions. Explicit reinstall removes obsolete wmcterm shell entries while
+preserving unrelated hooks. No worktree creation/removal hooks are installed:
+`WorktreeCreate` replaces provider behavior and is not an observation API.
+
+Claude `PermissionDenied` is informational auto-review telemetry, including the
+tool and denial reason. It never creates an actionable permission or requests a
+retry. Root `CwdChanged` and `DirectoryAdded` observations update the core Agent
+session; child observations cannot change root directory metadata. Additional
+directories are deduplicated, bounded to 128, persisted compatibly and cleared on
+session replacement. Only the workspace's selected surface updates its displayed
+cwd; per-terminal cwd and session diagnostics retain inactive surfaces' paths.
+
+The IPC crate owns bounded provider-neutral form fields, schema validation and
+answer conversion. Codex retains its public input API while delegating shared
+validation. Claude `Elicitation` supports the same primitive MCP form subset. A
+supported hook blocks and owns the dialog, returning typed content or `cancel` on
+denial, timeout, stale session or control failure. Unsupported schemas, secrets
+and URL requests return no decision and retain native interaction. Claude skips
+`ElicitationResult` for a hook-owned answer. Native result reconciliation requires
+an explicit elicitation ID and matching server, session, surface and lifecycle;
+unidentified results never cancel other requests. Input polling and late replies
+check the current session generation and terminal lifecycle. Neither read-all nor
+ordinary auto-denial notifications resolve actionable forms.
+
 SessionStart delivery carries a receiver-generated nanosecond timestamp. A
 per-terminal guard rejects older starts and ambiguous legacy re-entry into a
 retired session, while allowing a fresh invocation to resume it. Guards reset
@@ -211,11 +272,25 @@ on PTY restart and cap identity history at 4096 sessions without evicting replay
 protection. Approval registration checks Claude session identity and scopes IDs
 to terminal lifecycle and core session generation. Session replacement cancels
 pending approvals; polling old completed grants returns deny after replacement.
+Claude `SessionEnd` also ends the lifecycle and cancels all requests bound to
+that surface/lifecycle, including hooks without PID metadata. Completed input
+answers and approvals become unreadable after exit or resume. Ordinary `Stop`
+and `StopFailure` retain their turn-level semantics.
 
 GUI keyboard events supply winit's layout-aware unmodified codepoint. Printable
 AltGr text does not become a Control+Alt command. Modified Enter never predicts
 submission, and Hook-owned state is not overridden by input heuristics. Local
-editors and modal input release terminal focus until they close.
+editors and modal input release terminal focus until they close or relinquish
+keyboard ownership. Notification panels release terminal focus unless an
+explicit editor retains keyboard ownership. IME commits and preedit obey the
+same modal boundaries as keyboard input. Terminal search visibility is separate
+from search focus: clicking a terminal restores input while preserving search
+highlights; clicking the search field resumes editing. Scrolling tabs in a
+background pane changes its selected tab without moving keyboard focus.
+File drops insert the shell-quoted path into the terminal under the pointer,
+then focus that pane and release local search ownership without submitting the
+command. Drops blocked by menus or modal editors leave terminal input and focus
+unchanged. Window activation is requested only after a successful user drop.
 
 `wmcterm diagnostics` / `app.diagnostics` reports executable paths, observed
 Hook provenance and snapshot protocol flags; CLI version probes have a timeout.
@@ -270,12 +345,24 @@ state and mode transitions through a GUI with temporary config and RPC socket.
 - `xvfb-run -a python3 scripts/agent-live-contract-smoke.py target/debug/wmcterm`
   drives installed Codex/Claude CLIs against a loopback-only model fixture.
   Codex traverses app-server, watcher and GUI before verifying the answer in the
-  next upstream tool output and turn completion. Claude verifies a working allow
+  next upstream tool output and turn completion. Claude exercises an actual
+  stdio MCP elicitation through the installed CLI and checks the typed answers
+  received by the MCP server. Claude also verifies a working allow
   control and denied execution for crashing, missing, timed-out and invalid-JSON
   PermissionRequest hooks. Configuration and tool marker files are disposable;
   these tests never call a paid model API or modify user Hook installations.
 - `python3 scripts/codex-permissions-smoke.py` uses an isolated Codex home and
   real app-server to check permission round trips, with no model turns.
+- `python3 scripts/codex-release-smoke.py` checks Codex 0.163.0 cold resume,
+  saved sandbox/network settings and explicit managed permission overrides
+  against the real app-server, with no model turns.
+- `xvfb-run -a node scripts/claude-input-smoke.mjs target/debug/wmcterm` checks
+  concurrent and duplicate forms, typed replies, native reconciliation,
+  unsupported-schema fallback and session isolation.
+- PTY compatibility tests cover Ctrl+C, Ctrl+X and F9 in legacy/Kitty modes and
+  CJK/emoji bracketed paste. CRLF is normalized before libghostty paste encoding
+  so Windows line endings produce one newline instead of two. The input
+  protocol GUI smoke also checks key press/release delivery.
 - `xvfb-run -a --server-args='-screen 0 1280x800x24' python3 scripts/codex-managed-restore-smoke.py`
   uses an isolated GUI, real server, and deterministic Node 22+ TUI fixture to
   check initial managed launch, three restart modes, `/resume`, labels and save.

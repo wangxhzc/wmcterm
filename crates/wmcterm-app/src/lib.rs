@@ -1,6 +1,9 @@
 #[cfg(test)]
 mod claude_regression;
 mod codex_restore;
+mod codex_tool_hooks;
+#[cfg(test)]
+mod focus_regression;
 mod i18n;
 #[cfg(test)]
 mod input_regression;
@@ -1151,6 +1154,7 @@ struct WmctermApplication {
     terminal_key_presses: HashMap<PhysicalKey, (TerminalId, KeyInput)>,
     input_focus_terminal: Option<TerminalId>,
     search_visible: bool,
+    search_focused: bool,
     search_editor: TextEditor,
     search_result: Option<SearchResult>,
     terminal_font_size: f32,
@@ -1194,11 +1198,12 @@ struct WmctermApplication {
     last_bell_notifications: HashMap<TerminalId, std::time::Instant>,
     agent_sessions: HashMap<SurfaceId, AgentSession>,
     session_start_guards: HashMap<TerminalId, session_start_guard::SessionStartGuard>,
+    codex_tool_hooks: HashMap<TerminalId, codex_tool_hooks::ToolHookTracker>,
     last_hook_delivery: HashMap<TerminalId, Value>,
     pending_agent_requests: PendingAgentRequests,
     agent_approval_results: HashMap<String, AgentApprovalAction>,
     agent_approval_bindings: HashMap<String, (SurfaceId, String, Option<u64>)>,
-    agent_input_forms: HashMap<String, wmcterm_codex::InputRequest>,
+    agent_input_forms: HashMap<String, wmcterm_ipc::InputFormRequest>,
     agent_input_edit: Option<(String, usize, serde_json::Map<String, Value>)>,
     agent_approval_result_order: VecDeque<String>,
     claude_subagents: HashMap<String, ClaudeSubagentStatus>,
@@ -1368,6 +1373,7 @@ impl WmctermApplication {
             terminal_key_presses: HashMap::new(),
             input_focus_terminal: None,
             search_visible: false,
+            search_focused: false,
             search_editor: TextEditor::default(),
             search_result: None,
             terminal_font_size,
@@ -1411,6 +1417,7 @@ impl WmctermApplication {
             last_bell_notifications: HashMap::new(),
             agent_sessions: restored_agent_sessions,
             session_start_guards: HashMap::new(),
+            codex_tool_hooks: HashMap::new(),
             last_hook_delivery: HashMap::new(),
             pending_agent_requests: PendingAgentRequests::new(256)
                 .expect("pending Agent request capacity is non-zero"),
@@ -1628,6 +1635,7 @@ impl WmctermApplication {
         self.foreground_agents.remove(&id);
         self.claude_hook_modes.remove(&id);
         self.session_start_guards.remove(&id);
+        self.codex_tool_hooks.remove(&id);
         self.last_hook_delivery.remove(&id);
         self.terminal_key_presses
             .retain(|_, (terminal, _)| *terminal != id);
@@ -1698,6 +1706,13 @@ impl WmctermApplication {
 
     fn cwd_for_terminal(&self, terminal: TerminalId) -> Option<std::path::PathBuf> {
         let surface = self.surface_for_terminal(terminal)?;
+        if let Some(session) = self.agent_sessions.get(&surface)
+            && session.agent_kind.as_str() == "claude"
+            && session.lifecycle.phase == AgentLifecyclePhase::Running
+            && let Some(cwd) = session.cwd.as_ref()
+        {
+            return Some(cwd.clone());
+        }
         let pane = self
             .state
             .panes
@@ -2528,8 +2543,65 @@ impl WmctermApplication {
     ) -> Result<(), String> {
         let surface = self.validate_claude_hook(terminal, hook)?;
         apply_claude_subagent_status(&mut self.claude_subagents, surface, hook);
+        if hook.agent_id.is_none() {
+            let observation =
+                match hook.kind {
+                    ClaudeHookKind::SessionStart => {
+                        hook.cwd.as_deref().map(|cwd| AgentTelemetry::CwdObserved {
+                            cwd: PathBuf::from(cwd),
+                        })
+                    }
+                    ClaudeHookKind::CwdChanged => {
+                        hook.new_cwd
+                            .as_deref()
+                            .map(|cwd| AgentTelemetry::CwdObserved {
+                                cwd: PathBuf::from(cwd),
+                            })
+                    }
+                    ClaudeHookKind::DirectoryAdded => hook.directory.as_deref().map(|directory| {
+                        AgentTelemetry::DirectoryObserved {
+                            directory: PathBuf::from(directory),
+                        }
+                    }),
+                    _ => None,
+                };
+            if let Some(observation) = observation
+                && let Some(session) = self.agent_sessions.get_mut(&surface)
+            {
+                session
+                    .apply_event(&AgentSessionEvent {
+                        event_id: format!("claude:directory:{}", uuid::Uuid::new_v4()),
+                        lifecycle_generation: session.lifecycle.generation,
+                        lifecycle_id: session.lifecycle.external_id.clone(),
+                        sequence: None,
+                        occurred_at_unix_ms: unix_time_ms(),
+                        kind: AgentSessionEventKind::Telemetry(observation),
+                    })
+                    .map_err(|error| error.to_string())?;
+            }
+            if matches!(
+                hook.kind,
+                ClaudeHookKind::SessionStart | ClaudeHookKind::CwdChanged
+            ) && let Some(index) = self.workspace_for_terminal(terminal)
+                && let Some(workspace) = self.state.workspaces.get(index)
+                && self
+                    .state
+                    .panes
+                    .get(&workspace.active_pane)
+                    .and_then(|pane| pane.active_surface())
+                    == Some(surface)
+                && let Some(cwd) = self
+                    .agent_sessions
+                    .get(&surface)
+                    .and_then(|session| session.cwd.clone())
+            {
+                self.state.workspaces[index].cwd = cwd;
+                self.refresh_workspace_metadata();
+            }
+        }
         if hook.kind == ClaudeHookKind::SessionEnd {
             self.claude_hook_modes.remove(&terminal);
+            self.close_agent_session_for_terminal(terminal, "Claude session ended".into());
         } else if hook.agent_id.is_none() {
             if hook.kind == ClaudeHookKind::SessionStart {
                 self.claude_hook_modes.remove(&terminal);
@@ -2581,6 +2653,7 @@ impl WmctermApplication {
         terminal: TerminalId,
         hook: &ClaudeHookEvent,
     ) -> Result<SurfaceId, String> {
+        validate_claude_hook_directories(hook)?;
         let (_, _, surface) = terminal_context_ids(&self.state, terminal)
             .ok_or_else(|| "Claude hook terminal context not found".to_owned())?;
         let metadata = self
@@ -2697,8 +2770,10 @@ impl WmctermApplication {
         let scope = wmcterm_ipc::AgentProcessScope {
             surface_id: surface.to_string(),
             lifecycle_id: session.lifecycle.external_id.clone().unwrap_or_default(),
-            agent_pid: session.pid,
-            pid_start_time: session.process_started_at_unix_ms,
+            // Ending the terminal's Agent lifecycle also cancels requests
+            // registered by hooks that did not carry a process identity.
+            agent_pid: None,
+            pid_start_time: None,
         };
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -3327,7 +3402,7 @@ impl WmctermApplication {
             }
             return;
         }
-        if self.search_visible {
+        if self.search_visible && self.search_focused {
             if let Some(shortcut) = text_edit_shortcut(event, self.modifiers) {
                 let copied = apply_text_edit_shortcut(&mut self.search_editor, shortcut);
                 if let (Some(clipboard), Some(text)) = (&mut self.clipboard, copied) {
@@ -3352,6 +3427,7 @@ impl WmctermApplication {
             match &event.logical_key {
                 Key::Named(NamedKey::Escape) => {
                     self.search_visible = false;
+                    self.search_focused = false;
                     self.rebuild_scene();
                 }
                 Key::Named(NamedKey::Enter) => {
@@ -3651,6 +3727,7 @@ impl WmctermApplication {
                         if value.eq_ignore_ascii_case("f") && self.modifiers.alt_key() =>
                     {
                         self.search_visible = true;
+                        self.search_focused = true;
                         self.search_editor = TextEditor::default();
                         self.search_result = None;
                         self.rebuild_scene();
@@ -3833,8 +3910,8 @@ impl WmctermApplication {
     fn commit_ime_text(&mut self, text: String) {
         if text.is_empty()
             || self.should_quarantine_focus_input()
-            || self.close_confirmation.is_some()
-            || self.codex_trust_confirmation.is_some()
+            || self.keyboard_overlay_active()
+            || (self.notifications_visible && !self.text_editor_active())
         {
             return;
         }
@@ -3847,7 +3924,7 @@ impl WmctermApplication {
             prompt.editor.insert(&text);
             prompt.error = None;
             self.rebuild_scene();
-        } else if self.search_visible {
+        } else if self.search_visible && self.search_focused {
             self.search_editor.insert(&text);
             self.search_active(1);
         } else if self.palette_visible {
@@ -3872,12 +3949,15 @@ impl WmctermApplication {
     fn text_editor_active(&self) -> bool {
         self.workspace_search_focused
             || self.prompt.is_some()
-            || self.search_visible
+            || (self.search_visible && self.search_focused)
             || self.palette_visible
     }
 
     fn update_ime_preedit(&mut self, text: &str) {
-        if self.close_confirmation.is_some() || self.codex_trust_confirmation.is_some() {
+        if !self.window_focused
+            || self.keyboard_overlay_active()
+            || (self.notifications_visible && !self.text_editor_active())
+        {
             return;
         }
         if self.workspace_search_focused {
@@ -3886,7 +3966,7 @@ impl WmctermApplication {
         } else if let Some(prompt) = &mut self.prompt {
             prompt.editor.set_preedit(text);
             self.rebuild_scene();
-        } else if self.search_visible {
+        } else if self.search_visible && self.search_focused {
             self.search_editor.set_preedit(text);
             self.rebuild_scene();
         } else if self.palette_visible {
@@ -4018,6 +4098,7 @@ impl WmctermApplication {
             "pane.zoom" => self.toggle_pane_zoom(),
             "terminal.find" => {
                 self.search_visible = true;
+                self.search_focused = true;
                 self.search_editor = TextEditor::default();
                 self.search_result = None;
                 self.rebuild_scene();
@@ -5006,9 +5087,6 @@ impl WmctermApplication {
         }
         pane.active_surface =
             ui::scroll_selection(pane.active_surface, pane.surfaces.len(), direction);
-        if let Some(workspace) = self.state.workspaces.get_mut(self.state.active_workspace) {
-            workspace.active_pane = pane_id;
-        }
         self.resize_terminals();
         self.rebuild_scene();
         true
@@ -6243,6 +6321,11 @@ impl WmctermApplication {
     /// Apply non-terminal navigation at the pointer. Returns true when a UI
     /// control consumed the click and the terminal must not also receive it.
     fn focus_at_cursor(&mut self) -> bool {
+        if self.search_focused {
+            self.search_focused = false;
+            self.search_editor.clear_preedit();
+            self.rebuild_scene();
+        }
         let (x, y) = self.cursor_position;
         if self.titlebar_command_bounds().contains(x, y) {
             self.palette_visible = true;
@@ -7591,6 +7674,7 @@ impl WmctermApplication {
             })
             .contains(x, y)
             {
+                self.search_focused = true;
                 let character_width = 14.0 * 0.6;
                 let label_columns = ui::display_width(self.language.find()) + 2;
                 let text_x = left + 10.0 + label_columns as f32 * character_width;
@@ -8099,7 +8183,7 @@ impl WmctermApplication {
                 command.y + 3.0,
                 24.0,
             )
-        } else if self.search_visible {
+        } else if self.search_visible && self.search_focused {
             let width = 430.0_f32
                 .min(self.window_size.width as f32 - 32.0)
                 .max(220.0);
@@ -8306,6 +8390,8 @@ impl WmctermApplication {
         let Some(workspace) = self.state.workspaces.get(source_index) else {
             return false;
         };
+        self.search_focused = false;
+        self.search_editor.clear_preedit();
         self.state.active_workspace = source_index;
         self.workspace_drag = Some(WorkspaceDrag {
             workspace: workspace.id,
@@ -8919,6 +9005,8 @@ impl WmctermApplication {
             .retain(|terminal, _| self.terminals.contains_key(terminal));
         self.last_hook_delivery
             .retain(|terminal, _| self.terminals.contains_key(terminal));
+        self.codex_tool_hooks
+            .retain(|terminal, _| self.terminals.contains_key(terminal));
         let focused = self
             .terminal_accepts_keyboard()
             .then(|| self.active_terminal_id())
@@ -8937,15 +9025,20 @@ impl WmctermApplication {
     fn terminal_accepts_keyboard(&self) -> bool {
         self.window_focused
             && !self.text_editor_active()
-            && self.agent_request_detail.is_none()
-            && self.close_confirmation.is_none()
-            && self.codex_trust_confirmation.is_none()
-            && self.tab_context_menu.is_none()
-            && self.workspace_context_menu.is_none()
-            && self.sidebar_context_menu.is_none()
-            && self.terminal_context_menu.is_none()
-            && self.notification_context_menu.is_none()
-            && self.tab_overflow_menu.is_none()
+            && !self.notifications_visible
+            && !self.keyboard_overlay_active()
+    }
+
+    fn keyboard_overlay_active(&self) -> bool {
+        self.agent_request_detail.is_some()
+            || self.close_confirmation.is_some()
+            || self.codex_trust_confirmation.is_some()
+            || self.tab_context_menu.is_some()
+            || self.workspace_context_menu.is_some()
+            || self.sidebar_context_menu.is_some()
+            || self.terminal_context_menu.is_some()
+            || self.notification_context_menu.is_some()
+            || self.tab_overflow_menu.is_some()
     }
 
     fn rebuild_scene_if_due(&mut self, now: std::time::Instant) -> bool {
@@ -10193,18 +10286,20 @@ impl WmctermApplication {
                 width - 20.0 - ui::display_width(&search_prefix) as f32 * character_width,
                 character_width,
             ));
-            push_editor_highlights(
-                &mut overlay_rectangles,
-                &self.search_editor,
-                left + 10.0 + ui::display_width(&search_prefix) as f32 * character_width,
-                10.0,
-                26.0,
-                EditorHighlightStyle {
-                    character_width,
-                    colors: (theme_selection, theme_cursor),
-                    viewport: search_viewport,
-                },
-            );
+            if self.search_focused {
+                push_editor_highlights(
+                    &mut overlay_rectangles,
+                    &self.search_editor,
+                    left + 10.0 + ui::display_width(&search_prefix) as f32 * character_width,
+                    10.0,
+                    26.0,
+                    EditorHighlightStyle {
+                        character_width,
+                        colors: (theme_selection, theme_cursor),
+                        viewport: search_viewport,
+                    },
+                );
+            }
             let mut search_spans = vec![TextSpan {
                 text: search_prefix,
                 color: theme_text,
@@ -10214,8 +10309,16 @@ impl WmctermApplication {
             search_spans.extend(editor_spans(
                 &self.search_editor,
                 theme_text,
-                theme_selection_text,
-                theme_cursor_text,
+                if self.search_focused {
+                    theme_selection_text
+                } else {
+                    theme_text
+                },
+                if self.search_focused {
+                    theme_cursor_text
+                } else {
+                    theme_text
+                },
                 search_viewport,
             ));
             search_spans.push(TextSpan {
@@ -11743,8 +11846,9 @@ impl WmctermApplication {
             ])
         );
         let summary = if kind == "input" {
-            let form: wmcterm_codex::InputRequest = serde_json::from_value(request_params.clone())
-                .map_err(|error| error.to_string())?;
+            let form: wmcterm_ipc::InputFormRequest =
+                serde_json::from_value(request_params.clone())
+                    .map_err(|error| error.to_string())?;
             let mut lines = vec![form.message];
             for field in form.fields {
                 lines.push(field.label);
@@ -11830,12 +11934,13 @@ impl WmctermApplication {
     }
 
     fn register_agent_input(&mut self, params: &Value) -> Result<Value, String> {
-        let form: wmcterm_codex::InputRequest =
+        let form: wmcterm_ipc::InputFormRequest =
             serde_json::from_value(params["request"]["params"].clone())
                 .map_err(|error| error.to_string())?;
         form.validate()?;
-        if params["source"] != "codex_app_server"
-            || params["request"]["kind"] != "input"
+        let source = required_string(params, "source")?;
+        validate_agent_approval_protocol(source, &form.method, "input")?;
+        if params["request"]["kind"] != "input"
             || params["request"]["method"].as_str() != Some(form.method.as_str())
             || params["request"]["thread_id"].as_str() != Some(form.thread_id.as_str())
             || params["request"]["turn_id"].as_str() != Some(form.turn_id.as_str())
@@ -11848,7 +11953,7 @@ impl WmctermApplication {
                 .len()
                 > 64 * 1024
         {
-            return Err("invalid Codex input request".into());
+            return Err("invalid Agent input request".into());
         }
         let surface = uuid::Uuid::parse_str(required_string(params, "surface_id")?)
             .map_err(|error| error.to_string())?;
@@ -11872,12 +11977,26 @@ impl WmctermApplication {
             })
             .ok_or("input target must be a terminal")?;
         if !self.terminals.contains_key(&terminal)
-            || self
-                .agent_sessions
-                .get(&surface)
-                .is_none_or(|session| session.agent_kind.as_str() != "codex")
+            || self.agent_sessions.get(&surface).is_none_or(|session| {
+                session.agent_kind.as_str()
+                    != if source == "claude_hook" {
+                        "claude"
+                    } else {
+                        "codex"
+                    }
+            })
         {
-            return Err("input target has no live Codex session".into());
+            return Err("input target has no matching live Agent session".into());
+        }
+        if source == "claude_hook" {
+            self.validate_claude_input_context(params, &form.thread_id, surface)?;
+            if params["request"]["mcp_server_name"].as_str() != Some(form.turn_id.as_str())
+                || params["request"]["elicitation_id"]
+                    .as_str()
+                    .is_some_and(|id| id != form.item_id)
+            {
+                return Err("Claude elicitation identity does not match its form".into());
+            }
         }
         let generation = self
             .agent_sessions
@@ -11930,6 +12049,102 @@ impl WmctermApplication {
         Ok(result)
     }
 
+    fn validate_claude_input_context(
+        &self,
+        params: &Value,
+        session_id: &str,
+        surface: SurfaceId,
+    ) -> Result<(), String> {
+        if required_string(params, "surface_id")? != surface.to_string()
+            || required_string(params, "session_id")? != session_id
+        {
+            return Err("Claude input context does not match its request".into());
+        }
+        let workspace = required_string(params, "workspace_id")?;
+        if !self.state.workspaces.iter().any(|candidate| {
+            candidate.id.to_string() == workspace
+                && self.state.panes.values().any(|pane| {
+                    candidate.root.contains(pane.id) && pane.surfaces.contains(&surface)
+                })
+        }) {
+            return Err("Claude input surface does not belong to workspace".into());
+        }
+        let runtime = self
+            .state
+            .surfaces
+            .get(&surface)
+            .and_then(|surface| match surface.kind {
+                SurfaceKind::Terminal(terminal) => self.terminals.get(&terminal),
+                _ => None,
+            })
+            .ok_or("Claude input terminal is not running")?;
+        let session = self
+            .agent_sessions
+            .get(&surface)
+            .ok_or("Claude input session not found")?;
+        if runtime.lifecycle_id != required_string(params, "lifecycle_id")?
+            || session.lifecycle.external_id.as_deref() != Some(runtime.lifecycle_id.as_str())
+            || session.lifecycle.phase != AgentLifecyclePhase::Running
+            || session.agent_kind.as_str() != "claude"
+            || session.session_id.as_deref() != Some(session_id)
+            || self
+                .state
+                .surfaces
+                .get(&surface)
+                .and_then(|surface| surface.agent.as_ref())
+                .and_then(|agent| agent.session_id.as_deref())
+                != Some(session_id)
+        {
+            return Err("Claude input does not match its live session and lifecycle".into());
+        }
+        Ok(())
+    }
+
+    fn reconcile_claude_input(&mut self, params: &Value) -> Result<Value, String> {
+        let surface = uuid::Uuid::parse_str(required_string(params, "surface_id")?)
+            .map_err(|error| error.to_string())?;
+        let session = required_string(params, "session_id")?;
+        self.validate_claude_input_context(params, session, surface)?;
+        let server = required_string(params, "mcp_server_name")?;
+        let elicitation = required_string(params, "elicitation_id")?;
+        let ids: Vec<_> = self
+            .agent_input_forms
+            .iter()
+            .filter(|(id, form)| {
+                form.method == "Elicitation"
+                    && form.thread_id == session
+                    && form.turn_id == server
+                    && form.item_id == elicitation
+                    && self.agent_approval_bindings.get(*id).is_some_and(
+                        |(bound, lifecycle, generation)| {
+                            *bound == surface
+                                && lifecycle
+                                    == required_string(params, "lifecycle_id").unwrap_or_default()
+                                && self.agent_sessions.get(&surface).is_some_and(|session| {
+                                    Some(session.lifecycle.generation) == *generation
+                                })
+                        },
+                    )
+                    && self.pending_agent_requests.get(id).ok().flatten().is_some()
+            })
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in &ids {
+            if let CompleteOutcome::Completed(reply) = self
+                .pending_agent_requests
+                .cancel(id, "resolved_by_claude_client", unix_time_ms())
+                .map_err(|error| error.to_string())?
+            {
+                self.remember_agent_approval_result(id.clone(), AgentApprovalAction::Deny);
+                if let Ok(surface) = uuid::Uuid::parse_str(&reply.surface_id) {
+                    self.sync_surface_agent_request_state(surface);
+                }
+            }
+        }
+        self.rebuild_scene();
+        Ok(json!({"cancelled": ids.len()}))
+    }
+
     fn poll_agent_input(&self, params: &Value) -> Result<Value, String> {
         let id = required_string(params, "request_id")?;
         let (surface, lifecycle, generation) = self
@@ -11939,12 +12154,35 @@ impl WmctermApplication {
         let current = self.agent_sessions.get(surface);
         let live = self.state.surfaces.get(surface).is_some_and(|surface| matches!(surface.kind, SurfaceKind::Terminal(terminal) if self.terminals.contains_key(&terminal)));
         if !live
+            || current.is_none_or(|session| session.lifecycle.phase != AgentLifecyclePhase::Running)
             || current.map(|session| session.lifecycle.generation) != *generation
             || current
                 .and_then(|session| session.lifecycle.external_id.as_ref())
                 .is_some_and(|id| id != lifecycle)
+            || self.agent_input_forms.get(id).is_some_and(|form| {
+                form.method == "Elicitation"
+                    && (current.and_then(|session| session.session_id.as_deref())
+                        != Some(form.thread_id.as_str())
+                        || self
+                            .state
+                            .surfaces
+                            .get(surface)
+                            .and_then(|surface| match surface.kind {
+                                SurfaceKind::Terminal(terminal) => self.terminals.get(&terminal),
+                                _ => None,
+                            })
+                            .is_none_or(|runtime| runtime.lifecycle_id != *lifecycle))
+            })
         {
             return Ok(json!({"status": "cancelled"}));
+        }
+        if let Some(form) = self.agent_input_forms.get(id)
+            && form.method == "Elicitation"
+            && ["workspace_id", "surface_id", "lifecycle_id", "session_id"]
+                .iter()
+                .any(|key| params.get(key).is_some())
+        {
+            self.validate_claude_input_context(params, &form.thread_id, *surface)?;
         }
         if let Some(reply) = self
             .pending_agent_requests
@@ -11959,7 +12197,7 @@ impl WmctermApplication {
             .map_err(|error| error.to_string())?
             .is_some()
         {
-            Ok(json!({"status": "pending"}))
+            Ok(json!({"status": "pending", "approval_id": id}))
         } else {
             Err("input request not found".into())
         }
@@ -12029,7 +12267,10 @@ impl WmctermApplication {
                 });
             if current.map(|session| session.lifecycle.generation) != *generation
                 || (approval_id.starts_with("approval:claude_hook:")
-                    && runtime.is_none_or(|runtime| runtime.lifecycle_id != *lifecycle))
+                    && (runtime.is_none_or(|runtime| runtime.lifecycle_id != *lifecycle)
+                        || current.is_none_or(|session| {
+                            session.lifecycle.phase != AgentLifecyclePhase::Running
+                        })))
                 || current
                     .and_then(|session| session.lifecycle.external_id.as_ref())
                     .is_some_and(|id| id != lifecycle)
@@ -12067,6 +12308,8 @@ impl WmctermApplication {
                     "lifecycle_id": runtime.lifecycle_id,
                     "agent": self.surface_for_terminal(*id).and_then(|surface| self.state.surfaces.get(&surface)).and_then(|surface| surface.agent.as_ref()),
                     "last_hook": self.last_hook_delivery.get(id),
+                    "cwd": self.cwd_for_terminal(*id),
+                    "agent_session": self.surface_for_terminal(*id).and_then(|surface| self.agent_sessions.get(&surface)),
                     "input_focused": self.input_focus_terminal == Some(*id),
                     "mouse_tracking": runtime.snapshot.mouse_tracking,
                     "keyboard_flags": runtime.snapshot.keyboard_flags,
@@ -12139,6 +12382,9 @@ impl WmctermApplication {
                     "hook_settings_validation": "additional settings and discovered user/project settings reject disableAllHooks and allowManagedHooksOnly; inherited SIMPLE and SAFE_MODE flags rejected",
                     "requires_installed_hooks": true,
                     "approval_hook_failure": "block; requires Claude 2.1.295+",
+                    "hook_command_form": "exec command plus args; no shell required",
+                    "auto_denials": "PermissionDenied is informational; never retries or creates approval buttons",
+                    "directory_events": "root CwdChanged and DirectoryAdded update session metadata; child directories cannot change the root",
                     "prompt_submission_event": true,
                     "detached_modes": "bg, background, cloud, desktop and tmux rejected"
                 },
@@ -12149,7 +12395,22 @@ impl WmctermApplication {
                     "deadline_ms": 540000,
                     "strict_permissions": "strict choice grants turn scope with strictAutoReview; never session scope"
                 },
+                "claude_input": {
+                    "methods": ["Elicitation", "ElicitationResult"],
+                    "forms": "primitive MCP form schemas; URL, secret and complex forms stay native",
+                    "ownership": "supported form hooks block and replace the native dialog; failures cancel",
+                    "reply": "resolution.text is a JSON object mapping field ids to strings",
+                    "binding": "workspace, surface, terminal lifecycle and active session",
+                    "deadline_ms": 540000
+                },
                 "program_status": {"protocol": "OSC 7501", "max_records": 64, "priority": "identity-bearing hooks and pending requests precede anonymous OSC", "actionable": false},
+                "codex_native_tool_hooks": {
+                    "events": ["PreToolUse", "PostToolUse", "PermissionRequest", "PreModelRequest"],
+                    "checked_version": "0.167.0",
+                    "binding": "explicit surface, terminal lifecycle, root session, turn and tool input",
+                    "actionable": false,
+                    "installation": "explicit Hook installation and native Codex review required"
+                },
                 "agent_events": [
                     "session_start", "tool_use", "permission_request", "needs_input",
                     "turn_complete", "turn_failed", "notification", "stop", "state_observed"
@@ -12185,7 +12446,7 @@ impl WmctermApplication {
                     "surface.logs", "screen.read", "send", "send.line", "terminal.search", "terminal.clear",
                     "terminal.scroll", "notification.list", "notification.mark", "notify",
                     "agent.update", "agent.request.list", "agent.request.reply", "agent.request.cancel",
-                    "agent.input.register", "agent.input.poll",
+                    "agent.input.register", "agent.input.poll", "agent.input.reconcile",
                     "agent.approval.register", "agent.approval.poll"
                 ],
                 "control_keys": [
@@ -12674,6 +12935,7 @@ impl WmctermApplication {
             },
             "agent.input.register" => self.register_agent_input(&request.params),
             "agent.input.poll" => self.poll_agent_input(&request.params),
+            "agent.input.reconcile" => self.reconcile_claude_input(&request.params),
             "agent.approval.poll" => self.poll_agent_approval(&request.params),
             "agent.request.list" => self
                 .pending_agent_requests
@@ -12779,7 +13041,7 @@ impl WmctermApplication {
                 serde_json::from_value::<AgentEvent>(request.params.clone())
                     .map_err(|e| e.to_string())
                     .and_then(|event| {
-                    let terminal = if codex_hook.is_some() || codex_session_end.is_some() {
+                    let terminal = if codex_hook.is_some() || codex_session_end.is_some() || request.params.get("codex_tool_hook").is_some() {
                         let (terminal, _) = self.codex_agent_update_route(&request.params)?;
                         self.validate_agent_event_route(terminal, &request.params)?;
                         terminal
@@ -12797,7 +13059,18 @@ impl WmctermApplication {
                     if let Some(session_id) = codex_session_end.as_deref() {
                         self.validate_codex_session(terminal, session_id)?;
                     }
+                    let mut tool_tracker = None;
+                    let event = if request.params.get("codex_tool_hook").is_some() {
+                        let Some((tracker, projected)) = self.project_codex_tool_hook(terminal, &request.params, &event)? else {
+                            return Ok(json!({"ignored": true}));
+                        };
+                        tool_tracker = Some(tracker);
+                        projected
+                    } else {
+                        event
+                    };
                     if let Some(hook) = claude_hook.as_ref() {
+                        validate_claude_hook_directories(hook)?;
                         if hook.agent_id.is_some() && matches!(hook.kind, ClaudeHookKind::SessionStart | ClaudeHookKind::SessionEnd) {
                             return Err("Claude child hooks cannot start or end the root session".into());
                         }
@@ -12814,6 +13087,19 @@ impl WmctermApplication {
                         }
                         return Ok(json!({"ignored": true}));
                     }
+                    if let Some(tracker) = tool_tracker {
+                        self.codex_tool_hooks.insert(terminal, tracker);
+                    } else if matches!(&event, AgentEvent::SessionStart { .. } | AgentEvent::Stop { .. } | AgentEvent::TurnComplete { .. } | AgentEvent::TurnFailed { .. })
+                        || (matches!(&event, AgentEvent::ToolUse { .. }) && request.params["codex_hook_event"] == "UserPromptSubmit")
+                    {
+                        let session = self.agent_sessions.get(&self.surface_for_terminal(terminal).ok_or("surface not found")?).and_then(|session| session.session_id.as_deref()).unwrap_or_default();
+                        let lifecycle = &self.terminals[&terminal].lifecycle_id;
+                        let timestamp = request.params["hook_started_at_unix_ns"].as_u64().unwrap_or_default();
+                        self.codex_tool_hooks.entry(terminal).or_default().reset(session, lifecycle, timestamp);
+                        if matches!(&event, AgentEvent::Stop { .. } | AgentEvent::TurnComplete { .. } | AgentEvent::TurnFailed { .. }) {
+                            self.codex_tool_hooks.get_mut(&terminal).unwrap().close();
+                        }
+                    }
                     if request.params.get("hook_executable").is_some() {
                         self.last_hook_delivery.insert(terminal, json!({
                             "executable": request.params.get("hook_executable"),
@@ -12822,7 +13108,12 @@ impl WmctermApplication {
                             "event": request.params.get("event")
                         }));
                     }
-                    let state = self.apply_agent_event(terminal, event);
+                    let metadata_only = claude_hook.as_ref().is_some_and(|hook| matches!(hook.kind, ClaudeHookKind::CwdChanged | ClaudeHookKind::DirectoryAdded | ClaudeHookKind::ElicitationResult));
+                    let state = if metadata_only {
+                        self.state.surfaces.get(&self.surface_for_terminal(terminal).ok_or("surface not found")?).and_then(|surface| surface.agent.as_ref()).map(|agent| agent.state).unwrap_or_default()
+                    } else {
+                        self.apply_agent_event(terminal, event)
+                    };
                     if let Some(hook) = claude_hook.as_ref() {
                         self.record_claude_hook(terminal, hook)?;
                     }
@@ -13320,22 +13611,7 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                 self.resize_terminals();
                 self.rebuild_scene();
             }
-            WindowEvent::DroppedFile(path) => {
-                let text = shell_quote_path(&path);
-                if let Some((_, terminal)) =
-                    self.terminal_at_point(self.cursor_position.0, self.cursor_position.1)
-                {
-                    let notifications_changed = self.mark_terminal_notifications_read(terminal);
-                    if let Some(runtime) = self.terminals.get(&terminal) {
-                        let _ = runtime
-                            .session
-                            .send(SessionCommand::Input(text.into_bytes()));
-                    }
-                    if notifications_changed {
-                        self.rebuild_scene();
-                    }
-                }
-            }
+            WindowEvent::DroppedFile(path) => self.drop_file_into_terminal(&path),
             WindowEvent::KeyboardInput { event, .. } => {
                 if should_suppress_recent_focus_tab(
                     event.state,
@@ -13374,6 +13650,51 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+impl WmctermApplication {
+    fn drop_file_into_terminal(&mut self, path: &Path) {
+        if self.keyboard_overlay_active()
+            || self.prompt.is_some()
+            || self.palette_visible
+            || self.pointer_over_overlay()
+        {
+            return;
+        }
+        let Some((pane, terminal)) =
+            self.terminal_at_point(self.cursor_position.0, self.cursor_position.1)
+        else {
+            return;
+        };
+        let Some(runtime) = self.terminals.get(&terminal) else {
+            return;
+        };
+        if runtime
+            .session
+            .send(SessionCommand::Input(shell_quote_path(path).into_bytes()))
+            .is_err()
+        {
+            return;
+        }
+        let _ = self
+            .state
+            .execute(AppCommand::Pane(PaneCommand::Focus { id: pane }));
+        self.workspace_search_focused = false;
+        self.workspace_search.clear_preedit();
+        self.search_focused = false;
+        self.search_editor.clear_preedit();
+        self.text_edit_drag = None;
+        self.notifications_visible = false;
+        self.focus_input_quarantine = false;
+        self.mark_terminal_notifications_read(terminal);
+        self.reset_cursor_blink();
+        self.rebuild_scene();
+        if !self.window_focused
+            && let Some(renderer) = &self.renderer
+        {
+            renderer.window().focus_window();
         }
     }
 }
@@ -15799,7 +16120,10 @@ fn validate_agent_approval_protocol(source: &str, method: &str, kind: &str) -> R
                 | ("item/tool/requestUserInput", "input")
                 | ("mcpServer/elicitation/request", "input")
         ),
-        "claude_hook" => method == "PermissionRequest" && kind == "permission",
+        "claude_hook" => matches!(
+            (method, kind),
+            ("PermissionRequest", "permission") | ("Elicitation", "input")
+        ),
         _ => false,
     };
     valid
@@ -15988,6 +16312,22 @@ fn approval_text_field<'a>(value: &'a Value, names: &[&str]) -> Option<&'a str> 
     })
 }
 
+fn validate_claude_hook_directories(hook: &ClaudeHookEvent) -> Result<(), String> {
+    let directories = match hook.kind {
+        ClaudeHookKind::SessionStart => [hook.cwd.as_deref(), None],
+        ClaudeHookKind::CwdChanged => [hook.old_cwd.as_deref(), hook.new_cwd.as_deref()],
+        ClaudeHookKind::DirectoryAdded => [hook.directory.as_deref(), None],
+        _ => [None, None],
+    };
+    for directory in directories.into_iter().flatten() {
+        if directory.len() > 4096 || directory.contains('\0') || !Path::new(directory).is_absolute()
+        {
+            return Err("Claude directory must be a bounded absolute path".into());
+        }
+    }
+    Ok(())
+}
+
 fn claude_approval_binding_matches(
     runtime_lifecycle: &str,
     metadata_agent: Option<&str>,
@@ -16032,6 +16372,11 @@ fn apply_claude_subagent_status(
         | ClaudeHookKind::PostToolUse
         | ClaudeHookKind::PostToolUseFailure
         | ClaudeHookKind::PermissionRequest
+        | ClaudeHookKind::PermissionDenied
+        | ClaudeHookKind::CwdChanged
+        | ClaudeHookKind::DirectoryAdded
+        | ClaudeHookKind::Elicitation
+        | ClaudeHookKind::ElicitationResult
         | ClaudeHookKind::Notification
         | ClaudeHookKind::Stop
         | ClaudeHookKind::StopFailure => {}
@@ -19659,6 +20004,7 @@ mod tests {
 
         // Reuse the isolated application: winit permits only one event loop
         // per process, including when checking another provider's RPC route.
+        crate::codex_tool_hooks::tests::check_rpc(&mut app, terminal, surface);
         app.agent_sessions.remove(&surface);
         let claude_params = |event: AgentEvent| {
             let mut params = serde_json::to_value(event).unwrap();
@@ -19857,6 +20203,7 @@ mod tests {
         }
         crate::claude_regression::check(&mut app, terminal, surface);
         crate::input_regression::check(&mut app, terminal, surface);
+        crate::focus_regression::check(&mut app);
     }
 
     #[test]

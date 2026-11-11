@@ -156,6 +156,14 @@ from the currently focused UI item: the user may be viewing another workspace.
   once, but must never be converted into a persistent or session-wide grant.
 - A Codex `Interrupt` hook ends the active turn without ending the live Codex
   session. Do not close its pane, surface, or PTY in response to that event.
+- Native Codex 0.167.0 sessions use `PreToolUse` / `PostToolUse` hooks to clear
+  matching native permission waits after tool completion. Tool input and turn
+  identity correlate concurrent calls; telemetry never resolves actionable
+  requests. New hooks require explicit installation and review in Codex. Package
+  creation and normal launch do not update personal Hook configuration.
+  Denied native tools do not fire PostToolUse; the same turn's PreModelRequest
+  clears native waits once Codex advances to the next model request. Interrupt
+  closes the turn so delayed tool telemetry cannot restart it.
 - Codex `SubagentStart` and `SubagentStop` hooks keep the parent workspace
   running while any subagent remains active. Stops retain a bounded per-session
   tombstone so a recent out-of-order start cannot reactivate the same agent.
@@ -194,7 +202,7 @@ from the currently focused UI item: the user may be viewing another workspace.
   permission mode. Never pass `bypassPermissions` or dangerous-skip flags.
 - Managed Claude interactive launches default to `--permission-mode manual`;
   an explicitly supplied safe permission mode takes precedence.
-- Codex 0.160.0 and Claude Code 2.1.289 are the checked integration versions.
+- Codex 0.163.0 and Claude Code 2.1.304 are the checked integration versions.
 - Managed Claude rejects `--bare`, `--safe-mode`, `--restricted`, custom
   `--setting-sources`, and additional or discovered settings that enable
   `disableAllHooks` or `allowManagedHooksOnly`. Enabled `CLAUDE_CODE_SIMPLE` and
@@ -206,6 +214,20 @@ from the currently focused UI item: the user may be viewing another workspace.
   Input telemetry creates no actionable request; subsequent activity clears the wait.
   Informational `notification` events preserve task state, including `agent_completed`.
   Real approvals use `agent.approval.register` and remain pending across telemetry.
+- Simple Claude MCP forms use the actionable request panel through a blocking
+  `Elicitation` hook. Reply with `agent-request reply ID --text` and a JSON object
+  mapping field IDs to string answers. Supported forms replace the native dialog;
+  cancellation, expiry and control failures return `cancel`. URL, secret and
+  complex schemas remain native. `ElicitationResult` reconciles only the exact
+  session/server/elicitation/surface/lifecycle identity, when an ID is available.
+- Claude `PermissionDenied` is informational: it records the auto-mode rejection
+  reason without approval buttons or automatic retries. Root `CwdChanged` and
+  `DirectoryAdded` update session metadata; child directories never replace the
+  root. Additional directories are bounded and reset with the session. Diagnostics
+  exposes `agent_session.cwd` and `additional_directories`.
+- Reinstall Claude hooks explicitly to register these events and migrate old
+  wmcterm shell commands to direct executable-plus-args hooks. Other hooks are
+  preserved. Worktree creation and cleanup remain provider-owned.
 - Native Claude permission flags set display metadata. Validated root Hook
   `permission_mode` overrides startup flags for the current session and lifecycle;
   child hooks and unknown modes do not change it or grant permissions.
@@ -323,6 +345,13 @@ Inspect actionable requests with `wmcterm agent-request list`. Reply with
 
 In the terminal UI, Ctrl+C is forwarded to the foreground process even when text
 is selected. Use Ctrl+Shift+C to copy the selection.
+
+Clicking a terminal while local history search is open restores terminal input
+without hiding search highlights. Click the search field to resume editing.
+Scrolling tabs in another pane preserves the current keyboard focus. Notification
+panels, approval details and menus block IME commits to the underlying terminal.
+Dropping a file into a terminal inserts its shell-quoted path and focuses that
+pane without submitting a command. Menus and modal editors block terminal drops.
 
 The workspace sidebar shows a scrollbar only when its filtered list overflows.
 Drag its thumb or click its track to scroll; the rail is separate from workspace

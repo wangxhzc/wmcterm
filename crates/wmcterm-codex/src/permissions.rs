@@ -155,6 +155,7 @@ impl CodexPermissions {
         ) {
             if key == "permissions"
                 || key.starts_with("permissions.")
+                || key == "sandbox_workspace_write"
                 || key.starts_with("sandbox_workspace_write.")
             {
                 return Err(BridgeError::Protocol(format!(
@@ -197,7 +198,11 @@ impl CodexPermissions {
             config.retain(|key, _| {
                 !matches!(
                     key.as_str(),
-                    "approval_policy" | "approvals_reviewer" | "sandbox_mode" | "permissions"
+                    "approval_policy"
+                        | "approvals_reviewer"
+                        | "sandbox_mode"
+                        | "permissions"
+                        | "sandbox_workspace_write"
                 ) && !key.starts_with("permissions.")
                     && !key.starts_with("sandbox_workspace_write.")
             });
@@ -1081,6 +1086,52 @@ mod tests {
             assert_eq!(request["params"]["approvalsReviewer"], reviewer);
             permissions.verify(&json!({"result": {"approvalPolicy": policy, "approvalsReviewer": reviewer, "sandbox": {"type": sandbox}}})).unwrap();
             assert!(permissions.verify(&json!({"result": {}})).is_err());
+        }
+    }
+
+    #[test]
+    fn launch_profile_rejects_network_table_overrides_and_scrubs_cold_resume_config() {
+        for config in [
+            "sandbox_workspace_write={network_access=true}",
+            "sandbox_workspace_write.network_access=true",
+            "permissions={default=\"full-access\"}",
+        ] {
+            assert!(CodexPermissions::extract(&["-c".into(), config.into()]).is_err());
+        }
+        let (permissions, _) = CodexPermissions::extract(&[
+            "--yolo".into(),
+            "--sandbox=read-only".into(),
+            "--ask-for-approval=on-request".into(),
+        ])
+        .unwrap();
+        let mut request = json!({"method": "thread/resume", "params": {
+            "threadId": "saved-full-access-thread", "cwd": "/worktree", "permissions": "saved-profile",
+            "config": {
+                "sandbox_workspace_write": {"network_access": true, "writable_roots": ["/private"]},
+                "sandbox_workspace_write.network_access": true,
+                "permissions": {"default": "full-access"},
+                "permissions.default": "full-access", "sandbox_mode": "danger-full-access",
+                "approval_policy": "never", "approvals_reviewer": "auto_review", "model": "test-model"
+            }
+        }});
+        permissions.apply(&mut request).unwrap();
+        assert_eq!(request["params"]["config"], json!({"model": "test-model"}));
+        assert_eq!(request["params"]["sandbox"], "read-only");
+        assert_eq!(request["params"]["approvalPolicy"], "on-request");
+        assert!(request["params"].get("permissions").is_none());
+        // A persisted full-access or auto-review profile cannot silently replace
+        // an explicitly selected managed launch profile during cold restore.
+        for (policy, reviewer, sandbox) in [
+            ("never", "user", "readOnly"),
+            ("on-request", "auto_review", "readOnly"),
+            ("on-request", "user", "dangerFullAccess"),
+        ] {
+            assert!(
+                permissions
+                    .verify(&json!({"result": {"approvalPolicy": policy,
+                "approvalsReviewer": reviewer, "sandbox": {"type": sandbox}}}))
+                    .is_err()
+            );
         }
     }
 
