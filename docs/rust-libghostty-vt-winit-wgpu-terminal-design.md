@@ -1,4 +1,24 @@
-# Managed Codex Restore
+# wmcterm Architecture and Implementation Notes
+
+wmcterm is a Rust 2024 GPU terminal workspace built on `libghostty-vt`,
+`portable-pty`, `winit`, `wgpu`, and `glyphon`. The application model is
+`Window -> Workspace -> Pane tree -> Surface`. Each terminal actor owns its
+PTY/VT state and publishes immutable render snapshots to the UI.
+
+This document records implementation mechanisms, compatibility findings, and
+validation procedures. Dated entries identify the provider versions examined
+for that change; later entries may cover additional versions.
+
+- [Runtime resource boundaries](#runtime-resource-boundaries-2026-11-11)
+- [Persisted state](#persisted-state)
+- [Managed resume compatibility](#managed-resume-compatibility)
+- [Permission ownership](#permission-ownership)
+- [Launch authority and routing](#launch-authority-and-routing)
+- [Validation](#validation)
+
+See the [README](../README.md) for commands and configuration, the
+[product design](wmcterm终端产品设计方案.md) for product models and design history,
+and [AGENTS.md](../AGENTS.md) for the source map and development requirements.
 
 ## Native Codex Permission Wait Recovery (2026-11-10)
 
@@ -76,9 +96,6 @@ Sources: [Codex release](https://github.com/openai/codex/releases/tag/rust-v0.16
 [Claude release](https://github.com/anthropics/claude-code/releases/tag/v2.1.304),
 [Claude hooks](https://code.claude.com/docs/en/hooks),
 [OSC 7501](https://www.superlogical.com/rex/docs/build/program-status).
-
-Implementation update: 2026-09-15. The broader terminal architecture is documented
-in [the product design](wmcterm终端产品设计方案.md).
 
 ## Managed Codex Turn State
 
@@ -274,7 +291,7 @@ and turn status. Saving retains waiting child surfaces even if their PTY could
 not start. Enter on an exited root reissues a fresh claim and retries the saved
 thread. Explicit native resume remains available as a user-selected alternative.
 
-## Validation
+## Hook and Input Integration
 
 The release baseline is Codex 0.163.0 and Claude Code 2.1.304. Claude command
 hooks use native executable-plus-args invocation, retaining `onFailure: block`
@@ -314,6 +331,8 @@ that surface/lifecycle, including hooks without PID metadata. Completed input
 answers and approvals become unreadable after exit or resume. Ordinary `Stop`
 and `StopFailure` retain their turn-level semantics.
 
+### GUI Input Ownership
+
 GUI keyboard events supply winit's layout-aware unmodified codepoint. Printable
 AltGr text does not become a Control+Alt command. Modified Enter never predicts
 submission, and Hook-owned state is not overridden by input heuristics. Local
@@ -328,6 +347,8 @@ File drops insert the shell-quoted path into the terminal under the pointer,
 then focus that pane and release local search ownership without submitting the
 command. Drops blocked by menus or modal editors leave terminal input and focus
 unchanged. Window activation is requested only after a successful user drop.
+
+### Diagnostics and Terminal Protocols
 
 `wmcterm diagnostics` / `app.diagnostics` reports executable paths, observed
 Hook provenance and snapshot protocol flags; CLI version probes have a timeout.
@@ -345,6 +366,8 @@ uses Ctrl+Alt+F/G, leaving Ctrl+F/G for Codex and Claude.
 events against an isolated PTY byte recorder, including application scrolling
 with local history. Ordinary right click follows application mouse reporting;
 Shift+right click opens the local terminal menu.
+
+### Notifications and Mode Metadata
 
 Claude input-wait telemetry observes state without registering an actionable
 request. Informational `notification` events preserve both reducer and core
@@ -365,6 +388,12 @@ Session replacement refreshes the core lifecycle identity even within the same
 PTY. Root SessionStart sequence checks run before mode-cache mutation.
 `xvfb-run -a node scripts/claude-notifications-smoke.mjs` verifies notification
 state and mode transitions through a GUI with temporary config and RPC socket.
+
+## Validation
+
+The following checks cover the implementation contracts described above. Run
+the relevant checks for the changed area; results belong to the individual
+validation run.
 
 - Unit tests cover mode parsing, verification failures, blocked premature turns,
   exact-once launch claims, stale lifecycle routing, and legacy serialization.

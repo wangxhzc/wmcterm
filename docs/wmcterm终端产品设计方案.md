@@ -1,13 +1,21 @@
-# wmcterm终端产品设计方案
+# wmcterm 终端产品设计与演进记录
 
-> 本文前 32 节保留了项目立项时的架构推导和阶段规划。它们用于解释设计
-> 取舍，不应被理解为当前实现清单；当前事实以第 33 节为准。
+本文记录产品模型、早期设计和实现演进，按以下顺序阅读：
+
+- [第 33 节](#33-实现基线与演进记录)：产品能力、组件职责和历次修复记录。
+- [第 1 至 32 节](#1-产品定位)：立项时的设计推导、接口草案和阶段规划。
+- [架构与实现记录](rust-libghostty-vt-winit-wgpu-terminal-design.md)：运行时资源边界、
+  持久化机制、托管 Agent 权限与兼容性验证。
+- [README](../README.md)：当前命令、配置和构建方法。
+
+早期设计中的 Rust 类型、CLI、RPC 和配置示例表达当时的方案，使用时请查阅
+README 和 `wmcterm capabilities` 中的现行接口。演进记录中的日期和版本用于标明
+各次变更的背景。
 
 ## 1. 产品定位
 
-参考 cmux 的产品结构与交互思路，目标不是简单实现一个 “Rust 版 Ghostty”，而是打造一个：
-
-> **Rust 原生、GPU 渲染、面向多终端 / 多 Agent 工作流的可编程 Terminal Workspace。**
+wmcterm 参考 cmux 的工作区组织和交互方式，采用 Rust 原生实现与 GPU 渲染，
+面向多终端、多 Agent 的可编程工作流。
 
 核心技术栈：
 
@@ -33,7 +41,7 @@ Rust
 
 ## 2. 产品核心理念
 
-cmux 最值得借鉴的不是外观，而是它将终端抽象为可组合的工作空间原语。
+产品将终端抽象为可组合的工作空间单元，通过工作区、窗格和表面组织任务。
 
 建议整体模型：
 
@@ -44,13 +52,7 @@ Window
               └── Surface
 ```
 
-产品关注点从：
-
-```text
-Terminal Tab
-```
-
-升级为：
+工作区组织的任务包括：
 
 ```text
 Workspace
@@ -62,15 +64,8 @@ Workspace
   └── Browser
 ```
 
-核心问题不是：
-
-> 我打开了多少个终端？
-
-而是：
-
-> 我同时运行了很多任务和 Agent，现在到底哪个需要我处理？
-
-因此产品核心应围绕：
+界面汇总任务和 Agent 的活动状态，帮助用户定位需要处理的输入、审批、完成和
+错误事件。对应的产品能力包括：
 
 - Workspace
 - Agent 状态
@@ -119,9 +114,9 @@ Workspace Sidebar 可以显示：
 
 ---
 
-# 4. 核心数据模型
+## 4. 核心数据模型
 
-## 4.1 App 层级
+### 4.1 App 层级
 
 建议采用：
 
@@ -149,7 +144,7 @@ type TerminalId = Uuid;
 
 ---
 
-## 4.2 Workspace
+### 4.2 Workspace
 
 ```rust
 struct Workspace {
@@ -174,11 +169,9 @@ Workspace 应作为产品的核心管理单元。
 
 ---
 
-## 4.3 Pane Tree
+### 4.3 Pane Tree
 
-不要使用二维数组表示 Pane。
-
-推荐使用 Split Tree：
+Pane 布局采用递归 Split Tree，记录分割方向、比例和两个子节点：
 
 ```rust
 enum PaneNode {
@@ -222,7 +215,7 @@ enum SplitAxis {
 
 ---
 
-# 5. Surface 模型
+## 5. Surface 模型
 
 Pane 内可以存在多个 Surface：
 
@@ -271,13 +264,7 @@ enum SurfaceKind {
 }
 ```
 
-不建议单独设计：
-
-```text
-AgentSurface
-```
-
-更推荐：
+Agent 通过 Terminal Surface 上的元数据表达：
 
 ```text
 Terminal Surface
@@ -285,16 +272,12 @@ Terminal Surface
 Agent Metadata
 ```
 
-原因是：
-
-- Claude Code
-- Codex
-
-本质上都还是运行在 PTY 中的 CLI / TUI。
+Claude Code 和 Codex 作为 CLI/TUI 运行在 PTY 中，复用终端的输入、渲染和
+进程生命周期管理。
 
 ---
 
-# 6. Terminal Core
+## 6. Terminal Core
 
 Terminal Core 必须独立于 GUI。
 
@@ -340,13 +323,7 @@ terminal-core
         └──────────────────┘
 ```
 
-需要明确：
-
-```text
-libghostty-vt != Ghostty terminal
-```
-
-真正的终端是：
+libghostty-vt 提供终端协议解析、状态维护和输入编码。完整终端由以下组件协作实现：
 
 ```text
 PTY
@@ -362,7 +339,7 @@ winit
 
 ---
 
-# 7. 多线程模型
+## 7. 多线程模型
 
 推荐：
 
@@ -390,7 +367,7 @@ winit
                   PTY            PTY           PTY
 ```
 
-## UI Thread
+### UI Thread
 
 负责：
 
@@ -404,7 +381,7 @@ winit
 
 ---
 
-## Terminal Worker
+### Terminal Worker
 
 每个 Terminal 使用独立 Actor：
 
@@ -457,23 +434,9 @@ flume
 
 ---
 
-# 8. Frame Scheduler
+## 8. Frame Scheduler
 
-不要让 PTY 每次输出都触发重绘。
-
-错误：
-
-```text
-PTY bytes
- ↓
-VT update
- ↓
-request_redraw()
-```
-
-大量输出时 UI 会被 EventLoop 消息打爆。
-
-正确：
+调度器合并终端更新，在帧预算内重绘最新状态，控制高吞吐输出产生的 UI 唤醒量：
 
 ```text
 PTY bytes
@@ -508,7 +471,7 @@ Terminal Worker
 
 ---
 
-# 9. wgpu Renderer
+## 9. wgpu Renderer
 
 建议模块：
 
@@ -553,11 +516,9 @@ SurfaceTexture
 
 ---
 
-# 10. Glyph Renderer
+## 10. Glyph Renderer
 
-不建议直接使用 egui Text 渲染 Terminal。
-
-推荐：
+早期字形渲染方案考虑以下组件：
 
 ```text
 fontdb
@@ -627,9 +588,7 @@ struct GlyphInstance {
 12,000 cells
 ```
 
-不能产生 12,000 个 Draw Call。
-
-建议：
+渲染器按背景、字形和装饰批量提交，将绘制调用数量与单元格数量解耦：
 
 ```text
 Backgrounds:   1 draw
@@ -642,7 +601,7 @@ Cursor:        1 draw
 
 ---
 
-# 11. Glyph Atlas
+## 11. Glyph Atlas
 
 ```text
                   GlyphAtlas
@@ -687,11 +646,9 @@ RGBA Atlas
 
 ---
 
-# 12. Render Snapshot
+## 12. Render Snapshot
 
-Renderer 不应该直接访问 Terminal。
-
-推荐：
+Terminal Worker 发布不可变 RenderSnapshot，Renderer 消费快照：
 
 ```text
 Terminal
@@ -704,39 +661,14 @@ RenderSnapshot
 Renderer
 ```
 
-不要：
-
-```text
-Renderer
-   │
- lock
-   ▼
-Terminal
-```
-
-否则容易变成：
-
-```text
-PTY Thread
-     ↓
-Terminal Lock
-
-Renderer
-     ↓
-Terminal Lock
-
-Resize
-     ↓
-Terminal Lock
-```
-
-建议 Terminal Worker 产生 RenderSnapshot。
+可变 VT 状态集中在 Terminal Worker 中，输入、输出和 resize 在 actor 内按序处理。
+快照传递使 GPU 绘制与 VT 更新独立调度。
 
 ---
 
-# 13. Terminal 数据流
+## 13. Terminal 数据流
 
-## 输入
+### 输入
 
 ```text
 Keyboard
@@ -763,7 +695,7 @@ KeyRouter
 
 ---
 
-## 输出
+### 输出
 
 ```text
 shell / Agent
@@ -791,7 +723,7 @@ wgpu Renderer
 
 ---
 
-# 14. Keyboard 路由
+## 14. Keyboard 路由
 
 快捷键必须两级路由。
 
@@ -833,7 +765,7 @@ Keybinding Resolver
 
 ---
 
-# 15. Agent 状态模型
+## 15. Agent 状态模型
 
 建议：
 
@@ -868,7 +800,7 @@ Agent 状态检测分三级。
 
 ---
 
-## Level 1：OSC
+### Level 1：OSC
 
 可以支持：
 
@@ -887,7 +819,7 @@ OSC 777
 
 ---
 
-## Level 2：Agent Hooks
+### Level 2：Agent Hooks
 
 例如：
 
@@ -915,7 +847,7 @@ wmcterm agent-event
 
 ---
 
-## Level 3：Socket API
+### Level 3：Socket API
 
 例如：
 
@@ -929,11 +861,11 @@ wmcterm agent-event
 }
 ```
 
-这样无需解析 Terminal 屏幕文本。
+结构化事件携带状态和目标标识，直接进入 Agent 状态归约流程。
 
 ---
 
-# 16. Notification Center
+## 16. Notification Center
 
 建议 MVP 就支持。
 
@@ -978,7 +910,7 @@ Focus Terminal
 
 ---
 
-# 17. Socket API
+## 17. Socket API
 
 建议 MVP 就实现。
 
@@ -1015,9 +947,9 @@ Linux/macOS：
 
 ---
 
-# 18. CLI
+## 18. CLI
 
-假设 CLI 名称为：
+CLI 入口：
 
 ```bash
 wmcterm
@@ -1088,7 +1020,7 @@ Workspace Manager
 
 ---
 
-# 19. Command Palette
+## 19. Command Palette
 
 快捷键建议：
 
@@ -1144,7 +1076,7 @@ ActionRegistry
 
 ---
 
-# 20. Command Architecture
+## 20. Command Architecture
 
 最终建议：
 
@@ -1189,18 +1121,11 @@ enum AppCommand {
 }
 ```
 
-不要为：
-
-- 快捷键
-- CLI
-- UI Button
-- Socket
-
-分别实现一套逻辑。
+快捷键、CLI、UI 按钮和 Socket 复用命令语义，统一执行目标解析和状态变更。
 
 ---
 
-# 21. Session Restore
+## 21. Session Restore
 
 Session Restore 需要从项目早期设计。
 
@@ -1272,11 +1197,11 @@ Restore Terminal
 Agent Specific Resume
 ```
 
-不要尝试恢复 PTY 进程内存。
+恢复时创建新的 PTY 进程，并根据保存的目录、命令和 Agent 会话标识重新启动。
 
 ---
 
-# 22. 配置系统
+## 22. 配置系统
 
 配置文件：
 
@@ -1333,7 +1258,7 @@ notifications = true
 
 ---
 
-# 23. 项目配置
+## 23. 项目配置
 
 项目目录中支持：
 
@@ -1382,7 +1307,7 @@ Workspace: ctsp
 
 ---
 
-# 24. Rust Workspace 工程结构
+## 24. Rust Workspace 工程结构
 
 建议：
 
@@ -1435,17 +1360,11 @@ wmcterm/
     └── main.rs
 ```
 
-建议避免整个项目依赖：
-
-```rust
-Arc<Mutex<App>>
-```
-
-到处互相调用。
+各 crate 通过命令、事件和快照协作，按职责管理状态所有权和依赖关系。
 
 ---
 
-# 25. 依赖建议
+## 25. 依赖建议
 
 示例：
 
@@ -1496,23 +1415,12 @@ slotmap = "..."
 wmcterm-terminal
 ```
 
-不要让：
-
-```rust
-libghostty_vt::*
-```
-
-扩散到整个项目。
-
-这样未来 libghostty-vt API 变化时：
-
-```text
-只修改 wmcterm-terminal
-```
+`wmcterm-terminal` 对外提供终端命令和渲染快照，将 libghostty-vt 的类型与生命周期
+管理集中在该 crate 内。升级 VT API 时，可在这一边界适配调用方。
 
 ---
 
-# 26. 总体架构
+## 26. 总体架构
 
 ```text
 ┌────────────────────────────────────────────────────────────┐
@@ -1562,22 +1470,9 @@ libghostty_vt::*
 
 ---
 
-# 27. MVP 范围
+## 27. MVP 范围
 
-第一阶段不要做：
-
-```text
-Browser
-SSH Manager UI
-File Browser
-AI Chat
-Markdown
-Settings GUI
-Plugin Marketplace
-Cloud Sync
-```
-
-MVP 只实现：
+立项时的 MVP 交付项：
 
 1. PTY
 2. libghostty-vt
@@ -1588,15 +1483,13 @@ MVP 只实现：
 7. Notification / Attention
 8. CLI + Unix Socket
 
-这样就已经不是普通 Rust Terminal Demo，而是：
-
-> **cmux-style Agent Terminal for Rust**
+上述能力构成面向 Agent 工作流的终端工作区初版。
 
 ---
 
-# 28. 开发阶段
+## 28. 开发阶段
 
-## Phase 0：libghostty-vt PoC
+### Phase 0：libghostty-vt PoC
 
 目标：
 
@@ -1617,7 +1510,7 @@ Dump Screen
 
 ---
 
-## Phase 1：单 Terminal
+### Phase 1：单 Terminal
 
 ```text
 PTY
@@ -1642,7 +1535,7 @@ Codex
 
 ---
 
-## Phase 2：Workspace
+### Phase 2：Workspace
 
 实现：
 
@@ -1662,7 +1555,7 @@ Surface
 
 ---
 
-## Phase 3：Command System
+### Phase 3：Command System
 
 实现：
 
@@ -1676,7 +1569,7 @@ Command Palette
 
 ---
 
-## Phase 4：Agent
+### Phase 4：Agent
 
 实现：
 
@@ -1690,7 +1583,7 @@ Notification Center
 
 ---
 
-## Phase 5：Session
+### Phase 5：Session
 
 实现：
 
@@ -1702,7 +1595,7 @@ Agent Resume
 
 ---
 
-## Phase 6：扩展 Surface
+### Phase 6：扩展 Surface
 
 未来：
 
@@ -1718,9 +1611,9 @@ Remote
 
 ---
 
-# 29. 最早需要验证的三个技术风险
+## 29. 最早需要验证的三个技术风险
 
-## 29.1 libghostty-vt 生命周期和线程模型
+### 29.1 libghostty-vt 生命周期和线程模型
 
 优先验证：
 
@@ -1734,11 +1627,11 @@ Render Snapshot
 UI Channel
 ```
 
-不要等工程很大以后再调整。
+在 PoC 阶段验证状态所有权、消息传递和关闭顺序，再扩展工作区功能。
 
 ---
 
-## 29.2 Font / Glyph Rendering
+### 29.2 Font / Glyph Rendering
 
 重点验证：
 
@@ -1755,7 +1648,7 @@ Ligatures
 
 ---
 
-## 29.3 高吞吐输出
+### 29.3 高吞吐输出
 
 测试：
 
@@ -1781,25 +1674,13 @@ Dirty Coalescing
 60 / 120 FPS UI
 ```
 
-而不是：
-
-```text
-每几十字节 repaint 一次
-```
+测试记录吞吐量、输入延迟和 UI 帧耗时，以评估脏状态合并与重绘调度。
 
 ---
 
-# 30. 最核心的架构原则
+## 30. 工作区与终端的职责分层
 
-不要设计成：
-
-```text
-Rust Ghostty Clone
-       +
-Sidebar
-```
-
-应该设计成：
+Workspace Core 管理布局和表面，终端后端提供 PTY/VT 能力：
 
 ```text
               Workspace Core
@@ -1817,7 +1698,7 @@ Sidebar
 
 > **Workspace 是产品核心，Terminal 是一种 Surface。**
 
-未来才能自然增加：
+Surface 模型为以下扩展方向提供统一的布局和生命周期入口：
 
 ```text
 Terminal
@@ -1832,11 +1713,9 @@ Kubernetes Exec
 Serial
 ```
 
-而无需推翻整个架构。
-
 ---
 
-# 31. 最终推荐产品形态
+## 31. 最终推荐产品形态
 
 ```text
                          WMCTERM
@@ -1871,11 +1750,10 @@ Serial
 
 ---
 
-# 32. 项目目标总结
+## 32. 项目目标总结
 
-第一版明确限定为：
-
-> **cmux 的 Workspace / Agent 体验 + Ghostty 级 VT 兼容性 + Rust / wgpu 跨平台底座。**
+第一版以工作区组织、Agent 状态感知、VT 兼容性和 Rust/wgpu 跨平台运行时为目标。
+终端兼容性通过真实 PTY/VT 测试和 GUI 输入协议测试验证。
 
 核心优先级：
 
@@ -1891,25 +1769,14 @@ Agent Awareness
 Programmability
 ```
 
-而不是：
-
-```text
-Browser
-IDE
-AI Chat
-Plugin Marketplace
-```
-
-先把 Terminal Workspace 做深，再向完整的 Agent Workspace 扩展。
-
 ---
 
-# 33. 当前实现基线（2026-08-19）
+## 33. 实现基线与演进记录
 
-本节记录能够从当前源码、测试和公开命令直接验证的事实。前文使用“建议”、
-“第一阶段”或“未来”的内容若与本节冲突，以本节和代码为准。
+本节从 2026-08-19 的实现基线开始，持续记录产品能力和后续修复。33.1 至 33.5
+介绍已落地的组件与接口，33.6 起记录具体变更及其验证背景。
 
-## 33.1 已落地的产品与线程模型
+### 33.1 已落地的产品与线程模型
 
 - 产品层级已实现为 `AppState -> Workspace -> PaneNode -> Pane -> Surface`，
   全部实体使用 UUID；Pane 使用可递归的 Split Tree，支持四向分割、比例调整、
@@ -1932,7 +1799,7 @@ Plugin Marketplace
   选区使用主题的 selection foreground/background 反色，不向字符串插入光标
   字符，因此移动光标不会改变文字布局。
 
-## 33.2 Surface 与界面能力
+### 33.2 Surface 与界面能力
 
 当前核心状态允许 `Terminal`、`Markdown`、`Logs` 和 `Browser` 四种 Surface
 类型，但成熟度不同：
@@ -1941,8 +1808,7 @@ Plugin Marketplace
   Kubernetes 命令。
 - Markdown 支持文件刷新、结构化块渲染与搜索。
 - Logs 支持有界历史、文件 tail、截断/替换检测、级别过滤和保留源行号的搜索。
-- Browser 只有平台无关的占位后端，没有嵌入式 WebView；产品行为是由外部系统
-  应用打开 URL，嵌入式浏览器和自动更新仍明确不在当前范围内。
+- Browser 提供平台无关的占位后端；URL 由外部系统应用打开。
 
 无边框 winit 窗口已经包含工作区侧栏、Surface 标签、Pane 分隔条、导航栏、
 命令面板、终端查找、通知中心、Agent 授权卡片和双语（英文/简体中文）界面。
@@ -1956,7 +1822,7 @@ Plugin Marketplace
 点击 GUI 标题栏关闭按钮或其他交互式关闭入口时，如果会终止活动进程、Agent
 或待处理请求，会显示确认；明确指定 UUID 的 CLI/RPC Agent 操作不弹出页面确认。
 
-## 33.3 CLI、IPC 与 Agent 控制面
+### 33.3 CLI、IPC 与 Agent 控制面
 
 - 本地控制面使用 JSON-RPC，协议能力由 `wmcterm capabilities` 自描述；当前
   协议版本为 4；无排序语义的 `workspace.pin` 已移除，顺序调整统一使用
@@ -1985,8 +1851,9 @@ Plugin Marketplace
 - Agent 运行策略与单条审批分层：`interactive` 维持按需审批；`unattended` 使用
   Codex `--approve-for-me`（自身启用 `workspace-write`）或 Claude `--permission-mode auto`，
   允许原生低风险自动判断但保留隔离；`full-access` 关闭审批和沙箱，只能从命令面板
-  的显式动作启动，并要求在危险说明弹窗中再次确认。完全访问只作用于新 Agent 进程，
-  不可持久化为配置，也不接受 CLI/Agent 自动化传入危险参数。
+  的显式动作启动，并要求在危险说明弹窗中再次确认。完全访问在启动时授权给目标会话，
+  启动选择保存在托管 Codex 的会话恢复记录中，重启时沿用；全局配置与
+  CLI/Agent 自动化入口继续拒绝危险全权限参数。
 - GUI 为含 `.codex` 目录的 Workspace 启动自动审查模式的 Codex 前，按规范化的精确项目根
   检查用户级 Codex 信任配置。未信任时由人工选择取消、不信任并继续，或信任并启动；
   信任操作保留未知 TOML 和文件权限并原子替换配置，解析或写入失败时 fail closed。
@@ -2018,9 +1885,10 @@ Plugin Marketplace
 - 已对照 Codex 0.154.0 的 `resume_running_thread` 和 thread lifecycle 实现核验
   多客户端订阅仍受支持。订阅只传 `threadId`、`excludeTurns`，不覆盖已保存的
   cwd、权限或 worktree 配置。回归测试覆盖只读子线程的 cwd、显式目标及
-  `focus: false`，以及交错提问不被审批桥当作权限请求回答；原生 TUI 负责提问。
-- watcher 从所有携带 thread ID 的 `thread/*` 通知发现新目标，而不是只依赖
-  `thread/started`；同时周期性回查 `thread/loaded/list` 并同步确认每次
+  `focus: false`，以及交错提问使用独立输入通道。受支持的问题和简单 MCP 表单由
+  请求面板处理，其他输入继续使用原生 TUI。
+- watcher 从所有携带 thread ID 的 `thread/*` 通知发现新目标，同时周期性回查
+  `thread/loaded/list` 并同步确认每次
   `thread/resume` 成功，以恢复丢失或版本差异导致的 resume 通知。
 - watcher 可以沿最后创建的子 Agent 表面继续分割；若该缓存表面已被用户关闭且
   `pane.split` 明确返回 `target surface not found`，则清除缓存并立即从根 Codex
@@ -2058,7 +1926,7 @@ Plugin Marketplace
   `wmcterm hook install --agent codex --scope user` 才写入 `~/.codex`，并须在
   `/hooks` 审核；项目级安装使用 `--scope project`。
 
-## 33.4 配置、恢复与发布
+### 33.4 配置、恢复与发布
 
 - 配置由用户级 `wmcterm/config.toml` 与项目级 `.wmcterm.toml` 分层加载；
   支持主题、256 色 palette、cursor/selection 颜色、字体、
@@ -2071,11 +1939,10 @@ Plugin Marketplace
   读取当前用户 WinINet；PAC/WPAD 安全跳过。缓存低频刷新，创建前执行有界刷新，
   UI 超时后使用最近有效快照，检测失败不清空缓存。父进程及 RPC 显式代理变量按协议
   优先，桌面代理只补缺；现有进程的环境和生命周期不受缓存变化影响。
-- `codex-teams` 子分区的私有 loopback app-server endpoint 是单次运行时状态，
-  不得在程序重启后重放。当持久化命令的 thread ID 与 Codex Agent
-  resume ID 一致时，恢复逻辑将其降级为独立 `codex resume` 会话；根
-  `codex-teams` 命令和无法验证归属的命令保持不变。Claude Code 的恢复不依赖
-  私有 loopback endpoint，继续使用稳定的 session ID 恢复语义。
+- `codex-teams` 的私有 loopback app-server endpoint 属于单次运行时状态。
+  带托管恢复记录的会话在重启时创建新 app-server，并将保存的子表面连接到新服务。
+  旧记录中的子分区命令在 thread ID 与 Agent resume ID 一致时降级为独立
+  `codex resume` 会话。Claude Code 使用稳定的 session ID 恢复。
 - 仓库包含 Linux x86_64 Debian 与 Windows x86_64 NSIS 打包脚本、桌面入口、
   应用图标，以及作为默认字体随包分发的 Maple Mono Normal NF（含 OFL 许可）。
   Windows 安装器检查 build 17763 门槛、注册 App Paths，并维护系统 `PATH`；
@@ -2089,7 +1956,7 @@ Plugin Marketplace
   更新脚本同步用户级 Codex/Claude Skill 与 Hook，同时保留不属于
   wmcterm 的已有配置。
 
-## 33.5 当前 Rust workspace 与验证基线
+### 33.5 当前 Rust workspace 与验证基线
 
 当前 workspace 共有根包和 12 个内部 crate：
 
@@ -2125,20 +1992,20 @@ cargo build --release --bin wmcterm
 Windows cross-check 或 `scripts/package-release.sh`。这些属于环境相关验证，不能
 用纯单元测试的通过替代。
 
-## 33.6 已修复缺陷：跨工作区审批阻塞模态编辑
+### 33.6 已修复缺陷：跨工作区审批阻塞模态编辑
 
 修复状态（2026-08-20）：审批注册仅在请求属于当前 Surface 且没有活动文本
 编辑器时自动展开通知面板；键盘路由同时保证 `TextPrompt`、工作区搜索、命令
 面板和终端查找优先于异步展开的通知面板。非当前 Surface 的请求仍更新对应
 Agent/Workspace attention，并按配置发送原生通知，但不会抢占键盘或 IME。
 
-已知问题：用户正在修改当前工作区路径时，如果其他工作区存在待审批的
+修复前现象：用户正在修改当前工作区路径时，如果其他工作区存在待审批的
 Agent 请求，当前路径编辑窗口可能卡死或无法继续输入、提交、取消及执行
 其他操作。这是错误的跨工作区交互耦合：非当前工作区的待处理请求可以触发
 attention 和通知更新，但不应抢占当前模态编辑器的输入归属，也不应使其进入
 不可退出状态。
 
-修复时需要同时检查同类问题，不应只覆盖“修改工作区路径”一个入口：
+同类交互的回归检查范围：
 
 - 审计待审批请求注册、更新、超时、取消和 Agent 状态重算时的焦点与模态层
   切换，确保状态更新按请求所属 Workspace/Pane/Surface 隔离。
@@ -2154,59 +2021,36 @@ attention 和通知更新，但不应抢占当前模态编辑器的输入归属�
 编辑会话；当前工作区的审批仍按明确的交互规则呈现，且所有审批决策继续
 fail closed。
 
-## 33.7 已修复缺陷：异步诊断输出覆盖 Codex 输入框
+### 33.7 已修复缺陷：异步诊断输出覆盖 Codex 输入框
 
 修复状态（2026-08-20）：确认示例中的日志来自 `wmcterm codex-teams` 启动的私有
 Codex app-server；该辅助进程此前继承了交互式 PTY 的 stderr。现在其 stdin、
 stdout 和 stderr 均不连接前台 PTY，延迟模型刷新诊断不会再注入根 Codex TUI
 或其他终端。根 Codex 进程本身仍保留标准流继承，以维持正常交互。
 
-已知问题：Codex 完成一次任务并恢复输入框后，后台模型刷新子进程的延迟
+修复前现象：Codex 完成一次任务并恢复输入框后，后台模型刷新子进程的延迟
 错误输出会直接写入当前终端，例如：
 
 ```text
 2026-08-20T03:08:09.769966Z ERROR codex_models_manager::manager: failed to refresh available models: timeout waiting for child process to exit
 ```
 
-该行会覆盖 Codex 的输入框，造成输入区域视觉损坏，并可能使 TUI 内部布局与
-wmcterm 当前显示的 VT 状态不一致。需先区分该日志是 Codex 本身向 PTY 写入的
-普通字节，还是 wmcterm 的 Agent 集成、watcher 或子进程管理将诊断误路由到了前台
-Terminal Surface。
+该行覆盖了 Codex 输入框。排查确认私有 app-server 继承了前台 PTY 的 stderr，
+修复将辅助进程标准流与交互式终端隔离。诊断输出按子进程归属路由，目标由显式
+Surface 和 Terminal lifecycle 标识确定。
 
-后续观察到相同的 `codex_models_manager::manager` 超时日志会在等待一段时间后出现在
-其他终端中。因此不能把该问题仅归因于单个 Codex TUI 未重绘；还需优先检查
-共享或全局模型刷新任务的输出是否被广播到多个 Surface，或子进程是否继承了
-错误的 PTY/stdout/stderr 文件描述符。调查时应记录日志实际出现的 Workspace、
-Pane、Surface、Terminal lifecycle 和前台进程，并与发起刷新任务的 Agent 归属对比。
+回归检查关注辅助进程延迟输出、watcher 重连和进程退出时的标准流归属，以及
+多终端切换后的输入文本、光标和提示区。属于 TUI 自身的输出继续由 VT 解析和
+快照渲染路径处理。
 
-修复与排查范围：
+### 33.8 已修复缺陷：Codex 完成本轮后 Workspace 仍显示运行中
 
-- 确认受管 Codex、app-server watcher 及模型刷新子进程的 stdout/stderr 归属，
-  防止辅助进程的日志注入交互式 PTY。
-- 审计子进程 spawn 时的 stdin/stdout/stderr 文件描述符继承、全局日志 subscriber/writer 和
-  跨 Surface 消息分发，确保诊断只进入明确指定的日志目标，不依赖当时 UI 焦点。
-- 如果该字节确属 Codex TUI 输出，检查 VT 光标保存/恢复、备用屏、擦除、换行、
-  延迟重绘和快照合并的处理，并确认 TUI 能在异步输出后完整重绘输入区。
-- 检查完成、审批解决、超时、模型列表刷新、watcher 重连和子进程退出等延迟
-  事件是否会在前台 TUI 进入输入态后产生同类输出。
-- 增加多终端回归测试：在 Codex 恢复输入框后注入延迟 stderr 或诊断事件，
-  验证所属 Surface 的输入文本、光标、提示区和后续键盘操作都正确，且其他
-  Workspace/Pane/Surface 不会收到该字节；同时覆盖焦点切换、窗口 resize、长行
-  换行和连续异步输出。
-
-验收条件是：辅助进程诊断不会泄漏到任何前台交互式 PTY，也不会跨终端、
-跨 Pane 或跨 Workspace 广播；对于应当显示的异步
-TUI 输出，wmcterm 能正确解析和重绘，不会留下被覆盖的输入框、错位光标或
-不可操作状态。
-
-## 33.8 已修复缺陷：Codex 完成本轮后 Workspace 仍显示运行中
-
-修复状态（2026-08-20）：Hook `Stop` 现在归一化为本轮状态观测
-`Completed`/`Error`，不再错误映射为长生命周期进程 `Exited`。真实 PTY 退出仍是
-关闭 Agent lifecycle 的唯一入口；交互式 Codex 恢复输入框后可以显示完成状态，
+修复状态（2026-08-20）：Codex Hook `Stop` 归一化为本轮状态观测
+`Completed`/`Error`，保留长生命周期进程状态。PTY 退出负责结束该终端进程；
+交互式 Codex 恢复输入框后可以显示完成状态，
 下一次活动又能在同一 lifecycle 中回到运行中。
 
-已知问题：Codex 已经完成输出并恢复可输入提示符后，Workspace 状态仍长时间
+修复前现象：Codex 已经完成输出并恢复可输入提示符后，Workspace 状态仍长时间
 显示“运行中”。这不符合当前状态模型：用户提交输入时可先乐观设置
 `AgentState::Running`，但本轮完成事件到达后应转为 `AgentState::Completed`，
 并聚合为 `WorkspaceStatus::Completed`。
@@ -2225,7 +2069,7 @@ TUI 输出，wmcterm 能正确解析和重绘，不会留下被覆盖的输入�
 验收条件是：Codex 每次开始执行时及时显示运行中，每次恢复等待下一次用户
 输入时及时离开运行中；进程存活状态与 turn 状态不再混用。
 
-## 33.9 已修复缺陷：Agent 动态标题前缀使终端标签正文不可见
+### 33.9 已修复缺陷：Agent 动态标题前缀使终端标签正文不可见
 
 修复状态（2026-08-20）：Surface 继续保存完整原始 OSC title。受管 Agent 标签为
 “单个 braille spinner + 空白”预留固定两列：运行时保留并显示 Codex/Claude 自带
@@ -2233,7 +2077,7 @@ spinner，空闲帧使用等宽空槽，因此动态帧不会改变标签宽度�
 标题、编号、间距和关闭按钮使用同一组几何常量计算显示与命中区域；英文、CJK、
 动态 spinner 及运行/空闲等宽切换已有共同回归用例。
 
-已知问题：终端标签根据已生成的标题确定长度后，Codex 在运行期间会向终端
+修复前现象：终端标签根据已生成的标题确定长度后，Codex 在运行期间会向终端
 标题最前面加入类似转圈的动态进度字符，此后标签中原本应显示的后续文字可能
 全部不可见。修复前实现会将每次 VT title change 整段替换到 `Surface.title`，
 然后固定从字符串开头截断到 14 个显示列；没有区分稳定标题和瞬时进度前缀。
@@ -2258,7 +2102,7 @@ Claude 与 Codex 在 wmcterm 中共用完全相同的 VT title 接收、`Surface
 验收条件是：无论 Agent 是否动态更新终端标题，标签都至少保留可识别的
 稳定标题文本；动态状态不会改变或破坏标签的布局与可操作区域。
 
-### 33.9.1 Surface 标签弹性布局与溢出导航
+#### 33.9.1 Surface 标签弹性布局与溢出导航
 
 实现状态（2026-09-01）：Surface 标签不再按标题内容生成狭窄且固定的命中区域。
 同一可见页中的标签平均分配可用宽度，单个标签以 80px 为最小舒适宽度、240px
@@ -2268,7 +2112,7 @@ Claude 与 Codex 在 wmcterm 中共用完全相同的 VT title 接收、`Surface
 其他页时仍保证活动标签可见。新增按钮、溢出按钮、标签和关闭按钮共享无重叠的
 绘制与命中几何。
 
-## 33.10 已修复缺陷：新启动 Codex 被误标为运行中
+### 33.10 已修复缺陷：新启动 Codex 被误标为运行中
 
 修复状态（2026-08-20）：Agent lifecycle `Started`、前台 Agent 进程自动识别和
 `SessionStart` 只表示交互式进程已经建立，初始 turn 状态统一为 `Idle`。用户提交
@@ -2278,7 +2122,7 @@ Enter、收到 ToolUse/Activity 或明确的运行状态观测后才进入 `Runn
 生命周期 `Running` 仅表示 Codex/Claude 进程仍存活，不能直接聚合为工作区“运行中”。
 新打开 Agent 并停在输入框时工作区显示空闲，避免把等待首次输入误报为正在执行任务。
 
-## 33.11 已修复缺陷：Claude Goal 续跑被误标为已完成
+### 33.11 已修复缺陷：Claude Goal 续跑被误标为已完成
 
 修复状态（2026-08-23）：Claude Code 的 `Stop` Hook 是可被 `/goal` 或用户 Stop Hook
 拒绝的本轮停止提议，不再映射为根会话 `Completed` 或释放会话路由。wmcterm 保留
@@ -2291,7 +2135,7 @@ Claude 会话真正完成，并清理该会话的子 Agent 状态。
 的 `Stop` 提前清除仍属于活动会话的子 Agent 路由。回归测试覆盖普通 Stop、Goal
 续跑 Stop 和 SessionEnd 清理边界。
 
-## 33.12 性能与显示修复：cmux 参考边界
+### 33.12 性能与显示修复：cmux 参考边界
 
 修复状态（2026-08-21）：高频终端快照只标记 scene dirty，UI 合并唤醒并在
 60 Hz 上限内消费最新状态。每个终端的待处理队列只保留最新快照；隐藏工作区、
@@ -2320,7 +2164,7 @@ GhosttyKit 的 surface/renderer；wmcterm 需要在 Linux、macOS 和 Windows �
 Rust actor、winit 事件循环、wgpu surface 和 glyphon 缓存。因此只借鉴上述时序、
 坐标和失效原则，不引入 AppKit/CAMetalLayer/GhosttyKit 适配层。
 
-## 33.13 手动 Codex 的运行模式与 turn 状态解耦
+### 33.13 手动 Codex 的运行模式与 turn 状态解耦
 
 实现状态（2026-09-01）：前台进程识别在保持 Agent 种类判断的同时记录运行模式。
 手动 `--approve-for-me`/`--full-auto` 归类为自动审查，手动
@@ -2333,7 +2177,7 @@ Rust actor、winit 事件循环、wgpu surface 和 glyphon 缓存。因此只借
 用于确认运行，`Stop`/`Interrupt` 和真实 PTY 退出分别结束 turn 或生命周期。托管启动器
 仍拒绝危险 bypass 参数；识别手动全权限进程不会产生任何授权能力。
 
-## 33.14 Agent 恢复按启动来源和退出状态决策
+### 33.14 Agent 恢复按启动来源和退出状态决策
 
 2026-09-15 更新：带托管恢复记录的 Codex 已改为按原权限模式重建 Teams 服务并恢复
 原线程，三种模式均保留。下述普通 resume 降级规则仅适用于旧记录、手动 Agent 和
@@ -2384,7 +2228,7 @@ Codex 的会话 ID 不代表 rollout 已持久化。会话保存和加载阶段�
 不被此检查改写。前台 Agent 消失后，在重新计算状态前清除旧会话和子 Agent 状态，
 避免把已结束的 Running/Waiting 状态投射回工作区。
 
-### 本地 Agent 的 Bash SSH 闭环
+### 33.15 本地 Agent 的 Bash SSH 闭环
 
 SSH 结构化操作由 `wmcterm-terminal::ssh` 实现，PTY 读取、协议状态和输入提交均在
 终端 actor 内执行。UI/RPC 仅显式定位 Surface 并发送有期限的请求，不根据焦点选终端。

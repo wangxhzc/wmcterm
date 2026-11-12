@@ -1,9 +1,5 @@
 # wmcterm
 
-`wmcterm diagnostics` 可检查 GUI/CLI 可执行文件路径、Codex/Claude 版本、最近
-实际收到的 Hook 来源，以及每个终端的鼠标、键盘、焦点和粘贴协议状态。
-诊断仅查询状态，不修改 Hook 安装或用户配置。
-
 基于 `libghostty-vt`、`winit`、`wgpu` 和 `glyphon` 构建的 Rust 原生 GPU
 终端工作区。每个终端表面拥有独立的 PTY/VT actor；UI 接收不可变的渲染快照，
 并合并重绘唤醒。
@@ -14,6 +10,10 @@
 不足一个单元格的余量，工作区元数据仅在可见值变化时触发重绘。UI 布局和命中测试
 始终使用逻辑坐标，而 wgpu 使用经过当前 DPI 缩放的物理尺寸。窗口 `opacity` 同时
 应用于渲染背景和原生窗口透明度。
+
+文档导航：[架构与实现](docs/rust-libghostty-vt-winit-wgpu-terminal-design.md)、
+[产品设计与演进记录](docs/wmcterm终端产品设计方案.md)、
+[开发约定](AGENTS.md)、[Agent 控制接口](integrations/skills/wmcterm/SKILL.md)。
 
 ## 系统要求
 
@@ -199,6 +199,12 @@ RPC 为 `ssh.connect/status/exec/cancel`，都要求 `surface_id` UUID。`connec
 
 ## CLI 和 IPC
 
+### 命令与诊断
+
+`wmcterm diagnostics` 可检查 GUI/CLI 可执行文件路径、Codex/Claude 版本、最近
+实际收到的 Hook 来源，以及每个终端的鼠标、键盘、焦点和粘贴协议状态。
+该命令以只读方式查询运行状态。
+
 控制服务最多同时处理 16 个连接，请求帧上限为 1 MiB，响应帧上限为 32 MiB，
 读写无进展超时为 5 秒。不完整连接不会阻塞其他请求或 GUI 退出。
 `wmcterm capabilities` 返回这些限制。终端输入队列按条数和字节数限制；
@@ -272,9 +278,11 @@ cargo run -- status
 
 Hook 接收器会继承由 wmcterm 启动的终端所含的 wmcterm 上下文变量，因此并发 Agent
 会把状态和通知报告给正确的工作区、窗格及表面。
-`hook plan` 只输出用于合并的集成片段，绝不会编辑 Agent 配置。`hook install` 会在
+### Hook 安装与状态事件
+
+`hook plan` 输出用于合并的集成片段。`hook install` 会在
 项目或用户作用域安全合并 Codex、Claude Code 的 JSON Hook 定义，重复安装
-会自动去重。Agent 启动、进程识别、Hook 和会话恢复仅支持 Codex 与 Claude Code。Codex
+会自动去重。Agent 启动、进程识别、Hook 和会话恢复支持 Codex 与 Claude Code。Codex
 新安装或发生变化的命令 Hook 必须先通过 `/hooks` 审核才能运行。
 Codex 0.150.0 的 `Interrupt` Hook 会在用户中断当前 turn 时立即清除运行中
 状态，但不会把仍在等待下一次输入的 Codex 进程标记为已退出。
@@ -291,7 +299,9 @@ agent ID 跟踪后台子 Agent；只要任一子 Agent 仍活动，Workspace 就
 显式执行 `wmcterm hook install --agent codex --scope user` 才会写入 `CODEX_HOME`（默认 `~/.codex`），
 随后仍需在 Codex `/hooks` 中审核变化。项目级安装使用 `--scope project`。
 
-CLI 也是稳定的 Agent 控制接口。在 wmcterm 终端内启动的命令会继承 `WMCTERM=1`、
+### 调用上下文与目标路由
+
+在 wmcterm 终端内启动的命令会继承 `WMCTERM=1`、
 `WMCTERM_WORKSPACE_ID`、`WMCTERM_PANE_ID`、`WMCTERM_SURFACE_ID`、
 `WMCTERM_TERMINAL_LIFECYCLE_ID` 和 `WMCTERM_CONTROL_SOCKET`。每当该终端的 PTY
 被重新创建时，lifecycle 值都会变化，因此旧进程延迟到达的 Hook 无法更新新会话。
@@ -301,6 +311,8 @@ CLI 也是稳定的 Agent 控制接口。在 wmcterm 终端内启动的命令会
 上下文变量、屏幕控制功能及受支持的控制键。协议版本 4 移除了无排序效果的
 `workspace.pin`；工作区顺序统一由 `workspace.move` 控制。版本 3 新增了
 `send.line`、屏幕 revision 和非侵入式回滚历史读取。
+
+### 托管 Agent 与运行模式
 
 `wmcterm codex-teams [CODEX_ARG...]` 会启动实验性的私有 Codex app-server，并连接
 根 Codex TUI。子 Agent 的线程创建事件会生成原生 wmcterm 窗格且不抢夺焦点：第一个
@@ -321,8 +333,8 @@ transcript 加载到监视器。它识别所有携带线程 ID 的 `thread/*` �
 需要自动审查权限请求时，可从命令面板选择“新建 Codex/Claude Code（自动审查）”，
 或运行 `wmcterm agent --mode unattended codex|claude`。该模式使用 provider 原生的
 自动审查能力：Codex 使用 `--approve-for-me`（该参数自身启用 `workspace-write`
-沙箱），Claude 使用 `--permission-mode auto`；它不是“自动同意所有请求”，也不会
-关闭沙箱。
+沙箱），Claude 使用 `--permission-mode auto`。自动审查保留各 provider 的权限
+约束，并可将需要人工决策的请求交给用户。
 Claude Code 2.1.268 起，`-p`/`--print` 也会触发 `PermissionRequest` Hook。
 托管 Claude 交互启动默认显式传入 `--permission-mode manual`，避免新版 Claude
 默认 auto 模式改变交互入口的行为；用户显式指定的安全权限模式仍保留。
@@ -342,6 +354,8 @@ Hook `permission_mode` 优先于启动参数，反映运行期间的切换，仅
 改变主会话，带序列号的重复或过期 Hook 也不会重写模式。
 输入等待通知不会创建审批按钮，恢复执行后会退出等待；`agent_completed`、认证成功
 等普通通知保留任务状态。真实权限请求仍由独立审批通道处理，不会被这些通知清除。
+
+### 输入表单与权限建议
 
 Codex 0.163.0 的普通 `requestUserInput` 问题和简单 MCP `form` 请求可在请求面板
 点击“回答”，逐字段提交；字段支持文本、整数、有限数字、布尔值和字符串枚举。
@@ -379,6 +393,8 @@ Claude 的单条权限建议会显示为“添加规则”“切换模式”等�
 检查 Codex 用户配置中的精确项目路径。未信任的项目必须由用户选择“信任并启动”或
 “不信任并继续”；前者安全合并 `~/.codex/config.toml`，后者保持项目级 config、
 Hooks 和 exec policies 禁用。该人工信任入口不会暴露给 CLI、RPC 或 Agent。
+### Codex 恢复、权限代理与状态同步
+
 Codex 原生 `codex resume` 默认按当前 cwd 过滤（`--all` 才显示全部）。wmcterm 会把
 Workspace cwd 显式传给私有 app-server 的远程 TUI。Codex 0.149.1 至 0.154.0 会话内部的
 `/resume` 会新建一个未继承 remote cwd 的 picker 连接，因此仍可能固定显示
@@ -428,21 +444,25 @@ Codex 0.150.0 把向已运行命令发送输入表示为同一 app-server method
 的人工入口；选择后必须在危险说明弹窗中明确确认，且只影响新启动的 Agent 会话，不写入
 配置。该会话关闭审批和沙箱，应仅在已有外部隔离边界时使用。
 
-可操作的 Agent 请求使用有界请求/回复通道，而不是普通通知。使用
+### 请求处理与关闭操作
+
+可操作的 Agent 请求使用独立的有界请求/回复通道。使用
 `wmcterm agent-request list` 查看请求，然后使用
 `agent-request reply ID --approve|--deny|--choice ID|--text TEXT` 或
 `agent-request cancel ID [REASON]` 处理。请求携带所属 Surface 和终端 lifecycle
 标识，会安全过期，并拒绝陈旧或重复的响应。通知中心的审批卡片优先显示命令、
 工具、工作目录、原因或权限等可读摘要；详情保留格式化 JSON，并提供滚轮、方向键、
 Page Up/Down、Home/End、行数进度和可拖动滚动条。
-卡片只呈现“拒绝”“允许一次”和 provider 明确提供时的“信任规则”；“自动审查”和
-“完全访问”是 Agent 会话启动模式，不是某一条审批请求的升级按钮。
+卡片按请求类型呈现“拒绝”“允许一次”、provider 明确提供的权限建议，以及 Codex
+权限申请的“严格审核”。“自动审查”和“完全访问”在启动 Agent 会话时选择。
 
 交互式关闭操作会在终止活动进程前发出警告。明确指定工作区、窗格或表面 UUID 的
 Agent 和 CLI 控制调用会直接执行，不弹出 UI 确认；显式目标和调用 Agent 的审批边界
 具有最终决定权。
 
-内置 `wmcterm` Agent Skill 记录了此控制接口。唯一签入的源文件是
+### Skill 与集成更新
+
+内置 `wmcterm` Agent Skill 记录了此控制接口。签入的源文件是
 `integrations/skills/wmcterm/SKILL.md`；隐藏的 Agent 目录是生成的发现目标，而非
 源文件位置。`wmcterm skill install --scope user` 会为所有仓库将内置源注册到
 `~/.agents/skills`、`~/.codex/skills` 和 Claude Code 的个人 `~/.claude/skills`
@@ -478,8 +498,9 @@ Codex 和 Claude Hook 计划中的每个事件。Debian 维护脚本有意不写
 
 ## 配置和项目
 
-用户配置从平台配置目录下的 `wmcterm/config.toml` 加载。项目可以定义
-`.wmcterm.toml`：
+### 用户配置与项目配置
+
+用户配置从平台配置目录下的 `wmcterm/config.toml` 加载。
 
 使用以下配置为新建工作区设置默认目录：
 
@@ -492,6 +513,8 @@ default-cwd = "~/code"
 当 `inherit-cwd` 为 true 且存在活动工作区时，新工作区会继承该目录。否则使用
 `default-cwd`，再回退到 wmcterm 进程目录。配置的路径必须是现有目录。
 
+项目通过 `.wmcterm.toml` 定义名称和启动命令：
+
 ```toml
 [workspace]
 name = "wmcterm"
@@ -501,8 +524,10 @@ name = "Tests"
 command = "cargo test"
 ```
 
+### 会话持久化与恢复
+
 工作区布局、表面、终端命令和受支持的 Agent 会话 ID 会从平台数据目录恢复。可见的
-回滚历史会保留；PTY 进程内存绝不会被序列化，命令以及 Claude/Codex 的
+回滚历史会保留；恢复时创建新的 PTY 进程，命令以及 Claude/Codex 的
 resume 标识符会按启动来源恢复。由 wmcterm Agent 入口启动并已取得 session ID 的
 会话恢复原线程，不会重新执行初始提示词；Shell 中手动
 启动的 Agent 仅在 wmcterm 关闭时生命周期仍在运行且前台进程仍是该 Agent 才恢复；
@@ -521,7 +546,13 @@ CLI/RPC 仍不能直接选择危险全权限。子窗格连接新服务，不复
 等待等任务状态分开。CLI 参数与会话中的 `interactive`、`unattended`、`full-access`
 值保持不变。
 托管模式以服务端核验结果为准；Shell 模式由进程识别，均不把权限模式当作运行状态。
-设计与验证说明见 [Codex 托管恢复设计](docs/rust-libghostty-vt-winit-wgpu-terminal-design.md)。
+设计与验证说明见 [架构与实现记录](docs/rust-libghostty-vt-winit-wgpu-terminal-design.md)。
+
+Codex 自动会话恢复在保存和加载时检查当前 `CODEX_HOME`（默认 `~/.codex`）
+的会话记录。已取得会话 ID 但尚未落盘的空会话恢复为普通 Shell，并清除对应的旧
+Agent 状态，保留工作区布局和终端历史。
+
+### 配置重载与界面选项
 
 可使用 `wmcterm config init`、`config show`、`config validate` 或
 `config import-ghostty [PATH]`。UI 每秒重新加载一次有效的配置变更。支持主题颜色、
@@ -585,12 +616,15 @@ Codex、Claude 等 TUI 开启鼠标协议时，滚轮、悬停和鼠标按钮优
 - `wmcterm-ipc`：JSON-RPC 本地传输
 - `wmcterm-agent`：OSC 和 Agent 状态转换
 - `wmcterm-codex`：隔离的实验性 Codex app-server/子 Agent 桥
+- `wmcterm-claude`：Claude Hook 审批与输入表单桥
 - `wmcterm-config`、`wmcterm-session`：分层配置和恢复
 - `wmcterm-surface`：Markdown 文档及有界、可筛选、可跟踪追加的 Log 表面
 
-自动更新和嵌入式浏览器有意不在 wmcterm 的范围内。URL 仍可通过外部系统应用程序打开。
+URL 通过外部系统应用程序打开；核心模型保留 Browser Surface 占位类型。
 
-Phase 0 无头 VT 快照工具仍然可用：
+## 构建、验证与打包
+
+无头 VT 快照工具可用于检查终端解析输出：
 
 ```bash
 cargo run -- dump --cols 80 --rows 24 -- sh -lc 'printf "\033[32mhello\033[0m\n"'
@@ -643,7 +677,3 @@ WMCTERM_TEST_BASH=/path/to/bash-4.2.46/bash xvfb-run -a python3 scripts/ssh-smok
 生成的截图写入 `target/ui-smoke-en.png` 和 `target/ui-smoke-zh-CN.png`。运行时控制
 smoke test 会通过 winit 向 shell 发送真实的键盘空格事件，通过本地 IPC socket 创建
 窗格，并验证子终端是否收到 wmcterm 控制环境变量。
-
-Codex 自动会话恢复在保存和加载时检查当前 `CODEX_HOME`（默认 `~/.codex`）
-的会话记录。仅取得会话 ID、尚未落盘的空会话不会生成自动恢复命令；恢复为普通
-Shell，并清除对应的旧 Agent 状态，保留工作区布局和终端历史。

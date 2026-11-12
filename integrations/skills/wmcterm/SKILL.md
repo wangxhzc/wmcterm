@@ -270,6 +270,8 @@ remain non-blocking. Prompt submission updates activity without storing prompt
 text. Managed launches reject `--bg`, `--background`, `--cloud`, `--desktop`, and
 `--tmux`; native background sessions are outside managed restore ownership.
 
+## Answer input requests
+
 Codex ordinary questions and simple MCP forms appear as `input` requests. Use
 the panel's Answer action or `agent-request reply ID --text` with a JSON object
 mapping field ids to string answers. Numeric/boolean values are validated and
@@ -279,6 +281,8 @@ instruction. Cancelled, expired, externally answered or disconnected requests
 must not be retried as new approvals. Codex permissions alone support the
 `strict` choice: turn-scoped grants with strict subsequent command review.
 OSC 7501 is status-only fallback telemetry and cannot resolve a request.
+
+## Route delegated tasks
 
 - Read `wmcterm pane list` after creation and use the returned pane and surface
   IDs for later operations. Do not infer the new target from UI focus.
@@ -366,6 +370,8 @@ rows and the sidebar resize edge. Mouse-wheel scrolling remains available.
 
 The sidebar scrollbar track extends to the bottom. The 32px blank context-menu
 area follows the last workspace as part of the scrollable list.
+
+## Restore Agent sessions
 
 Managed Codex sessions with a saved managed restore record retain their original
 interactive, auto-review, or dangerous full-access mode after restarting wmcterm.
