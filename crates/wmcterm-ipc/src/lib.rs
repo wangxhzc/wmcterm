@@ -10,6 +10,57 @@ use thiserror::Error;
 mod input;
 pub use input::{InputField, InputFormRequest};
 
+pub const IO_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+pub const MAX_REQUEST_BYTES: usize = 1024 * 1024;
+pub const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+pub const MAX_CONNECTIONS: usize = 16;
+
+fn encode_request(request: &Request) -> Result<Vec<u8>, IpcError> {
+    let mut bytes = serde_json::to_vec(request)?;
+    if bytes.len() >= MAX_REQUEST_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "IPC request exceeds the 1 MiB frame limit",
+        )
+        .into());
+    }
+    bytes.push(b'\n');
+    Ok(bytes)
+}
+
+fn read_frame(reader: impl std::io::BufRead, limit: usize) -> std::io::Result<String> {
+    use std::io::BufRead;
+    let mut line = String::new();
+    reader.take(limit as u64 + 1).read_line(&mut line)?;
+    if line.len() > limit || !line.ends_with('\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "IPC frame exceeds its limit or is incomplete",
+        ));
+    }
+    Ok(line)
+}
+
+struct ConnectionPermit(Arc<std::sync::atomic::AtomicUsize>);
+
+impl ConnectionPermit {
+    fn acquire(active: &Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                (count < MAX_CONNECTIONS).then_some(count + 1)
+            })
+            .ok()?;
+        Some(Self(active.clone()))
+    }
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
     pub id: String,
@@ -476,7 +527,7 @@ pub fn default_socket_path() -> Option<PathBuf> {
 #[cfg(unix)]
 mod unix {
     use std::fs;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufReader, Write};
     use std::os::unix::fs::PermissionsExt;
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::Path;
@@ -508,12 +559,23 @@ mod unix {
             let stop = Arc::new(AtomicBool::new(false));
             let thread_stop = Arc::clone(&stop);
             let handler = Arc::new(handler);
+            let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let worker = thread::Builder::new()
                 .name("wmcterm-ipc".into())
                 .spawn(move || {
                     while !thread_stop.load(Ordering::Acquire) {
                         match listener.accept() {
-                            Ok((stream, _)) => handle(stream, handler.as_ref()),
+                            Ok((stream, _)) => {
+                                if let Some(permit) = super::ConnectionPermit::acquire(&active) {
+                                    let handler = handler.clone();
+                                    let _ = thread::Builder::new()
+                                        .name("wmcterm-ipc-client".into())
+                                        .spawn(move || {
+                                            let _permit = permit;
+                                            handle(stream, handler.as_ref());
+                                        });
+                                }
+                            }
                             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                                 thread::sleep(std::time::Duration::from_millis(10));
                             }
@@ -546,8 +608,12 @@ mod unix {
     where
         F: Fn(Request) -> Response,
     {
-        let mut line = String::new();
-        if BufReader::new(&stream).read_line(&mut line).is_ok() {
+        if stream.set_read_timeout(Some(super::IO_TIMEOUT)).is_err()
+            || stream.set_write_timeout(Some(super::IO_TIMEOUT)).is_err()
+        {
+            return;
+        }
+        if let Ok(line) = super::read_frame(BufReader::new(&stream), super::MAX_REQUEST_BYTES) {
             let response = match serde_json::from_str::<Request>(&line) {
                 Ok(request) => handler(request),
                 Err(error) => Response::error(String::new(), -32700, error.to_string()),
@@ -559,18 +625,20 @@ mod unix {
     }
 
     pub fn call(path: &Path, request: &Request) -> Result<Response, IpcError> {
+        let request = super::encode_request(request)?;
         let mut stream = UnixStream::connect(path)?;
-        serde_json::to_writer(&mut stream, request)?;
-        stream.write_all(b"\n")?;
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line)?;
+        stream.set_read_timeout(Some(super::IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(super::IO_TIMEOUT))?;
+        stream.write_all(&request)?;
+        let line = super::read_frame(BufReader::new(stream), super::MAX_RESPONSE_BYTES)?;
         Ok(serde_json::from_str(&line)?)
     }
 
     pub fn notify(path: &Path, request: &Request) -> Result<(), IpcError> {
+        let request = super::encode_request(request)?;
         let mut stream = UnixStream::connect(path)?;
-        serde_json::to_writer(&mut stream, request)?;
-        stream.write_all(b"\n")?;
+        stream.set_write_timeout(Some(super::IO_TIMEOUT))?;
+        stream.write_all(&request)?;
         stream.flush()?;
         Ok(())
     }
@@ -584,7 +652,7 @@ pub use unix::{UnixServer, call, notify};
 #[cfg(windows)]
 mod windows {
     use std::fs;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufReader, Write};
     use std::net::{TcpListener, TcpStream};
     use std::path::Path;
     use std::path::PathBuf;
@@ -626,34 +694,53 @@ mod windows {
             let thread_stop = Arc::clone(&stop);
             let handler = Arc::new(handler);
             let expected_token = token.clone();
+            let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             let worker = thread::Builder::new()
                 .name("wmcterm-ipc".into())
                 .spawn(move || {
                     while !thread_stop.load(Ordering::Acquire) {
                         match listener.accept() {
                             Ok((mut stream, _)) => {
-                                let mut line = String::new();
-                                let mut reader = BufReader::new(&stream);
-                                if reader.read_line(&mut line).is_err()
-                                    || line.trim() != expected_token
-                                {
+                                let Some(permit) = super::ConnectionPermit::acquire(&active) else {
                                     continue;
-                                }
-                                line.clear();
-                                if reader.read_line(&mut line).is_ok() {
-                                    let response = serde_json::from_str::<Request>(&line)
-                                        .map(|request| handler(request))
-                                        .unwrap_or_else(|error| {
-                                            Response::error(
-                                                String::new(),
-                                                -32700,
-                                                error.to_string(),
-                                            )
-                                        });
-                                    if serde_json::to_writer(&mut stream, &response).is_ok() {
-                                        let _ = stream.write_all(b"\n");
-                                    }
-                                }
+                                };
+                                let expected_token = expected_token.clone();
+                                let handler = handler.clone();
+                                let _ = thread::Builder::new()
+                                    .name("wmcterm-ipc-client".into())
+                                    .spawn(move || {
+                                        let _permit = permit;
+                                        if stream.set_read_timeout(Some(super::IO_TIMEOUT)).is_err()
+                                            || stream
+                                                .set_write_timeout(Some(super::IO_TIMEOUT))
+                                                .is_err()
+                                        {
+                                            return;
+                                        }
+                                        let mut reader = BufReader::new(&stream);
+                                        if !super::read_frame(&mut reader, 128)
+                                            .is_ok_and(|line| line.trim() == expected_token)
+                                        {
+                                            return;
+                                        }
+                                        if let Ok(line) =
+                                            super::read_frame(&mut reader, super::MAX_REQUEST_BYTES)
+                                        {
+                                            let response = serde_json::from_str::<Request>(&line)
+                                                .map(|request| handler(request))
+                                                .unwrap_or_else(|error| {
+                                                    Response::error(
+                                                        String::new(),
+                                                        -32700,
+                                                        error.to_string(),
+                                                    )
+                                                });
+                                            if serde_json::to_writer(&mut stream, &response).is_ok()
+                                            {
+                                                let _ = stream.write_all(b"\n");
+                                            }
+                                        }
+                                    });
                             }
                             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
                                 thread::sleep(std::time::Duration::from_millis(10))
@@ -698,23 +785,28 @@ mod windows {
         let (address, token) = endpoint.trim().split_once(' ').ok_or_else(|| {
             std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid wmcterm endpoint")
         })?;
-        Ok((TcpStream::connect(address)?, token.to_owned()))
+        let address = address
+            .parse()
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let stream = TcpStream::connect_timeout(&address, super::IO_TIMEOUT)?;
+        stream.set_read_timeout(Some(super::IO_TIMEOUT))?;
+        stream.set_write_timeout(Some(super::IO_TIMEOUT))?;
+        Ok((stream, token.to_owned()))
     }
     pub fn call(path: &Path, request: &Request) -> Result<Response, IpcError> {
+        let request = super::encode_request(request)?;
         let (mut stream, token) = connect(path)?;
         writeln!(stream, "{token}")?;
-        serde_json::to_writer(&mut stream, request)?;
-        stream.write_all(b"\n")?;
-        let mut line = String::new();
-        BufReader::new(stream).read_line(&mut line)?;
+        stream.write_all(&request)?;
+        let line = super::read_frame(BufReader::new(stream), super::MAX_RESPONSE_BYTES)?;
         Ok(serde_json::from_str(&line)?)
     }
 
     pub fn notify(path: &Path, request: &Request) -> Result<(), IpcError> {
+        let request = super::encode_request(request)?;
         let (mut stream, token) = connect(path)?;
         writeln!(stream, "{token}")?;
-        serde_json::to_writer(&mut stream, request)?;
-        stream.write_all(b"\n")?;
+        stream.write_all(&request)?;
         stream.flush()?;
         Ok(())
     }
@@ -981,6 +1073,52 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn frames_reject_oversize_and_incomplete_requests() {
+        assert!(read_frame(std::io::Cursor::new(b"12345\n"), 5).is_err());
+        assert!(read_frame(std::io::Cursor::new(b"1234"), 5).is_err());
+        assert_eq!(
+            read_frame(std::io::Cursor::new(b"1234\nextra"), 5).unwrap(),
+            "1234\n"
+        );
+    }
+
+    #[test]
+    fn stalled_connection_does_not_block_other_clients_or_shutdown() {
+        use std::os::unix::net::UnixStream;
+        let path =
+            std::env::temp_dir().join(format!("wmcterm-stalled-{}.sock", uuid::Uuid::new_v4()));
+        let server =
+            UnixServer::spawn(&path, |request| Response::success(request.id, json!(true))).unwrap();
+        let stalled = UnixStream::connect(&path).unwrap();
+        let response = call(
+            &path,
+            &Request {
+                id: "healthy".into(),
+                method: "test".into(),
+                params: json!({}),
+            },
+        )
+        .unwrap();
+        assert_eq!(response.result, Some(json!(true)));
+        let started = std::time::Instant::now();
+        drop(server);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        drop(stalled);
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn connection_capacity_is_released_with_the_permit() {
+        let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let permits: Vec<_> = (0..MAX_CONNECTIONS)
+            .map(|_| ConnectionPermit::acquire(&active).unwrap())
+            .collect();
+        assert!(ConnectionPermit::acquire(&active).is_none());
+        drop(permits);
+        assert!(ConnectionPermit::acquire(&active).is_some());
+    }
 
     #[test]
     fn request_round_trips_over_unix_socket() {

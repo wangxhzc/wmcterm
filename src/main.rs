@@ -146,6 +146,8 @@ fn print_help() {
          \x20 wmcterm pane close ID | close-others [--anchor ID]\n\
          \x20 wmcterm surface new [--pane ID|--surface ID] [--no-focus] [--command CMD] [--cwd DIR] [--env KEY=VALUE] [--title TITLE]\n\
          \x20 wmcterm surface markdown|logs PATH [--workspace ID|--pane ID|--surface ID] [--no-focus]\n\
+         \x20   Logs: 1 MiB per refresh, 8 MiB retained text, 64 KiB per line\n\
+         \x20   IPC: 1 MiB request frames, 5s read/write inactivity timeout\n\
          \x20 wmcterm surface close [ID] | close-others [--anchor ID]\n\
          \x20 wmcterm send [--surface ID] TEXT...\n\
          \x20 wmcterm send-line [--surface ID] TEXT...\n\

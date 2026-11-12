@@ -1,5 +1,9 @@
 use std::ffi::{OsStr, OsString};
 use std::io::{Read, Write};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 #[cfg(any(unix, windows))]
@@ -114,9 +118,47 @@ pub enum PtyEvent {
 
 /// Handle to an interactive PTY actor. Dropping it requests shutdown.
 pub struct PtySession {
-    commands: flume::Sender<PtyCommand>,
+    commands: flume::Sender<QueuedCommand>,
     events: flume::Receiver<PtyEvent>,
     worker: Option<JoinHandle<()>>,
+    stopped: Arc<AtomicBool>,
+    input_bytes: Arc<AtomicUsize>,
+}
+
+const MAX_QUEUED_INPUT_BYTES: usize = 16 * 1024 * 1024;
+
+struct InputPermit {
+    bytes: usize,
+    budget: Arc<AtomicUsize>,
+}
+impl Drop for InputPermit {
+    fn drop(&mut self) {
+        self.budget.fetch_sub(self.bytes, Ordering::AcqRel);
+    }
+}
+struct QueuedCommand {
+    command: PtyCommand,
+    permit: InputPermit,
+}
+
+#[derive(Clone)]
+struct EventSender {
+    sender: flume::Sender<PtyEvent>,
+    stopped: Arc<AtomicBool>,
+}
+impl EventSender {
+    fn send(&self, mut event: PtyEvent) -> Result<(), ()> {
+        loop {
+            if self.stopped.load(Ordering::Acquire) {
+                return Err(());
+            }
+            match self.sender.send_timeout(event, Duration::from_millis(10)) {
+                Ok(()) => return Ok(()),
+                Err(flume::SendTimeoutError::Timeout(value)) => event = value,
+                Err(flume::SendTimeoutError::Disconnected(_)) => return Err(()),
+            }
+        }
+    }
 }
 
 const MAX_PENDING_PROTOCOL_REPLIES: usize = 8;
@@ -136,8 +178,13 @@ impl PtySession {
         drop(pair.slave);
         let reader = pair.master.try_clone_reader()?;
         let writer = pair.master.take_writer()?;
-        let (command_tx, command_rx) = flume::unbounded();
-        let (event_tx, event_rx) = flume::unbounded();
+        let (command_tx, command_rx) = flume::bounded(128);
+        let (event_tx, event_rx) = flume::bounded(64);
+        let stopped = Arc::new(AtomicBool::new(false));
+        let event_tx = EventSender {
+            sender: event_tx,
+            stopped: stopped.clone(),
+        };
         let worker = thread::Builder::new()
             .name("wmcterm-pty".into())
             .spawn(move || run_actor(pair.master, child, reader, writer, command_rx, event_tx))?;
@@ -145,11 +192,41 @@ impl PtySession {
             commands: command_tx,
             events: event_rx,
             worker: Some(worker),
+            stopped,
+            input_bytes: Arc::new(AtomicUsize::new(0)),
         })
     }
 
     pub fn send(&self, command: PtyCommand) -> Result<(), flume::SendError<PtyCommand>> {
-        self.commands.send(command)
+        if matches!(command, PtyCommand::Shutdown) {
+            self.stopped.store(true, Ordering::Release);
+            return Ok(());
+        }
+        let bytes = match &command {
+            PtyCommand::Input(bytes) => bytes.len(),
+            _ => 0,
+        }
+        .max(256);
+        if self
+            .input_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                used.checked_add(bytes)
+                    .filter(|total| *total <= MAX_QUEUED_INPUT_BYTES)
+            })
+            .is_err()
+        {
+            return Err(flume::SendError(command));
+        }
+        let queued = QueuedCommand {
+            command,
+            permit: InputPermit {
+                bytes,
+                budget: self.input_bytes.clone(),
+            },
+        };
+        self.commands
+            .try_send(queued)
+            .map_err(|error| flume::SendError(error.into_inner().command))
     }
 
     /// Queue a terminal-generated protocol reply without allowing hostile
@@ -165,7 +242,7 @@ impl PtySession {
         if self.commands.len() >= MAX_PENDING_PROTOCOL_REPLIES {
             return Ok(false);
         }
-        self.commands.send(PtyCommand::Input(bytes)).map(|()| true)
+        self.send(PtyCommand::Input(bytes)).map(|()| true)
     }
 
     pub fn events(&self) -> &flume::Receiver<PtyEvent> {
@@ -175,7 +252,7 @@ impl PtySession {
 
 impl Drop for PtySession {
     fn drop(&mut self) {
-        let _ = self.commands.send(PtyCommand::Shutdown);
+        self.stopped.store(true, Ordering::Release);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -187,12 +264,12 @@ fn run_actor(
     mut child: Box<dyn portable_pty::Child + Send + Sync>,
     mut reader: Box<dyn Read + Send>,
     mut writer: Box<dyn Write + Send>,
-    commands: flume::Receiver<PtyCommand>,
-    events: flume::Sender<PtyEvent>,
+    commands: flume::Receiver<QueuedCommand>,
+    events: EventSender,
 ) {
     #[cfg(any(unix, windows))]
     let root_process_id = child.process_id();
-    let (output_tx, output_rx) = flume::unbounded();
+    let (output_tx, output_rx) = flume::bounded(64);
     thread::spawn(move || {
         let mut buffer = [0_u8; 16 * 1024];
         loop {
@@ -214,10 +291,10 @@ fn run_actor(
     // consuming input (a large paste is the common case). Keep that blocking
     // syscall off the lifecycle actor so Shutdown can still kill the child and
     // let TerminalSession::drop return without freezing the UI thread.
-    let (input_tx, input_rx) = flume::unbounded::<Vec<u8>>();
+    let (input_tx, input_rx) = flume::unbounded::<(Vec<u8>, InputPermit)>();
     let writer_events = events.clone();
     thread::spawn(move || {
-        while let Ok(bytes) = input_rx.recv() {
+        while let Ok((bytes, _permit)) = input_rx.recv() {
             if let Err(error) = writer.write_all(&bytes).and_then(|_| writer.flush()) {
                 let _ = writer_events.send(PtyEvent::Error(error.to_string()));
                 return;
@@ -233,7 +310,12 @@ fn run_actor(
     let mut last_children = Vec::new();
 
     loop {
-        while let Ok(bytes) = output_rx.try_recv() {
+        if events.stopped.load(Ordering::Acquire) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return;
+        }
+        for bytes in output_rx.try_iter().take(64) {
             if events.send(PtyEvent::Output(bytes)).is_err() {
                 let _ = child.kill();
                 return;
@@ -278,7 +360,9 @@ fn run_actor(
         match child.try_wait() {
             Ok(Some(status)) => {
                 while let Ok(bytes) = output_rx.recv_timeout(Duration::from_millis(10)) {
-                    let _ = events.send(PtyEvent::Output(bytes));
+                    if events.send(PtyEvent::Output(bytes)).is_err() {
+                        return;
+                    }
                 }
                 let _ = events.send(PtyEvent::Exited(status));
                 return;
@@ -290,18 +374,28 @@ fn run_actor(
             Ok(None) => {}
         }
         match commands.recv_timeout(Duration::from_millis(8)) {
-            Ok(PtyCommand::Input(bytes)) => {
-                if input_tx.send(bytes).is_err() {
+            Ok(QueuedCommand {
+                command: PtyCommand::Input(bytes),
+                permit,
+            }) => {
+                if input_tx.send((bytes, permit)).is_err() {
                     let _ = events.send(PtyEvent::Error("PTY writer stopped".into()));
                     return;
                 }
             }
-            Ok(PtyCommand::Resize(size)) => {
+            Ok(QueuedCommand {
+                command: PtyCommand::Resize(size),
+                ..
+            }) => {
                 if let Err(error) = master.resize(size.into()) {
                     let _ = events.send(PtyEvent::Error(error.to_string()));
                 }
             }
-            Ok(PtyCommand::Shutdown) | Err(flume::RecvTimeoutError::Disconnected) => {
+            Ok(QueuedCommand {
+                command: PtyCommand::Shutdown,
+                ..
+            })
+            | Err(flume::RecvTimeoutError::Disconnected) => {
                 let _ = child.kill();
                 let _ = child.wait();
                 return;
@@ -493,6 +587,36 @@ pub fn run_to_end(command: &CommandSpec, size: PtySize) -> Result<PtyOutput, Pty
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shutdown_remains_responsive_with_unconsumed_output() {
+        let session = PtySession::spawn(
+            CommandSpec::new("sh").args(["-c", "while :; do printf '%4096s' x; done"]),
+            PtySize::new(80, 24),
+        )
+        .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(session.events.len() <= 64);
+        let started = Instant::now();
+        drop(session);
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn input_budget_rejects_excess_without_consuming_capacity() {
+        let session = PtySession::spawn(
+            CommandSpec::new("sh").args(["-c", "sleep 10"]),
+            PtySize::new(80, 24),
+        )
+        .unwrap();
+        assert!(
+            session
+                .send(PtyCommand::Input(vec![b'x'; MAX_QUEUED_INPUT_BYTES + 1]))
+                .is_err()
+        );
+        assert_eq!(session.input_bytes.load(Ordering::Acquire), 0);
+        assert!(session.send(PtyCommand::Input(b"ok".to_vec())).is_ok());
+    }
 
     #[test]
     fn captures_output_from_a_real_pty() {

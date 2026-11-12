@@ -19,6 +19,13 @@ unless explicitly overridden in user keybindings.
 
 Use `wmcterm` as the stable control interface. Start with `wmcterm capabilities`
 when the protocol is uncertain.
+Capabilities include IPC limits (1 MiB request frames, 32 MiB response frames,
+16 connections and a five-second I/O inactivity timeout), background document
+refresh and session checkpoint intervals. Logs load incrementally in 1 MiB
+batches, retaining at most 8 MiB of text and 64 KiB per line. Input overload
+rejects the command; do not assume a failed send was submitted or blindly retry
+commands with side effects. Session changes are checkpointed every five seconds;
+history is sampled every sixty seconds and saved again on normal exit.
 Use `wmcterm diagnostics` (`app.diagnostics`) to inspect running/client binary
 paths, provider versions, observed Hook source and per-terminal input protocols.
 It does not change configuration or installation. New Hook receivers timestamp

@@ -16,7 +16,9 @@ use thiserror::Error;
 use wmcterm_agent::{AgentEvent, OscEvent, OscScanner};
 use wmcterm_pty::{CommandSpec, PtyCommand, PtyEvent, PtySession, PtySize};
 
+mod runtime_queue;
 mod ssh;
+use runtime_queue::{RuntimeControl, TerminalEventSender};
 
 /// Ghostty measures scrollback capacity in bytes, not rows. Keep the standalone
 /// terminal constructors aligned with Ghostty's default allocation.
@@ -949,6 +951,7 @@ pub enum SessionCommand {
     ExportHistory(std::sync::mpsc::SyncSender<String>),
     RestoreHistory(String),
     SetTheme(TerminalTheme),
+    Wake,
     Shutdown,
 }
 
@@ -970,6 +973,7 @@ pub enum SessionEvent {
     SearchResult(SearchResult),
     Exited(String),
     Warning(String),
+    InputRejected,
     Error(String),
 }
 
@@ -991,6 +995,7 @@ pub struct TerminalSession {
     events: flume::Receiver<SessionEvent>,
     worker: Option<JoinHandle<()>>,
     final_ssh_status: std::sync::Arc<std::sync::Mutex<Option<serde_json::Value>>>,
+    control: RuntimeControl,
 }
 
 impl TerminalSession {
@@ -1045,8 +1050,10 @@ impl TerminalSession {
         let command = command.with_bash_rc(&ssh.local_rc());
         let pty = PtySession::spawn(command, PtySize::new(size.cols, size.rows))
             .map_err(|error| TerminalError::Runtime(error.to_string()))?;
-        let (command_tx, command_rx) = flume::unbounded();
-        let (event_tx, event_rx) = flume::unbounded();
+        let (command_tx, command_rx) = flume::bounded(128);
+        let (event_tx, event_rx) = flume::bounded(64);
+        let control = RuntimeControl::default();
+        let event_tx = TerminalEventSender::new(event_tx, control.clone());
         let worker = thread::Builder::new()
             .name("wmcterm-terminal".into())
             .spawn(move || {
@@ -1070,23 +1077,38 @@ impl TerminalSession {
             events: event_rx,
             worker: Some(worker),
             final_ssh_status,
+            control,
         })
     }
     pub fn send(&self, command: SessionCommand) -> Result<(), flume::SendError<SessionCommand>> {
-        self.commands.send(command)
+        if matches!(command, SessionCommand::Shutdown) {
+            self.control.stop();
+        }
+        if !self.control.reserve(&command) {
+            let _ = self.commands.try_send(SessionCommand::Wake);
+            return Err(flume::SendError(command));
+        }
+        self.commands.try_send(command).map_err(|error| {
+            let command = error.into_inner();
+            self.control.release(&command);
+            self.control.reject();
+            flume::SendError(command)
+        })
     }
     pub fn events(&self) -> &flume::Receiver<SessionEvent> {
         &self.events
     }
 
     pub fn export_history(&self) -> Option<String> {
-        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
-        self.commands
-            .send(SessionCommand::ExportHistory(sender))
-            .ok()?;
-        receiver
+        self.request_history()?
             .recv_timeout(std::time::Duration::from_millis(500))
             .ok()
+    }
+
+    pub fn request_history(&self) -> Option<std::sync::mpsc::Receiver<String>> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        self.send(SessionCommand::ExportHistory(sender)).ok()?;
+        Some(receiver)
     }
 
     pub fn ssh_request(
@@ -1121,7 +1143,8 @@ impl TerminalSession {
 
 impl Drop for TerminalSession {
     fn drop(&mut self) {
-        let _ = self.commands.send(SessionCommand::Shutdown);
+        self.control.stop();
+        let _ = self.commands.try_send(SessionCommand::Shutdown);
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -1170,7 +1193,7 @@ impl OutputSnapshotSchedule {
 
 fn publish_snapshot(
     engine: &mut TerminalEngine,
-    events: &flume::Sender<SessionEvent>,
+    events: &TerminalEventSender,
     schedule: &mut OutputSnapshotSchedule,
     force: bool,
 ) {
@@ -1249,7 +1272,7 @@ fn drain_terminal_effects(
 fn forward_terminal_effects(
     engine: &TerminalEngine,
     pty: &PtySession,
-    events: &flume::Sender<SessionEvent>,
+    events: &TerminalEventSender,
     reply_limiter: &mut ProtocolReplyLimiter,
     reply_limit_warned: &mut bool,
 ) {
@@ -1285,7 +1308,7 @@ fn process_pty_output_chunk(
     engine: &mut TerminalEngine,
     osc: &mut OscScanner,
     pty: &PtySession,
-    events: &flume::Sender<SessionEvent>,
+    events: &TerminalEventSender,
     reply_limiter: &mut ProtocolReplyLimiter,
     reply_limit_warned: &mut bool,
 ) {
@@ -1327,7 +1350,7 @@ fn run_terminal_actor(
     history: Option<String>,
     theme: Option<TerminalTheme>,
     commands: flume::Receiver<SessionCommand>,
-    events: flume::Sender<SessionEvent>,
+    events: TerminalEventSender,
     mut ssh: ssh::SshState,
 ) {
     let Ok(mut engine) =
@@ -1370,6 +1393,12 @@ fn run_terminal_actor(
         SnapshotDeadline,
     }
     loop {
+        if events.control.is_stopped() {
+            return;
+        }
+        if events.control.take_rejected() {
+            let _ = events.send(SessionEvent::InputRejected);
+        }
         let now = std::time::Instant::now();
         if snapshot_schedule.is_due(now) && !engine.synchronized_output() {
             publish_snapshot(&mut engine, &events, &mut snapshot_schedule, false);
@@ -1393,6 +1422,9 @@ fn run_terminal_actor(
             }
         };
         let Some(incoming) = incoming else { return };
+        if let Incoming::Command(command) = &incoming {
+            events.control.release(command);
+        }
         match incoming {
             Incoming::Command(SessionCommand::Ssh {
                 method,
@@ -1427,7 +1459,7 @@ fn run_terminal_actor(
                 if engine.scroll_to_bottom() {
                     publish_snapshot(&mut engine, &events, &mut snapshot_schedule, false);
                 }
-                let _ = pty.send(PtyCommand::Input(bytes));
+                runtime_queue::send_pty_input(&pty, &events, bytes);
             }
             Incoming::Command(SessionCommand::Key(input)) => {
                 if let Ok(bytes) = engine.encode_key(&input) {
@@ -1437,21 +1469,21 @@ fn run_terminal_actor(
                     if engine.scroll_to_bottom() {
                         publish_snapshot(&mut engine, &events, &mut snapshot_schedule, false);
                     }
-                    let _ = pty.send(PtyCommand::Input(bytes));
+                    runtime_queue::send_pty_input(&pty, &events, bytes);
                 }
             }
             Incoming::Command(SessionCommand::KeyRelease(input)) => {
                 if let Ok(bytes) = engine.encode_key_release(&input)
                     && !bytes.is_empty()
                 {
-                    let _ = pty.send(PtyCommand::Input(bytes));
+                    runtime_queue::send_pty_input(&pty, &events, bytes);
                 }
             }
             Incoming::Command(SessionCommand::Focus(focused)) => {
                 if let Ok(bytes) = engine.encode_focus(focused)
                     && !bytes.is_empty()
                 {
-                    let _ = pty.send(PtyCommand::Input(bytes));
+                    runtime_queue::send_pty_input(&pty, &events, bytes);
                 }
             }
             Incoming::Command(SessionCommand::Paste(text)) => {
@@ -1462,7 +1494,7 @@ fn run_terminal_actor(
                     if engine.scroll_to_bottom() {
                         publish_snapshot(&mut engine, &events, &mut snapshot_schedule, false);
                     }
-                    let _ = pty.send(PtyCommand::Input(bytes));
+                    runtime_queue::send_pty_input(&pty, &events, bytes);
                 }
             }
             Incoming::Command(SessionCommand::PasteLine(text)) => {
@@ -1472,7 +1504,7 @@ fn run_terminal_actor(
                     if engine.scroll_to_bottom() {
                         publish_snapshot(&mut engine, &events, &mut snapshot_schedule, false);
                     }
-                    let _ = pty.send(PtyCommand::Input(bytes));
+                    runtime_queue::send_pty_input(&pty, &events, bytes);
                 }
             }
             Incoming::Command(SessionCommand::CopyAll) => match engine.select_all_text() {
@@ -1499,7 +1531,7 @@ fn run_terminal_actor(
             Incoming::Command(SessionCommand::Mouse(input)) => match engine.encode_mouse(input) {
                 Ok(bytes) if !bytes.is_empty() => {
                     ssh.user_input();
-                    let _ = pty.send(PtyCommand::Input(bytes));
+                    runtime_queue::send_pty_input(&pty, &events, bytes);
                 }
                 Ok(_) => {}
                 Err(error) => {
@@ -1551,10 +1583,11 @@ fn run_terminal_actor(
                 }
             }
             Incoming::Command(SessionCommand::Shutdown) => return,
+            Incoming::Command(SessionCommand::Wake) => {}
             Incoming::Pty(PtyEvent::Output(bytes)) => {
                 ssh.feed(&bytes);
                 if let Some(bytes) = ssh.take_dispatch_output() {
-                    let _ = pty.send(PtyCommand::Input(bytes));
+                    runtime_queue::send_pty_input(&pty, &events, bytes);
                 }
                 process_pty_output_chunk(
                     &bytes,

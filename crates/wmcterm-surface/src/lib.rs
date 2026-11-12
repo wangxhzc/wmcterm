@@ -9,10 +9,15 @@ use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use thiserror::Error;
 use uuid::Uuid;
+
+pub const MAX_LOG_LINE_BYTES: usize = 64 * 1024;
+pub const MAX_LOG_HISTORY_BYTES: usize = 8 * 1024 * 1024;
+pub const LOG_READ_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SurfaceKind {
@@ -28,7 +33,7 @@ pub struct SearchMatch {
     pub text: String,
 }
 
-pub trait SurfaceBackend {
+pub trait SurfaceBackend: Send {
     fn id(&self) -> Uuid;
     fn title(&self) -> &str;
     fn render_text(&self) -> String;
@@ -240,8 +245,8 @@ impl MarkdownDocument {
 pub struct MarkdownSurface {
     id: Uuid,
     path: PathBuf,
-    source: String,
-    document: MarkdownDocument,
+    source: Arc<String>,
+    document: Arc<MarkdownDocument>,
     modified: Option<SystemTime>,
     file_backed: bool,
 }
@@ -259,8 +264,8 @@ impl MarkdownSurface {
         Ok(Self {
             id: Uuid::new_v4(),
             path: path.into(),
-            document: MarkdownDocument::parse(&source),
-            source,
+            document: Arc::new(MarkdownDocument::parse(&source)),
+            source: Arc::new(source),
             modified,
             file_backed: true,
         })
@@ -271,8 +276,8 @@ impl MarkdownSurface {
         Self {
             id: Uuid::new_v4(),
             path: title.into(),
-            document: MarkdownDocument::parse(&source),
-            source,
+            document: Arc::new(MarkdownDocument::parse(&source)),
+            source: Arc::new(source),
             modified: None,
             file_backed: false,
         }
@@ -298,10 +303,10 @@ impl MarkdownSurface {
         let modified = metadata.modified().ok();
         // Some file systems have coarse timestamps, so compare contents as well.
         let source = fs::read_to_string(&self.path)?;
-        let changed = source != self.source;
+        let changed = source.as_str() != self.source.as_str();
         if changed {
-            self.document = MarkdownDocument::parse(&source);
-            self.source = source;
+            self.document = Arc::new(MarkdownDocument::parse(&source));
+            self.source = Arc::new(source);
         }
         self.modified = modified;
         Ok(changed)
@@ -325,7 +330,7 @@ impl SurfaceBackend for MarkdownSurface {
     }
 
     fn render_text(&self) -> String {
-        self.source.clone()
+        self.source.as_ref().clone()
     }
 
     fn kind(&self) -> SurfaceKind {
@@ -410,13 +415,14 @@ pub struct LogSurface {
     id: Uuid,
     title: String,
     capacity: usize,
-    lines: VecDeque<LogEntry>,
+    lines: Arc<VecDeque<LogEntry>>,
     next_number: u64,
     filter: LogFilter,
     path: Option<PathBuf>,
     offset: u64,
     pending: Vec<u8>,
     file_prefix: Vec<u8>,
+    history_bytes: usize,
 }
 
 impl LogSurface {
@@ -425,17 +431,18 @@ impl LogSurface {
             id: Uuid::new_v4(),
             title: title.into(),
             capacity: capacity.max(1),
-            lines: VecDeque::new(),
+            lines: Arc::new(VecDeque::new()),
             next_number: 1,
             filter: LogFilter::default(),
             path: None,
             offset: 0,
             pending: Vec::new(),
             file_prefix: Vec::new(),
+            history_bytes: 0,
         }
     }
 
-    /// Open a file and ingest its existing contents, retaining only `capacity` lines.
+    /// Open a file and ingest its first bounded batch; refresh ingests the rest.
     pub fn open(path: &Path, capacity: usize) -> Result<Self, SurfaceError> {
         let title = path
             .file_name()
@@ -473,17 +480,27 @@ impl LogSurface {
     }
 
     pub fn push(&mut self, line: impl Into<String>) {
-        let text = line.into();
+        let mut text = line.into();
+        let mut end = text.len().min(MAX_LOG_LINE_BYTES);
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        text.truncate(end);
         let entry = LogEntry {
             number: self.next_number,
             level: LogLevel::detect(&text),
             text,
         };
         self.next_number += 1;
-        if self.lines.len() == self.capacity {
-            self.lines.pop_front();
+        while self.lines.len() >= self.capacity
+            || self.history_bytes + entry.text.len() > MAX_LOG_HISTORY_BYTES
+        {
+            if let Some(old) = Arc::make_mut(&mut self.lines).pop_front() {
+                self.history_bytes -= old.text.len();
+            }
         }
-        self.lines.push_back(entry);
+        self.history_bytes += entry.text.len();
+        Arc::make_mut(&mut self.lines).push_back(entry);
     }
 
     /// Read bytes appended since the last call. A partial final line is held until a
@@ -507,30 +524,25 @@ impl LogSurface {
         self.file_prefix = prefix;
         file.seek(SeekFrom::Start(self.offset))?;
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes)?;
-        self.offset = length;
+        file.take(length.saturating_sub(self.offset).min(LOG_READ_BYTES))
+            .read_to_end(&mut bytes)?;
+        self.offset += bytes.len() as u64;
         if bytes.is_empty() {
             return Ok(false);
         }
 
-        self.pending.extend(bytes);
-        let mut complete_through = 0;
-        let mut complete_lines = Vec::new();
-        for (index, byte) in self.pending.iter().enumerate() {
-            if *byte == b'\n' {
-                let mut line = &self.pending[complete_through..index];
+        for byte in bytes {
+            if byte == b'\n' {
+                let mut line = self.pending.as_slice();
                 if line.last() == Some(&b'\r') {
                     line = &line[..line.len() - 1];
                 }
-                complete_lines.push(String::from_utf8_lossy(line).into_owned());
-                complete_through = index + 1;
+                let line = String::from_utf8_lossy(line).into_owned();
+                self.push(line);
+                self.pending.clear();
+            } else if self.pending.len() < MAX_LOG_LINE_BYTES {
+                self.pending.push(byte);
             }
-        }
-        if complete_through != 0 {
-            self.pending.drain(..complete_through);
-        }
-        for line in complete_lines {
-            self.push(line);
         }
         Ok(true)
     }
@@ -658,6 +670,50 @@ mod tests {
         logs.push("three");
         assert_eq!(logs.render_text(), "two\nthree");
         assert_eq!(logs.entries().front().unwrap().number, 2);
+    }
+
+    #[test]
+    fn log_reads_bounded_batches_without_skipping_or_repeating_bytes() {
+        let path = temp_file("large.log");
+        let line = "INFO bounded\n";
+        let count = LOG_READ_BYTES as usize / line.len() + 100;
+        fs::write(&path, line.repeat(count)).unwrap();
+        let mut logs = LogSurface::open(&path, count).unwrap();
+        assert_eq!(logs.offset, LOG_READ_BYTES);
+        assert!(logs.read_appended().unwrap());
+        assert_eq!(logs.entries().len(), count);
+        assert_eq!(logs.next_number, count as u64 + 1);
+        assert!(!logs.read_appended().unwrap());
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn log_bounds_unterminated_lines_and_unicode_history() {
+        let path = temp_file("unterminated.log");
+        fs::write(&path, vec![b'x'; LOG_READ_BYTES as usize + 10]).unwrap();
+        let mut logs = LogSurface::open(&path, 1000).unwrap();
+        assert!(logs.pending.len() <= MAX_LOG_LINE_BYTES);
+        logs.read_appended().unwrap();
+        assert_eq!(logs.pending.len(), MAX_LOG_LINE_BYTES);
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"\nINFO next\n")
+            .unwrap();
+        logs.read_appended().unwrap();
+        assert_eq!(logs.entries()[0].text.len(), MAX_LOG_LINE_BYTES);
+        assert_eq!(logs.entries()[1].text, "INFO next");
+        for _ in 0..200 {
+            logs.push("中".repeat(MAX_LOG_LINE_BYTES));
+        }
+        assert!(logs.history_bytes <= MAX_LOG_HISTORY_BYTES);
+        assert!(
+            logs.entries()
+                .iter()
+                .all(|entry| entry.text.len() <= MAX_LOG_LINE_BYTES)
+        );
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

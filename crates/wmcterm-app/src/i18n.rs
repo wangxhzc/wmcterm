@@ -527,6 +527,14 @@ impl Language {
         }
     }
 
+    pub(crate) const fn terminal_input_rejected(self) -> &'static str {
+        if self.is_chinese() {
+            "输入队列已满或不可用，输入未提交"
+        } else {
+            "Input queue full or unavailable; input was not submitted"
+        }
+    }
+
     pub(crate) fn terminal_spawn_failed(self, error: &str) -> String {
         if self.is_chinese() {
             format!("无法启动终端：{error}")
@@ -653,6 +661,14 @@ mod tests {
 
     #[test]
     fn terminal_lifecycle_messages_keep_details_in_both_languages() {
+        assert_eq!(
+            Language::English.terminal_input_rejected(),
+            "Input queue full or unavailable; input was not submitted"
+        );
+        assert_eq!(
+            Language::SimplifiedChinese.terminal_input_rejected(),
+            "输入队列已满或不可用，输入未提交"
+        );
         assert_eq!(
             Language::English.terminal_exited("exit code 7"),
             "Terminal process exited (exit code 7) · Enter reconnect · Ctrl+D close"

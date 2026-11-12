@@ -1,14 +1,19 @@
+mod agent_coordinator;
 #[cfg(test)]
 mod claude_regression;
 mod codex_restore;
 mod codex_tool_hooks;
+mod document_refresh;
 #[cfg(test)]
 mod focus_regression;
 mod i18n;
 #[cfg(test)]
 mod input_regression;
+mod rpc;
+mod session_persistence;
 mod session_start_guard;
 mod system_proxy;
+mod terminal_runtime;
 mod text_edit;
 mod ui;
 
@@ -349,6 +354,29 @@ struct TaggedEvent {
     event: SessionEvent,
 }
 
+#[derive(Clone)]
+enum AppEventProxy {
+    Window(EventLoopProxy<UserEvent>),
+    #[cfg(test)]
+    Headless,
+}
+
+impl AppEventProxy {
+    fn send_event(&self, event: UserEvent) -> Result<(), ()> {
+        match self {
+            Self::Window(proxy) => proxy.send_event(event).map_err(|_| ()),
+            #[cfg(test)]
+            Self::Headless => Ok(()),
+        }
+    }
+}
+
+impl From<EventLoopProxy<UserEvent>> for AppEventProxy {
+    fn from(proxy: EventLoopProxy<UserEvent>) -> Self {
+        Self::Window(proxy)
+    }
+}
+
 struct TerminalRuntime {
     session: TerminalSession,
     snapshot: ScreenSnapshot,
@@ -356,6 +384,7 @@ struct TerminalRuntime {
     size: TerminalSize,
     cell_metrics_px: (u32, u32),
     lifecycle_id: String,
+    bridge_stopped: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -681,6 +710,7 @@ const WORKSPACE_CONTEXT_ACTIONS: [WorkspaceContextAction; 7] = [
 enum TerminalNotice {
     Exited(String),
     Warning(String),
+    InputRejected,
     Error(String),
     SpawnFailed(String),
 }
@@ -688,7 +718,7 @@ enum TerminalNotice {
 fn terminal_notice_attention(notice: &TerminalNotice) -> Option<AttentionState> {
     match notice {
         TerminalNotice::Exited(_) => Some(AttentionState::Activity),
-        TerminalNotice::Warning(_) => None,
+        TerminalNotice::Warning(_) | TerminalNotice::InputRejected => None,
         TerminalNotice::Error(_) | TerminalNotice::SpawnFailed(_) => Some(AttentionState::Error),
     }
 }
@@ -792,85 +822,9 @@ pub fn run() -> Result<()> {
         restored_codex,
     )?;
     event_loop.run_app(&mut app)?;
-    if let Some(path) = state_path() {
-        let terminals = app
-            .state
-            .surfaces
-            .values()
-            .filter_map(|surface| {
-                if let SurfaceKind::Terminal(id) = surface.kind {
-                    Some(id)
-                } else {
-                    None
-                }
-            })
-            .map(|terminal_id| {
-                let runtime = app.terminals.get(&terminal_id);
-                let resume = app
-                    .managed_codex
-                    .get(&terminal_id)
-                    .filter(|codex| !codex.saved.session_id.is_empty())
-                    .map(|codex| PersistedAgentResume {
-                        agent: AgentResumeInfo::Codex {
-                            session_id: codex.saved.session_id.clone(),
-                        },
-                        managed: true,
-                    })
-                    .or_else(|| {
-                        resume_info(
-                            &app.state,
-                            &app.agent_sessions,
-                            &app.foreground_agents,
-                            terminal_id,
-                        )
-                    });
-                TerminalResume {
-                    managed_codex: app
-                        .managed_codex
-                        .get(&terminal_id)
-                        .map(|codex| codex.saved.clone()),
-                    terminal_id,
-                    cwd: app
-                        .managed_codex
-                        .get(&terminal_id)
-                        .and_then(|codex| codex.cwd.clone())
-                        .or_else(|| app.cwd_for_terminal(terminal_id))
-                        .unwrap_or_else(|| env::current_dir().unwrap_or_default()),
-                    command: match resume.as_ref() {
-                        Some(resume) if resume.managed => None,
-                        Some(resume) => Some(manual_agent_resume_command(&resume.agent.command())),
-                        None => app
-                            .commands
-                            .get(&terminal_id)
-                            .filter(|command| {
-                                !is_manual_agent_resume_command(command)
-                                    || can_preserve_manual_resume(
-                                        &app.state,
-                                        &app.agent_sessions,
-                                        terminal_id,
-                                    )
-                            })
-                            .cloned(),
-                    },
-                    agent: resume.map(|resume| resume.agent),
-                    scrollback: runtime
-                        .and_then(|runtime| runtime.session.export_history())
-                        .or_else(|| app.restored_history.get(&terminal_id).cloned()),
-                }
-            })
-            .collect();
-        let mut session = Session {
-            version: SESSION_VERSION,
-            app: app.state.clone(),
-            terminals,
-            agent_sessions: app.agent_sessions.into_values().collect(),
-            window: Some(WindowState {
-                width: app.window_size.width.max(600),
-                height: app.window_size.height.max(360),
-            }),
-        };
-        discard_unavailable_codex_resumes(&mut session);
-        save_session(&path, &session).context("saving wmcterm session")?;
+    let session = app.session_snapshot(true);
+    if let Some(mut persistence) = app.session_persistence.take() {
+        persistence.finish(session)?;
     }
     Ok(())
 }
@@ -1106,8 +1060,9 @@ struct WmctermApplication {
     state: AppState,
     terminals: HashMap<TerminalId, TerminalRuntime>,
     pending: Arc<Mutex<VecDeque<TaggedEvent>>>,
+    pending_ready: Arc<std::sync::Condvar>,
     wake_pending: Arc<AtomicBool>,
-    proxy: EventLoopProxy<UserEvent>,
+    proxy: AppEventProxy,
     modifiers: ModifiersState,
     physical_alt_pressed: bool,
     pending_unmodified_tab: Option<(KeyEvent, std::time::Instant)>,
@@ -1170,6 +1125,8 @@ struct WmctermApplication {
     restored_history: HashMap<TerminalId, String>,
     keybindings: ResolvedKeybindings,
     surface_backends: HashMap<SurfaceId, Box<dyn SurfaceBackend>>,
+    document_refresh: document_refresh::DocumentRefresh,
+    session_persistence: Option<session_persistence::SessionPersistence>,
     config_reloader: Option<ConfigReloader>,
     last_metadata_refresh: std::time::Instant,
     language: Language,
@@ -1223,7 +1180,7 @@ impl WmctermApplication {
         restored_codex: HashMap<TerminalId, ManagedCodexRuntime>,
     ) -> Result<Self> {
         Self::new_configured(
-            proxy,
+            proxy.into(),
             config,
             restored,
             commands,
@@ -1237,7 +1194,7 @@ impl WmctermApplication {
 
     #[allow(clippy::too_many_arguments)]
     fn new_configured(
-        proxy: EventLoopProxy<UserEvent>,
+        proxy: AppEventProxy,
         config: Config,
         restored: Option<AppState>,
         mut commands: HashMap<TerminalId, String>,
@@ -1318,12 +1275,22 @@ impl WmctermApplication {
         let config_reloader =
             wmcterm_config::config_path().map(|path| ConfigReloader::new(vec![path]));
         let language = Language::resolve(config.ui.language);
+        let session_persistence = if enable_ipc {
+            state_path()
+                .map(|path| {
+                    session_persistence::SessionPersistence::new(path, restored_history.clone())
+                })
+                .transpose()?
+        } else {
+            None
+        };
         let mut app = Self {
             managed_codex: restored_codex,
             renderer: None,
             state,
             terminals: HashMap::new(),
             pending,
+            pending_ready: Arc::new(std::sync::Condvar::new()),
             wake_pending,
             proxy,
             modifiers: ModifiersState::empty(),
@@ -1389,6 +1356,8 @@ impl WmctermApplication {
             restored_history,
             keybindings,
             surface_backends: HashMap::new(),
+            document_refresh: document_refresh::DocumentRefresh::new()?,
+            session_persistence,
             config_reloader,
             last_metadata_refresh: std::time::Instant::now(),
             language,
@@ -1649,12 +1618,15 @@ impl WmctermApplication {
             self.terminal_mouse_capture = None;
         }
         self.automatic_agent_status.remove(&id);
+        let bridge_stopped = Arc::new(AtomicBool::new(false));
         spawn_event_bridge(
             id,
             session.events().clone(),
             Arc::clone(&self.pending),
             Arc::clone(&self.wake_pending),
             self.proxy.clone(),
+            self.pending_ready.clone(),
+            bridge_stopped.clone(),
         );
         self.terminals.insert(
             id,
@@ -1678,6 +1650,7 @@ impl WmctermApplication {
                 size,
                 cell_metrics_px: (0, 0),
                 lifecycle_id,
+                bridge_stopped,
             },
         );
         if let Some(command) = options.command {
@@ -1877,6 +1850,7 @@ impl WmctermApplication {
             .expect("PTY event queue poisoned")
             .drain(..)
             .collect();
+        self.pending_ready.notify_all();
         let mut changed = false;
         let mut saw_snapshot = false;
         for tagged in events {
@@ -1917,6 +1891,10 @@ impl WmctermApplication {
                 SessionEvent::Warning(warning) => {
                     tracing::warn!(terminal=%tagged.terminal, %warning, "recoverable terminal error");
                     self.report_terminal_notice(terminal_id, TerminalNotice::Warning(warning));
+                    changed = true;
+                }
+                SessionEvent::InputRejected => {
+                    self.report_terminal_notice(terminal_id, TerminalNotice::InputRejected);
                     changed = true;
                 }
                 SessionEvent::TitleChanged(title) => { if let Some(surface) = self.state.surfaces.values_mut().find(|surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal_id)) { surface.title = title; changed = true; } }
@@ -2098,11 +2076,13 @@ impl WmctermApplication {
     }
 
     fn report_terminal_notice(&mut self, terminal: TerminalId, notice: TerminalNotice) {
-        if matches!(notice, TerminalNotice::Warning(_))
-            && self
-                .terminal_notices
-                .get(&terminal)
-                .is_some_and(terminal_notice_is_error)
+        if matches!(
+            notice,
+            TerminalNotice::Warning(_) | TerminalNotice::InputRejected
+        ) && self
+            .terminal_notices
+            .get(&terminal)
+            .is_some_and(terminal_notice_is_error)
         {
             return;
         }
@@ -2121,911 +2101,6 @@ impl WmctermApplication {
             workspace.status = wmcterm_core::WorkspaceStatus::Error;
         }
         self.terminal_notices.insert(terminal, notice);
-    }
-
-    fn apply_agent_event(
-        &mut self,
-        terminal: TerminalId,
-        event: AgentEvent,
-    ) -> wmcterm_core::AgentState {
-        if !matches!(event, AgentEvent::Notification { .. }) {
-            self.automatic_agent_status.remove(&terminal);
-        }
-        let metadata = self
-            .surface_for_terminal(terminal)
-            .and_then(|surface| self.state.surfaces.get(&surface))
-            .and_then(|surface| surface.agent.as_ref());
-        // Only Codex's automatic reviewer suppresses permission-wait telemetry.
-        let transition_mode = metadata
-            .filter(|agent| agent.name.eq_ignore_ascii_case("codex"))
-            .map(|agent| agent.run_mode)
-            .unwrap_or_default();
-        let transition = agent_transition_for_run_mode(&event, transition_mode);
-        let suppress_notification = non_actionable_agent_exit(&event);
-        let announced = match &event {
-            AgentEvent::SessionStart { agent, session_id } => {
-                Some((agent.clone(), session_id.clone()))
-            }
-            _ => None,
-        };
-        let mut observed_state = wmcterm_core::AgentState::Idle;
-        if let Some(surface) = self
-            .state
-            .surfaces
-            .values_mut()
-            .find(|surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal))
-        {
-            let run_mode = surface
-                .agent
-                .as_ref()
-                .map(|agent| agent.run_mode)
-                .unwrap_or_default();
-            let (name, session_id) = announced.unwrap_or_else(|| {
-                surface
-                    .agent
-                    .as_ref()
-                    .map(|agent| (agent.name.clone(), agent.session_id.clone()))
-                    .unwrap_or_else(|| ("agent".into(), None))
-            });
-            observed_state = transition.state.unwrap_or_else(|| {
-                surface
-                    .agent
-                    .as_ref()
-                    .map(|agent| agent.state)
-                    .unwrap_or_default()
-            });
-            surface.agent = Some(wmcterm_core::AgentMetadata {
-                name,
-                state: observed_state,
-                session_id,
-                run_mode,
-            });
-            if transition.state.is_some() {
-                surface.attention = transition.attention;
-            }
-        }
-        if let Some(message) = transition.notification
-            && !suppress_notification
-        {
-            self.notify_terminal(terminal, &message);
-        }
-        if let Some(index) = self.workspace_for_terminal(terminal) {
-            self.sync_workspace_agent_status(index);
-        }
-        if let Some(surface) = self.surface_for_terminal(terminal) {
-            self.sync_surface_agent_request_state(surface);
-        }
-        observed_state
-    }
-
-    fn record_agent_event(
-        &mut self,
-        terminal: TerminalId,
-        params: &Value,
-        event: &AgentEvent,
-    ) -> Result<bool, String> {
-        let (surface, effective_lifecycle) = self.validate_agent_event_route(terminal, params)?;
-        if let Some(session_id) = params.get("codex_session_id").and_then(Value::as_str)
-            && self
-                .managed_codex
-                .get(&terminal)
-                .is_some_and(|launch| launch.verified && launch.saved.session_id != session_id)
-        {
-            return Err("Codex hook session does not match the managed thread".into());
-        }
-        let mut start_guard = None;
-        if let AgentEvent::SessionStart {
-            agent,
-            session_id: Some(id),
-        } = event
-        {
-            // Native reviewer SessionStart hooks belong to an internal thread,
-            // not the managed TUI's registered session. /resume is routed by ready.
-            if agent.eq_ignore_ascii_case("codex")
-                && self
-                    .managed_codex
-                    .get(&terminal)
-                    .is_some_and(|launch| launch.verified && launch.saved.session_id != *id)
-            {
-                return Err("Codex hook session does not match the managed thread".into());
-            }
-            let mut guard = self
-                .session_start_guards
-                .get(&terminal)
-                .cloned()
-                .unwrap_or_default();
-            let emitted = params
-                .get("hook_started_at_unix_ns")
-                .map(|value| {
-                    value
-                        .as_u64()
-                        .ok_or_else(|| "invalid hook timestamp".to_owned())
-                })
-                .transpose()?;
-            if !guard.observe(&format!("{agent}:{id}"), emitted)? {
-                return Ok(false);
-            }
-            start_guard = Some(guard);
-        }
-        let sequence = params.get("sequence").and_then(Value::as_u64);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|value| value.as_millis() as u64)
-            .unwrap_or_default();
-        let terminal_cwd = self.cwd_for_terminal(terminal);
-        let launch_command = self.commands.get(&terminal).cloned();
-        let session = self
-            .agent_sessions
-            .entry(surface)
-            .or_insert_with(|| AgentSession::new(surface));
-        let name = match event {
-            AgentEvent::SessionStart { agent, .. } => agent.clone(),
-            _ if !session.agent_kind.as_str().is_empty() => session.agent_kind.as_str().to_owned(),
-            _ => "agent".into(),
-        };
-        let must_start = session.lifecycle.phase != AgentLifecyclePhase::Running
-            || session.lifecycle.external_id.as_deref() != Some(effective_lifecycle.as_str())
-            || matches!(event, AgentEvent::SessionStart { session_id: Some(id), .. }
-                if session.session_id.as_ref() != Some(id));
-        if must_start {
-            let generation = session
-                .next_lifecycle_generation()
-                .map_err(|error| error.to_string())?;
-            let (pid, process_started_at_unix_ms) = match (
-                params.get("agent_pid").and_then(Value::as_u64),
-                params.get("pid_start_time").and_then(Value::as_u64),
-            ) {
-                (Some(pid), Some(start)) => (u32::try_from(pid).ok(), Some(start)),
-                _ => (None, None),
-            };
-            let session_id = match event {
-                AgentEvent::SessionStart { session_id, .. } => session_id.clone(),
-                _ => None,
-            };
-            let start = AgentSessionEvent {
-                event_id: format!("{effective_lifecycle}:start:{generation}"),
-                lifecycle_generation: generation,
-                lifecycle_id: Some(effective_lifecycle.clone()),
-                sequence: None,
-                occurred_at_unix_ms: now,
-                kind: AgentSessionEventKind::Lifecycle(AgentLifecycleEvent::Started {
-                    launch: AgentLaunchInfo {
-                        agent_kind: AgentKindId::new(name),
-                        session_id,
-                        pid,
-                        process_started_at_unix_ms,
-                        cwd: terminal_cwd,
-                        transcript: None,
-                        launch_command,
-                    },
-                }),
-            };
-            session
-                .apply_event(&start)
-                .map_err(|error| error.to_string())?;
-        }
-        if matches!(event, AgentEvent::SessionStart { .. }) {
-            if let (
-                Some(sequence),
-                AgentEvent::SessionStart {
-                    session_id: Some(id),
-                    ..
-                },
-            ) = (sequence, event)
-            {
-                let outcome = session
-                    .apply_event(&AgentSessionEvent {
-                        event_id: format!(
-                            "{effective_lifecycle}:start:{}:{sequence}",
-                            session.lifecycle.generation
-                        ),
-                        lifecycle_generation: session.lifecycle.generation,
-                        lifecycle_id: Some(effective_lifecycle.clone()),
-                        sequence: Some(sequence),
-                        occurred_at_unix_ms: now,
-                        kind: AgentSessionEventKind::Telemetry(AgentTelemetry::SessionObserved {
-                            session_id: id.clone(),
-                        }),
-                    })
-                    .map_err(|error| error.to_string())?;
-                if !matches!(
-                    outcome,
-                    wmcterm_core::AgentEventApplyOutcome::Applied { .. }
-                ) {
-                    return Ok(false);
-                }
-            }
-            if let AgentEvent::SessionStart {
-                agent,
-                session_id: Some(session_id),
-            } = event
-                && agent.eq_ignore_ascii_case("codex")
-            {
-                clear_codex_subagent_sessions_except(
-                    &mut self.codex_subagents,
-                    surface,
-                    session_id,
-                );
-            }
-            if let Some(guard) = start_guard {
-                self.session_start_guards.insert(terminal, guard);
-            }
-            if must_start {
-                for request in self
-                    .pending_agent_request_list()
-                    .into_iter()
-                    .filter(|request| request.surface_id == surface.to_string())
-                {
-                    let _ = self.pending_agent_requests.cancel(
-                        &request.request_id,
-                        "Agent session replaced",
-                        now,
-                    );
-                    self.remember_agent_approval_result(
-                        request.request_id.clone(),
-                        AgentApprovalAction::Deny,
-                    );
-                    self.conclude_agent_request_state(&request);
-                }
-            }
-            return Ok(true);
-        }
-        let generation = session.lifecycle.generation;
-        let suffix = sequence
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
-        let run_mode = self
-            .state
-            .surfaces
-            .get(&surface)
-            .and_then(|surface| surface.agent.as_ref())
-            .filter(|agent| agent.name.eq_ignore_ascii_case("codex"))
-            .map(|agent| agent.run_mode)
-            .unwrap_or_default();
-        let kind = agent_session_event_kind(event, &suffix, run_mode)
-            .ok_or_else(|| "session start must be handled before event mapping".to_owned())?;
-        let event = AgentSessionEvent {
-            event_id: format!("{effective_lifecycle}:{suffix}"),
-            lifecycle_generation: generation,
-            lifecycle_id: Some(effective_lifecycle.clone()),
-            sequence,
-            occurred_at_unix_ms: now,
-            kind,
-        };
-        if let AgentSessionEventKind::ActionRequired(request) = &event.kind {
-            let kind = match request.kind {
-                AgentRequestKind::Permission => IpcAgentRequestKind::PERMISSION,
-                AgentRequestKind::Input => IpcAgentRequestKind::INPUT,
-                AgentRequestKind::Confirmation => IpcAgentRequestKind::CONFIRMATION,
-            };
-            self.pending_agent_requests
-                .register(AgentInteractionRequest {
-                    request_id: request.request_id.clone(),
-                    surface_id: surface.to_string(),
-                    lifecycle_id: effective_lifecycle.clone(),
-                    agent_pid: params
-                        .get("agent_pid")
-                        .and_then(Value::as_u64)
-                        .and_then(|value| u32::try_from(value).ok()),
-                    pid_start_time: params.get("pid_start_time").and_then(Value::as_u64),
-                    kind: IpcAgentRequestKind::new(kind),
-                    message: request.message.clone(),
-                    choices: request
-                        .choices
-                        .iter()
-                        .enumerate()
-                        .map(|(index, label)| wmcterm_ipc::AgentChoice {
-                            id: index.to_string(),
-                            label: label.clone(),
-                        })
-                        .collect(),
-                    deadline_unix_ms: params.get("deadline_unix_ms").and_then(Value::as_u64),
-                })
-                .map_err(|error| error.to_string())?;
-        }
-        let actionable = matches!(event.kind, AgentSessionEventKind::ActionRequired(_));
-        let applied = session
-            .apply_event(&event)
-            .map(|outcome| {
-                matches!(
-                    outcome,
-                    wmcterm_core::AgentEventApplyOutcome::Applied { .. }
-                )
-            })
-            .map_err(|error| error.to_string())?;
-        if applied && actionable {
-            self.sync_surface_agent_request_state(surface);
-        }
-        Ok(applied)
-    }
-
-    fn validate_agent_event_route(
-        &self,
-        terminal: TerminalId,
-        params: &Value,
-    ) -> Result<(SurfaceId, String), String> {
-        let surface = self
-            .surface_for_terminal(terminal)
-            .ok_or_else(|| "agent target surface no longer exists".to_owned())?;
-        let runtime_lifecycle = &self
-            .terminals
-            .get(&terminal)
-            .ok_or_else(|| "agent target terminal is not running".to_owned())?
-            .lifecycle_id;
-        let effective_lifecycle = effective_agent_lifecycle(
-            runtime_lifecycle,
-            params.get("lifecycle_id").and_then(Value::as_str),
-        )?;
-        match (
-            params.get("agent_pid").and_then(Value::as_u64),
-            params.get("pid_start_time").and_then(Value::as_u64),
-        ) {
-            (Some(pid), Some(start)) => {
-                let pid = u32::try_from(pid).map_err(|_| "invalid agent pid".to_owned())?;
-                let expected = AgentProcessIdentity::expected(
-                    pid,
-                    start,
-                    surface.to_string(),
-                    effective_lifecycle.clone(),
-                );
-                validate_agent_process_identity(&expected).map_err(|error| error.to_string())?;
-            }
-            (None, None) => {}
-            _ => return Err("incomplete agent process identity".into()),
-        }
-        Ok((surface, effective_lifecycle))
-    }
-
-    fn resolve_agent_session_request(&mut self, request_id: &str) -> Result<(), String> {
-        let (_, session) = self
-            .agent_sessions
-            .iter_mut()
-            .find(|(_, session)| {
-                session
-                    .pending_requests
-                    .iter()
-                    .any(|request| request.request_id == request_id)
-            })
-            .ok_or_else(|| "agent session request not found".to_owned())?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|value| value.as_millis() as u64)
-            .unwrap_or_default();
-        let event = AgentSessionEvent {
-            event_id: format!("reply:{request_id}:{}", uuid::Uuid::new_v4()),
-            lifecycle_generation: session.lifecycle.generation,
-            lifecycle_id: session.lifecycle.external_id.clone(),
-            sequence: None,
-            occurred_at_unix_ms: now,
-            kind: AgentSessionEventKind::ActionResolved {
-                request_id: request_id.to_owned(),
-            },
-        };
-        session
-            .apply_event(&event)
-            .map_err(|error| error.to_string())?;
-        Ok(())
-    }
-
-    fn conclude_agent_request_state(&mut self, request: &AgentInteractionRequest) {
-        let _ = self.resolve_agent_session_request(&request.request_id);
-        if self
-            .agent_request_detail
-            .as_ref()
-            .is_some_and(|(request_id, _)| request_id == &request.request_id)
-        {
-            self.agent_request_detail = None;
-            self.agent_request_detail_scrollbar_drag = None;
-        }
-        if let Ok(surface) = uuid::Uuid::parse_str(&request.surface_id) {
-            if let Some(notification) =
-                self.state
-                    .notifications
-                    .iter_mut()
-                    .rev()
-                    .find(|notification| {
-                        notification.surface == surface
-                            && !notification.read
-                            && notification.attention == AttentionState::NeedsInput
-                            && notification.body == request.message
-                    })
-            {
-                notification.read = true;
-            }
-            self.sync_surface_agent_request_state(surface);
-        }
-    }
-
-    fn record_claude_hook(
-        &mut self,
-        terminal: TerminalId,
-        hook: &ClaudeHookEvent,
-    ) -> Result<(), String> {
-        let surface = self.validate_claude_hook(terminal, hook)?;
-        apply_claude_subagent_status(&mut self.claude_subagents, surface, hook);
-        if hook.agent_id.is_none() {
-            let observation =
-                match hook.kind {
-                    ClaudeHookKind::SessionStart => {
-                        hook.cwd.as_deref().map(|cwd| AgentTelemetry::CwdObserved {
-                            cwd: PathBuf::from(cwd),
-                        })
-                    }
-                    ClaudeHookKind::CwdChanged => {
-                        hook.new_cwd
-                            .as_deref()
-                            .map(|cwd| AgentTelemetry::CwdObserved {
-                                cwd: PathBuf::from(cwd),
-                            })
-                    }
-                    ClaudeHookKind::DirectoryAdded => hook.directory.as_deref().map(|directory| {
-                        AgentTelemetry::DirectoryObserved {
-                            directory: PathBuf::from(directory),
-                        }
-                    }),
-                    _ => None,
-                };
-            if let Some(observation) = observation
-                && let Some(session) = self.agent_sessions.get_mut(&surface)
-            {
-                session
-                    .apply_event(&AgentSessionEvent {
-                        event_id: format!("claude:directory:{}", uuid::Uuid::new_v4()),
-                        lifecycle_generation: session.lifecycle.generation,
-                        lifecycle_id: session.lifecycle.external_id.clone(),
-                        sequence: None,
-                        occurred_at_unix_ms: unix_time_ms(),
-                        kind: AgentSessionEventKind::Telemetry(observation),
-                    })
-                    .map_err(|error| error.to_string())?;
-            }
-            if matches!(
-                hook.kind,
-                ClaudeHookKind::SessionStart | ClaudeHookKind::CwdChanged
-            ) && let Some(index) = self.workspace_for_terminal(terminal)
-                && let Some(workspace) = self.state.workspaces.get(index)
-                && self
-                    .state
-                    .panes
-                    .get(&workspace.active_pane)
-                    .and_then(|pane| pane.active_surface())
-                    == Some(surface)
-                && let Some(cwd) = self
-                    .agent_sessions
-                    .get(&surface)
-                    .and_then(|session| session.cwd.clone())
-            {
-                self.state.workspaces[index].cwd = cwd;
-                self.refresh_workspace_metadata();
-            }
-        }
-        if hook.kind == ClaudeHookKind::SessionEnd {
-            self.claude_hook_modes.remove(&terminal);
-            self.close_agent_session_for_terminal(terminal, "Claude session ended".into());
-        } else if hook.agent_id.is_none() {
-            if hook.kind == ClaudeHookKind::SessionStart {
-                self.claude_hook_modes.remove(&terminal);
-                if hook.run_mode().is_none() {
-                    let mode = self
-                        .terminal_processes
-                        .get(&terminal)
-                        .and_then(|commands| {
-                            commands.iter().find(|command| {
-                                AgentKind::from_process_command(command) == Some(AgentKind::Claude)
-                            })
-                        })
-                        .map(|command| AgentKind::Claude.run_mode_from_process_command(command))
-                        .unwrap_or_default();
-                    if let Some(metadata) = self
-                        .state
-                        .surfaces
-                        .get_mut(&surface)
-                        .and_then(|surface| surface.agent.as_mut())
-                    {
-                        metadata.run_mode = mode;
-                    }
-                }
-            }
-            if let Some(mode) = hook.run_mode() {
-                self.claude_hook_modes.insert(
-                    terminal,
-                    (
-                        self.terminals[&terminal].lifecycle_id.clone(),
-                        hook.session_id.clone(),
-                        mode,
-                    ),
-                );
-                if let Some(metadata) = self
-                    .state
-                    .surfaces
-                    .get_mut(&surface)
-                    .and_then(|surface| surface.agent.as_mut())
-                {
-                    metadata.run_mode = mode;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn validate_claude_hook(
-        &self,
-        terminal: TerminalId,
-        hook: &ClaudeHookEvent,
-    ) -> Result<SurfaceId, String> {
-        validate_claude_hook_directories(hook)?;
-        let (_, _, surface) = terminal_context_ids(&self.state, terminal)
-            .ok_or_else(|| "Claude hook terminal context not found".to_owned())?;
-        let metadata = self
-            .state
-            .surfaces
-            .get(&surface)
-            .and_then(|surface| surface.agent.as_ref())
-            .ok_or_else(|| "Claude hook surface has no Agent session".to_owned())?;
-        if !matches!(
-            metadata.name.to_ascii_lowercase().as_str(),
-            "claude" | "claude code"
-        ) {
-            return Err("Claude hook cannot update a non-Claude surface".into());
-        }
-        if metadata.session_id.as_deref() != Some(hook.session_id.as_str()) {
-            return Err("Claude hook session does not match its surface".into());
-        }
-        Ok(surface)
-    }
-
-    fn validate_codex_session(
-        &self,
-        terminal: TerminalId,
-        session_id: &str,
-    ) -> Result<SurfaceId, String> {
-        let (_, _, surface) = terminal_context_ids(&self.state, terminal)
-            .ok_or_else(|| "Codex hook terminal context not found".to_owned())?;
-        let metadata = self
-            .state
-            .surfaces
-            .get(&surface)
-            .and_then(|surface| surface.agent.as_ref())
-            .ok_or_else(|| "Codex hook surface has no Agent session".to_owned())?;
-        if !metadata.name.eq_ignore_ascii_case("codex") {
-            return Err("Codex hook cannot update a non-Codex surface".into());
-        }
-        if metadata.session_id.as_deref() != Some(session_id) {
-            return Err("Codex hook session does not match its surface".into());
-        }
-        Ok(surface)
-    }
-
-    fn record_codex_subagent_hook(
-        &mut self,
-        terminal: TerminalId,
-        hook: &CodexSubagentHookEvent,
-    ) -> Result<wmcterm_core::AgentState, String> {
-        hook.validate().map_err(|error| error.to_string())?;
-        let surface = self.validate_codex_session(terminal, &hook.session_id)?;
-        apply_codex_subagent_status(&mut self.codex_subagents, surface, hook);
-        let parent = self
-            .state
-            .surfaces
-            .get(&surface)
-            .and_then(|surface| surface.agent.as_ref())
-            .map(|agent| agent.state)
-            .unwrap_or(wmcterm_core::AgentState::Idle);
-        let active = codex_subagent_count(&self.codex_subagents, surface, &hook.session_id) > 0;
-        if let Some(workspace) = self.workspace_for_surface(surface) {
-            self.sync_workspace_agent_status(workspace);
-        }
-        Ok(effective_codex_agent_state(parent, active))
-    }
-
-    fn end_codex_subagent_session(
-        &mut self,
-        terminal: TerminalId,
-        session_id: &str,
-    ) -> Result<(), String> {
-        let surface = self.validate_codex_session(terminal, session_id)?;
-        clear_codex_subagent_session(&mut self.codex_subagents, surface, session_id);
-        if let Some(workspace) = self.workspace_for_surface(surface) {
-            self.sync_workspace_agent_status(workspace);
-        }
-        Ok(())
-    }
-
-    fn expire_agent_requests(&mut self) -> bool {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|value| value.as_millis() as u64)
-            .unwrap_or_default();
-        let requests = self.pending_agent_request_list();
-        let replies = match self.pending_agent_requests.expire(now) {
-            Ok(replies) => replies,
-            Err(error) => {
-                tracing::warn!(%error, "expiring Agent requests failed");
-                return false;
-            }
-        };
-        let changed = !replies.is_empty();
-        for reply in replies {
-            if let Some(request) = requests
-                .iter()
-                .find(|request| request.request_id == reply.request_id)
-            {
-                self.conclude_agent_request_state(request);
-            }
-        }
-        changed
-    }
-
-    fn close_agent_session_for_terminal(&mut self, terminal: TerminalId, message: String) {
-        let Some(surface) = self.surface_for_terminal(terminal) else {
-            return;
-        };
-        clear_codex_subagent_surface(&mut self.codex_subagents, surface);
-        if let Some(workspace) = self.workspace_for_surface(surface) {
-            self.sync_workspace_agent_status(workspace);
-        }
-        let Some(session) = self.agent_sessions.get(&surface) else {
-            return;
-        };
-        let scope = wmcterm_ipc::AgentProcessScope {
-            surface_id: surface.to_string(),
-            lifecycle_id: session.lifecycle.external_id.clone().unwrap_or_default(),
-            // Ending the terminal's Agent lifecycle also cancels requests
-            // registered by hooks that did not carry a process identity.
-            agent_pid: None,
-            pid_start_time: None,
-        };
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|value| value.as_millis() as u64)
-            .unwrap_or_default();
-        let requests = self.pending_agent_request_list();
-        let replies = self
-            .pending_agent_requests
-            .process_exited(&scope, now)
-            .unwrap_or_default();
-        for reply in replies {
-            if let Some(request) = requests
-                .iter()
-                .find(|request| request.request_id == reply.request_id)
-            {
-                self.conclude_agent_request_state(request);
-            }
-        }
-        let Some(session) = self.agent_sessions.get_mut(&surface) else {
-            return;
-        };
-        if session.lifecycle.phase != AgentLifecyclePhase::Running {
-            self.sync_surface_agent_request_state(surface);
-            return;
-        }
-        let event = AgentSessionEvent {
-            event_id: format!("terminal-exit:{}", uuid::Uuid::new_v4()),
-            lifecycle_generation: session.lifecycle.generation,
-            lifecycle_id: session.lifecycle.external_id.clone(),
-            sequence: None,
-            occurred_at_unix_ms: now,
-            kind: AgentSessionEventKind::Lifecycle(AgentLifecycleEvent::Exited {
-                success: true,
-                message: Some(message),
-            }),
-        };
-        let _ = session.apply_event(&event);
-        self.sync_surface_agent_request_state(surface);
-    }
-
-    fn clear_manual_agent_resume_after_terminal_exit(&mut self, terminal: TerminalId) {
-        if !self
-            .commands
-            .get(&terminal)
-            .is_some_and(|command| is_manual_agent_resume_command(command))
-        {
-            return;
-        }
-        self.commands.remove(&terminal);
-        self.foreground_agents.remove(&terminal);
-        self.foreground_agent_input.remove(&terminal);
-        self.automatic_agent_status.remove(&terminal);
-        let Some(surface) = self.surface_for_terminal(terminal) else {
-            return;
-        };
-        self.agent_sessions.remove(&surface);
-        clear_codex_subagent_surface(&mut self.codex_subagents, surface);
-        if let Some(surface) = self.state.surfaces.get_mut(&surface) {
-            surface.agent = None;
-            surface.attention = AttentionState::None;
-        }
-        if let Some(workspace) = self.workspace_for_surface(surface) {
-            self.sync_workspace_agent_status(workspace);
-        }
-    }
-
-    fn update_foreground_agent(&mut self, terminal: TerminalId, commands: &[String]) -> bool {
-        self.claude_hook_modes.retain(|id, (lifecycle, _, _)| {
-            self.terminals
-                .get(id)
-                .is_some_and(|runtime| runtime.lifecycle_id == *lifecycle)
-        });
-        let hook_mode = self
-            .claude_hook_modes
-            .get(&terminal)
-            .and_then(|(_, session, mode)| {
-                self.surface_for_terminal(terminal)
-                    .and_then(|surface| self.state.surfaces.get(&surface))
-                    .and_then(|surface| surface.agent.as_ref())
-                    .filter(|metadata| metadata.session_id.as_ref() == Some(session))
-                    .map(|_| *mode)
-            });
-        let detected = commands.iter().find_map(|command| {
-            AgentKind::from_process_command(command).map(|agent| {
-                (
-                    agent,
-                    self.managed_codex
-                        .get(&terminal)
-                        .filter(|_| agent == AgentKind::Codex)
-                        .map(|codex| codex.saved.mode)
-                        .or_else(|| (agent == AgentKind::Claude).then_some(hook_mode).flatten())
-                        .unwrap_or_else(|| agent.run_mode_from_process_command(command)),
-                )
-            })
-        });
-        let previous = self.foreground_agents.get(&terminal).copied();
-        if previous == detected {
-            return false;
-        }
-        match detected {
-            Some((agent, run_mode)) => {
-                self.foreground_agents.insert(terminal, (agent, run_mode));
-                self.foreground_agent_input.remove(&terminal);
-                let should_update = self.automatic_agent_status.contains(&terminal)
-                    || self
-                        .state
-                        .surfaces
-                        .values()
-                        .find(|surface| {
-                            matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal)
-                        })
-                        .is_none_or(|surface| surface.agent.is_none());
-                if !should_update {
-                    // Hook/session state owns the task status, but a manually
-                    // launched process still owns its current approval mode.
-                    if agent_launch_is_managed(
-                        self.commands.get(&terminal).map(String::as_str),
-                        agent.as_str(),
-                    ) {
-                        return false;
-                    }
-                    return self.state.surfaces.values_mut().find(|surface| {
-                        matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal)
-                    }).and_then(|surface| surface.agent.as_mut())
-                        .is_some_and(|metadata| sync_detected_agent_mode(metadata, agent, run_mode));
-                }
-                self.automatic_agent_status.insert(terminal);
-                if let Some(surface) = self.state.surfaces.values_mut().find(
-                    |surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal),
-                ) {
-                    surface.agent = Some(detected_foreground_agent_metadata(agent, run_mode));
-                    surface.attention = AttentionState::None;
-                }
-                if let Some(index) = self.workspace_for_terminal(terminal)
-                    && let Some(workspace) = self.state.workspaces.get_mut(index)
-                {
-                    workspace.status = wmcterm_core::WorkspaceStatus::Idle;
-                }
-                if let Some(surface) = self.surface_for_terminal(terminal) {
-                    self.sync_surface_agent_request_state(surface);
-                }
-                true
-            }
-            None => {
-                self.foreground_agents.remove(&terminal);
-                self.foreground_agent_input.remove(&terminal);
-                self.automatic_agent_status.remove(&terminal);
-                if let Some(surface) = self.state.surfaces.values_mut().find(
-                    |surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal),
-                ) {
-                    surface.agent = None;
-                    surface.attention = AttentionState::None;
-                }
-                if let Some(index) = self.workspace_for_terminal(terminal)
-                    && let Some(workspace) = self.state.workspaces.get_mut(index)
-                {
-                    workspace.status = wmcterm_core::WorkspaceStatus::Idle;
-                }
-                if let Some(surface) = self.surface_for_terminal(terminal) {
-                    self.agent_sessions.remove(&surface);
-                    clear_codex_subagent_surface(&mut self.codex_subagents, surface);
-                    self.sync_surface_agent_request_state(surface);
-                }
-                true
-            }
-        }
-    }
-
-    fn mark_foreground_agent_running(&mut self, terminal: TerminalId) {
-        let Some((agent, run_mode)) = self.foreground_agents.get(&terminal).copied() else {
-            return;
-        };
-        self.automatic_agent_status.insert(terminal);
-        if let Some(surface) = self
-            .state
-            .surfaces
-            .values_mut()
-            .find(|surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal))
-        {
-            let session_id = surface
-                .agent
-                .as_ref()
-                .and_then(|metadata| metadata.session_id.clone());
-            surface.agent = Some(wmcterm_core::AgentMetadata {
-                name: agent.as_str().to_owned(),
-                state: wmcterm_core::AgentState::Running,
-                session_id,
-                run_mode,
-            });
-            surface.attention = AttentionState::None;
-        }
-        if let Some(index) = self.workspace_for_terminal(terminal)
-            && let Some(workspace) = self.state.workspaces.get_mut(index)
-        {
-            workspace.status = wmcterm_core::WorkspaceStatus::Running;
-        }
-        if let Some(surface) = self.surface_for_terminal(terminal) {
-            self.observe_agent_session_state(surface, wmcterm_core::AgentState::Running);
-            self.sync_surface_agent_request_state(surface);
-        }
-    }
-
-    fn mark_foreground_agent_idle(&mut self, terminal: TerminalId) {
-        let Some((agent, run_mode)) = self.foreground_agents.get(&terminal).copied() else {
-            return;
-        };
-        self.automatic_agent_status.insert(terminal);
-        if let Some(surface) = self
-            .state
-            .surfaces
-            .values_mut()
-            .find(|surface| matches!(surface.kind, SurfaceKind::Terminal(id) if id == terminal))
-        {
-            let session_id = surface
-                .agent
-                .as_ref()
-                .and_then(|metadata| metadata.session_id.clone());
-            surface.agent = Some(wmcterm_core::AgentMetadata {
-                name: agent.as_str().to_owned(),
-                state: wmcterm_core::AgentState::Idle,
-                session_id,
-                run_mode,
-            });
-            surface.attention = AttentionState::None;
-        }
-        if let Some(index) = self.workspace_for_terminal(terminal)
-            && let Some(workspace) = self.state.workspaces.get_mut(index)
-        {
-            workspace.status = wmcterm_core::WorkspaceStatus::Idle;
-        }
-        if let Some(surface) = self.surface_for_terminal(terminal) {
-            self.observe_agent_session_state(surface, wmcterm_core::AgentState::Idle);
-            self.sync_surface_agent_request_state(surface);
-        }
-    }
-
-    fn observe_agent_session_state(&mut self, surface: SurfaceId, state: wmcterm_core::AgentState) {
-        let Some(session) = self.agent_sessions.get_mut(&surface) else {
-            return;
-        };
-        let event = AgentSessionEvent {
-            event_id: format!("terminal-input:{}", uuid::Uuid::new_v4()),
-            lifecycle_generation: session.lifecycle.generation,
-            lifecycle_id: session.lifecycle.external_id.clone(),
-            sequence: None,
-            occurred_at_unix_ms: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|value| value.as_millis() as u64)
-                .unwrap_or_default(),
-            kind: AgentSessionEventKind::Telemetry(AgentTelemetry::StateObserved { state }),
-        };
-        let _ = session.apply_event(&event);
     }
 
     fn should_quarantine_focus_input(&mut self) -> bool {
@@ -5705,14 +4780,7 @@ impl WmctermApplication {
                 clear_codex_subagent_surface(&mut self.codex_subagents, surface);
             }
             for terminal in terminal_ids {
-                self.terminals.remove(&terminal);
-                self.managed_codex.remove(&terminal);
-                self.commands.remove(&terminal);
-                self.terminal_notices.remove(&terminal);
-                self.terminal_processes.remove(&terminal);
-                self.last_bell_notifications.remove(&terminal);
-                self.foreground_agents.remove(&terminal);
-                self.automatic_agent_status.remove(&terminal);
+                self.remove_terminal_runtime(terminal);
             }
             self.resize_terminals();
             self.rebuild_scene();
@@ -6038,14 +5106,7 @@ impl WmctermApplication {
         if let Some(surface) = self.state.surfaces.remove(&surface_id)
             && let SurfaceKind::Terminal(terminal) = surface.kind
         {
-            self.terminals.remove(&terminal);
-            self.managed_codex.remove(&terminal);
-            self.commands.remove(&terminal);
-            self.terminal_notices.remove(&terminal);
-            self.terminal_processes.remove(&terminal);
-            self.last_bell_notifications.remove(&terminal);
-            self.foreground_agents.remove(&terminal);
-            self.automatic_agent_status.remove(&terminal);
+            self.remove_terminal_runtime(terminal);
         }
     }
 
@@ -6117,14 +5178,7 @@ impl WmctermApplication {
         if let Some(surface) = self.state.surfaces.remove(&surface_id)
             && let SurfaceKind::Terminal(terminal) = surface.kind
         {
-            self.terminals.remove(&terminal);
-            self.managed_codex.remove(&terminal);
-            self.commands.remove(&terminal);
-            self.terminal_notices.remove(&terminal);
-            self.terminal_processes.remove(&terminal);
-            self.last_bell_notifications.remove(&terminal);
-            self.foreground_agents.remove(&terminal);
-            self.automatic_agent_status.remove(&terminal);
+            self.remove_terminal_runtime(terminal);
         }
         self.resize_terminals();
         self.rebuild_scene();
@@ -6302,14 +5356,7 @@ impl WmctermApplication {
                     if let Some(surface) = self.state.surfaces.remove(&surface_id)
                         && let SurfaceKind::Terminal(terminal) = surface.kind
                     {
-                        self.terminals.remove(&terminal);
-                        self.managed_codex.remove(&terminal);
-                        self.commands.remove(&terminal);
-                        self.terminal_notices.remove(&terminal);
-                        self.terminal_processes.remove(&terminal);
-                        self.last_bell_notifications.remove(&terminal);
-                        self.foreground_agents.remove(&terminal);
-                        self.automatic_agent_status.remove(&terminal);
+                        self.remove_terminal_runtime(terminal);
                     }
                 }
             }
@@ -10150,6 +9197,9 @@ impl WmctermApplication {
                 let message = match notice {
                     TerminalNotice::Exited(status) => self.language.terminal_exited(status),
                     TerminalNotice::Warning(warning) => self.language.terminal_warning(warning),
+                    TerminalNotice::InputRejected => {
+                        self.language.terminal_input_rejected().to_owned()
+                    }
                     TerminalNotice::Error(error) => self.language.terminal_error(error),
                     TerminalNotice::SpawnFailed(error) => {
                         self.language.terminal_spawn_failed(error)
@@ -10172,7 +9222,9 @@ impl WmctermApplication {
                     width: rect.width - 20.0,
                     height: self.cell_height(),
                     color: match notice {
-                        TerminalNotice::Exited(_) | TerminalNotice::Warning(_) => theme_yellow,
+                        TerminalNotice::Exited(_)
+                        | TerminalNotice::Warning(_)
+                        | TerminalNotice::InputRejected => theme_yellow,
                         TerminalNotice::Error(_) | TerminalNotice::SpawnFailed(_) => theme_red,
                     },
                     font_size: self.terminal_font_size,
@@ -12292,865 +11344,6 @@ impl WmctermApplication {
             Err("approval_id not found".into())
         }
     }
-
-    fn handle_rpc(&mut self, request: Request) -> Response {
-        let id = request.id.clone();
-        let result: Result<Value, String> = (|| {
-            match request.method.as_str() {
-            "app.diagnostics" => Ok(json!({
-                "version": env!("CARGO_PKG_VERSION"),
-                "server_executable": env::current_exe().ok(),
-                "client_executable": request.params.get("client_executable"),
-                "provider_versions": request.params.get("provider_versions"),
-                "config_path": wmcterm_config::config_path(),
-                "terminals": self.terminals.iter().map(|(id, runtime)| json!({
-                    "terminal_id": id, "surface_id": self.surface_for_terminal(*id),
-                    "lifecycle_id": runtime.lifecycle_id,
-                    "agent": self.surface_for_terminal(*id).and_then(|surface| self.state.surfaces.get(&surface)).and_then(|surface| surface.agent.as_ref()),
-                    "last_hook": self.last_hook_delivery.get(id),
-                    "cwd": self.cwd_for_terminal(*id),
-                    "agent_session": self.surface_for_terminal(*id).and_then(|surface| self.agent_sessions.get(&surface)),
-                    "input_focused": self.input_focus_terminal == Some(*id),
-                    "mouse_tracking": runtime.snapshot.mouse_tracking,
-                    "keyboard_flags": runtime.snapshot.keyboard_flags,
-                    "focus_reporting": runtime.snapshot.focus_reporting,
-                    "bracketed_paste": runtime.snapshot.bracketed_paste
-                })).collect::<Vec<_>>()
-            })),
-            "app.status" => Ok(json!({
-                "product": "wmcterm",
-                "version": env!("CARGO_PKG_VERSION"),
-                "active_workspace": self.state.active_workspace().map(|workspace| workspace.id),
-                "active_terminal": self.active_terminal_id(),
-                "workspaces": self.state.workspaces.len(),
-                "panes": self.state.panes.len(),
-                "surfaces": self.state.surfaces.len(),
-                "running_terminals": self.terminals.len(),
-                "unread_notifications": self.state.notifications.iter().filter(|item| !item.read).count(),
-            })),
-            "app.capabilities" => Ok(json!({
-                "protocol_version": 5,
-                "product": "wmcterm",
-                "supported_agents": AgentKind::ALL,
-                "version": env!("CARGO_PKG_VERSION"),
-                "context": {
-                    "marker_env": "WMCTERM",
-                    "workspace_env": "WMCTERM_WORKSPACE_ID",
-                    "pane_env": "WMCTERM_PANE_ID",
-                    "surface_env": "WMCTERM_SURFACE_ID",
-                    "terminal_lifecycle_env": "WMCTERM_TERMINAL_LIFECYCLE_ID",
-                    "control_socket_env": "WMCTERM_CONTROL_SOCKET",
-                    "legacy_socket_env": "WMCTERM_SOCKET",
-                    "implicit_surface_target": true,
-                    "explicit_surface_target": true,
-                    "atomic_target_create": true,
-                    "focus_preserving_create": true,
-                    "focus_preserving_documents": true,
-                    "atomic_close_others": true,
-                    "destructive_rpc_requires_target": true,
-                    "non_intrusive_scrollback_read": true,
-                    "screen_revisions": true,
-                    "screen_wait_cli": true,
-                },
-                "create_options": [
-                    "workspace", "pane", "surface", "direction", "focus", "command", "cwd",
-                    "environment", "title"
-                ],
-                "agent_approval": {
-                    "register_method": "agent.approval.register",
-                    "poll_method": "agent.approval.poll",
-                    "sources": ["codex_app_server", "claude_hook"],
-                    "decision_modes": ["deny", "once", "always", "all"],
-                    "claude_permission_changes": "always applies the single displayed suggestion; its label describes the operation, and the message shows scope and storage",
-                    "fail_closed": true
-                },
-                "codex_restore": {
-                    "managed_modes": ["interactive", "unattended", "full-access"],
-                    "preserves_mode": true,
-                    "rebuilds_teams_bridge": true,
-                    "permission_verification": "server response before turn/start",
-                    "settings_updates": "verified threads only; non-null permission, reviewer and cwd updates rejected; restart to change the launch profile",
-                    "turn_workspace": "turn/start preserves verified cwd and runtime workspace roots; matching overrides are removed and changes rejected",
-                    "full_access": "GUI confirmation or persisted managed session; not a CLI/RPC launch option",
-                    "failure": "no automatic permission downgrade; Enter retries an exited terminal",
-                    "legacy": "missing managed restore record uses interactive provider resume"
-                },
-                "claude_launch": {
-                    "interactive_permission_mode": "manual",
-                    "unattended_permission_mode": "auto",
-                    "hook_disabling_options": "bare, safe-mode, restricted and custom setting-sources rejected",
-                    "hook_settings_validation": "additional settings and discovered user/project settings reject disableAllHooks and allowManagedHooksOnly; inherited SIMPLE and SAFE_MODE flags rejected",
-                    "requires_installed_hooks": true,
-                    "approval_hook_failure": "block; requires Claude 2.1.295+",
-                    "hook_command_form": "exec command plus args; no shell required",
-                    "auto_denials": "PermissionDenied is informational; never retries or creates approval buttons",
-                    "directory_events": "root CwdChanged and DirectoryAdded update session metadata; child directories cannot change the root",
-                    "prompt_submission_event": true,
-                    "detached_modes": "bg, background, cloud, desktop and tmux rejected"
-                },
-                "codex_input": {
-                    "methods": ["item/tool/requestUserInput", "mcpServer/elicitation/request"],
-                    "forms": "ordinary non-secret questions and primitive MCP form schemas; unsupported forms stay native",
-                    "reply": "resolution.text is a JSON object mapping field ids to strings",
-                    "deadline_ms": 540000,
-                    "strict_permissions": "strict choice grants turn scope with strictAutoReview; never session scope"
-                },
-                "claude_input": {
-                    "methods": ["Elicitation", "ElicitationResult"],
-                    "forms": "primitive MCP form schemas; URL, secret and complex forms stay native",
-                    "ownership": "supported form hooks block and replace the native dialog; failures cancel",
-                    "reply": "resolution.text is a JSON object mapping field ids to strings",
-                    "binding": "workspace, surface, terminal lifecycle and active session",
-                    "deadline_ms": 540000
-                },
-                "program_status": {"protocol": "OSC 7501", "max_records": 64, "priority": "identity-bearing hooks and pending requests precede anonymous OSC", "actionable": false},
-                "codex_native_tool_hooks": {
-                    "events": ["PreToolUse", "PostToolUse", "PermissionRequest", "PreModelRequest"],
-                    "checked_version": "0.167.0",
-                    "binding": "explicit surface, terminal lifecycle, root session, turn and tool input",
-                    "actionable": false,
-                    "installation": "explicit Hook installation and native Codex review required"
-                },
-                "agent_events": [
-                    "session_start", "tool_use", "permission_request", "needs_input",
-                    "turn_complete", "turn_failed", "notification", "stop", "state_observed"
-                ],
-                "terminal_input": {
-                    "local_search": "Ctrl+Alt+F; next match Ctrl+Alt+G",
-                    "mouse_override": "Shift forces local selection, scroll, menu and primary paste",
-                    "protocols": ["SGR mouse including hover", "focus reporting", "Kitty keyboard press/repeat/release"]
-                },
-                "ssh": {
-                    "shell": "bash >= 4.2.46",
-                    "target": "explicit surface_id UUID; integrated idle local Bash",
-                    "remote_directory": "~/.wmcterm/tmp",
-                    "max_command_bytes": 16384,
-                    "max_output_bytes": 1048576,
-                    "output": "merged PTY bytes, UTF-8 lossy, ANSI preserved",
-                    "persistent": false,
-                    "focus": false,
-                    "cli_new": "ssh HOST [--new] [--pane UUID]; defaults to WMCTERM_PANE_ID, splits right without focus and waits for local and remote readiness",
-                    "agent_usage": "only when the user explicitly requests wmcterm SSH",
-                    "cli_command_sources": ["--command", "--command-file", "--command-stdin"],
-                    "exec_expected_host": "optional exact host match, checked atomically with connection_id and ready state",
-                    "authentication": "interactive OpenSSH; connecting includes authentication waits"
-                },
-                "methods": [
-                    "ssh.connect", "ssh.status", "ssh.exec", "ssh.cancel",
-                    "app.status", "app.diagnostics", "workspace.list", "workspace.create", "workspace.activate",
-                    "workspace.rename", "workspace.describe", "workspace.move",
-                    "workspace.cwd",
-                    "workspace.close", "pane.list", "pane.split", "pane.focus", "pane.zoom",
-                    "pane.close", "pane.close-others", "surface.list", "surface.new", "surface.activate",
-                    "surface.close", "surface.close-others", "surface.read", "surface.search", "surface.markdown",
-                    "surface.logs", "screen.read", "send", "send.line", "terminal.search", "terminal.clear",
-                    "terminal.scroll", "notification.list", "notification.mark", "notify",
-                    "agent.update", "agent.request.list", "agent.request.reply", "agent.request.cancel",
-                    "agent.input.register", "agent.input.poll", "agent.input.reconcile",
-                    "agent.approval.register", "agent.approval.poll"
-                ],
-                "control_keys": [
-                    "enter", "tab", "escape", "backspace", "up", "down", "left", "right",
-                    "ctrl+a..ctrl+z", "ctrl+space", "ctrl+[", "ctrl+\\", "ctrl+]", "ctrl+^", "ctrl+_"
-                ]
-            })),
-            "workspace.list" => Ok(json!(
-                self.state
-                    .workspaces
-                    .iter()
-                    .map(|w| json!({"id": w.id, "name": w.name, "cwd": w.cwd, "status": w.status, "description": w.description, "git_branch": w.git_branch, "pull_request": w.pull_request, "listening_ports": w.listening_ports}))
-                    .collect::<Vec<_>>()
-            )),
-            "workspace.activate" | "workspace.rename" | "workspace.describe" | "workspace.cwd"
-            | "workspace.move" | "workspace.close" => request
-                .params
-                .get("id")
-                .and_then(Value::as_str)
-                .and_then(|value| uuid::Uuid::parse_str(value).ok())
-                .ok_or_else(|| "invalid params.id".to_owned())
-                .and_then(|workspace| {
-                    let command = match request.method.as_str() {
-                        "workspace.activate" => WorkspaceCommand::Activate { id: workspace },
-                        "workspace.rename" => WorkspaceCommand::Rename {
-                            id: workspace,
-                            name: request
-                                .params
-                                .get("name")
-                                .and_then(Value::as_str)
-                                .ok_or_else(|| "missing params.name".to_owned())?
-                                .to_owned(),
-                        },
-                        "workspace.describe" => WorkspaceCommand::Describe {
-                            id: workspace,
-                            description: request
-                                .params
-                                .get("description")
-                                .and_then(Value::as_str)
-                                .ok_or_else(|| "missing params.description".to_owned())?
-                                .to_owned(),
-                        },
-                        "workspace.cwd" => {
-                            let input = request
-                                .params
-                                .get("cwd")
-                                .and_then(Value::as_str)
-                                .ok_or_else(|| "missing params.cwd".to_owned())?;
-                            let current = self
-                                .state
-                                .workspaces
-                                .iter()
-                                .find(|item| item.id == workspace)
-                                .ok_or_else(|| "workspace not found".to_owned())?
-                                .cwd
-                                .clone();
-                            WorkspaceCommand::ChangeDirectory {
-                                id: workspace,
-                                cwd: resolve_existing_directory(input, &current)?,
-                            }
-                        }
-                        "workspace.move" => WorkspaceCommand::Move {
-                            id: workspace,
-                            offset: request
-                                .params
-                                .get("offset")
-                                .and_then(Value::as_i64)
-                                .unwrap_or(0) as isize,
-                        },
-                        "workspace.close" => {
-                            let closed = self.remove_workspace_by_id(workspace);
-                            return Ok(json!({
-                                "workspace_id": workspace,
-                                "closed": closed,
-                                "confirmation_required": false,
-                            }));
-                        }
-                        _ => unreachable!(),
-                    };
-                    self.state
-                        .execute(AppCommand::Workspace(command))
-                        .map_err(|e| e.to_string())?;
-                    self.resize_terminals();
-                    if request.method == "workspace.cwd" {
-                        self.refresh_workspace_metadata();
-                    }
-                    self.rebuild_scene();
-                    Ok(json!({"ok": true}))
-                }),
-            "workspace.create" => {
-                let name = request
-                    .params
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or("workspace")
-                    .to_owned();
-                let process_cwd = env::current_dir().map_err(|error| error.to_string())?;
-                let cwd_input = request
-                    .params
-                    .get("cwd")
-                    .and_then(Value::as_str)
-                    .unwrap_or_else(|| process_cwd.to_str().unwrap_or("."));
-                // Validate before mutating AppState. A bad Agent-provided cwd
-                // must not leave an active workspace whose first PTY can never
-                // start.
-                let cwd = resolve_existing_directory(cwd_input, &process_cwd)?;
-                self.state
-                    .execute(AppCommand::Workspace(WorkspaceCommand::Create {
-                        name,
-                        cwd,
-                    }))
-                    .map_err(|e| e.to_string())
-                    .and_then(|_| {
-                        if let Some(command) = request.params.get("command").and_then(Value::as_str)
-                            && let Some(terminal) = self.active_terminal_id()
-                        {
-                            self.commands.insert(terminal, command.to_owned());
-                        }
-                        let missing: Vec<_> = self
-                            .state
-                            .surfaces
-                            .values()
-                            .filter_map(|s| match s.kind {
-                                SurfaceKind::Terminal(t) if !self.terminals.contains_key(&t) => {
-                                    Some(t)
-                                }
-                                _ => None,
-                            })
-                            .collect();
-                        for terminal in missing {
-                            if let Err(error) = self.spawn_terminal(terminal) {
-                                let message = error.to_string();
-                                self.report_terminal_notice(
-                                    terminal,
-                                    TerminalNotice::SpawnFailed(message.clone()),
-                                );
-                                self.rebuild_scene();
-                                return Err(message);
-                            }
-                        }
-                        self.resize_terminals();
-                        self.rebuild_scene();
-                        Ok(json!({"workspace_id": self.state.active_workspace().map(|w| w.id)}))
-                    })
-            }
-            "pane.split" => {
-                let placement = split_direction(&request.params)?;
-                let focus = request
-                    .params
-                    .get("focus")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true);
-                let options = parse_terminal_create_options(&request.params)?;
-                let (workspace, pane) = self.rpc_target_pane(&request.params)?;
-                self.rpc_split_pane(workspace, pane, placement, options, focus)
-            }
-            "pane.list" => {
-                let mut panes = Vec::new();
-                let workspace_id = optional_uuid_param(&request.params, "workspace")?;
-                let workspace = match workspace_id {
-                    Some(id) => self.state.workspaces.iter().find(|workspace| workspace.id == id),
-                    None => self.state.active_workspace(),
-                };
-                if workspace_id.is_some() && workspace.is_none() {
-                    return Err("workspace not found".to_owned());
-                }
-                if let Some(workspace) = workspace {
-                    let mut ids = Vec::new();
-                    workspace.root.leaves(&mut ids);
-                    panes.extend(ids.into_iter().filter_map(|id| self.state.panes.get(&id)).map(
-                        |pane| json!({"id": pane.id, "surfaces": pane.surfaces, "active_surface": pane.active_surface, "zoomed": pane.zoomed}),
-                    ));
-                }
-                Ok(json!(panes))
-            }
-            "pane.close" | "pane.zoom" => {
-                let pane = request
-                    .params
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
-                    .ok_or_else(|| "invalid or missing params.id".to_owned())?;
-                if request.method == "pane.close" {
-                    if !self.state.panes.contains_key(&pane) {
-                        return Err("pane not found".into());
-                    }
-                    let can_remove = self.state.workspaces.iter().any(|workspace| {
-                        if !workspace.root.contains(pane) {
-                            return false;
-                        }
-                        let mut leaves = Vec::new();
-                        workspace.root.leaves(&mut leaves);
-                        leaves.len() > 1
-                    });
-                    if !can_remove {
-                        return Err("cannot close the last pane in a workspace".into());
-                    }
-                    let closed = self.remove_pane_by_id(pane);
-                    self.resize_terminals();
-                    self.rebuild_scene();
-                    return Ok(json!({
-                        "closed": usize::from(closed),
-                        "closed_ids": if closed { vec![pane] } else { Vec::new() },
-                        "confirmation_required": false,
-                    }));
-                } else {
-                    self.state
-                        .execute(AppCommand::Pane(PaneCommand::ToggleZoom { id: pane }))
-                        .map_err(|e| e.to_string())?;
-                    self.rebuild_scene();
-                }
-                Ok(json!({"ok": true}))
-            }
-            "pane.close-others" => {
-                let anchor = optional_uuid_param(&request.params, "anchor")?
-                    .ok_or_else(|| "missing params.anchor".to_owned())?;
-                let workspace = self
-                    .state
-                    .workspaces
-                    .iter()
-                    .find(|workspace| workspace.root.contains(anchor))
-                    .ok_or_else(|| "anchor pane not found".to_owned())?;
-                let mut candidates = Vec::new();
-                workspace.root.leaves(&mut candidates);
-                let targets = wmcterm_core::plan_close_others(&candidates, anchor)
-                    .map_err(|error| error.to_string())?;
-                let closed_ids = targets
-                    .iter()
-                    .copied()
-                    .filter(|pane| self.remove_pane_by_id(*pane))
-                    .collect::<Vec<_>>();
-                self.resize_terminals();
-                self.rebuild_scene();
-                Ok(json!({
-                    "anchor": anchor,
-                    "closed": closed_ids.len(),
-                    "closed_ids": closed_ids,
-                    "pending_ids": Vec::<PaneId>::new(),
-                    "confirmation_required": false,
-                }))
-            }
-            "surface.list" => {
-                let workspace_id = optional_uuid_param(&request.params, "workspace")?
-                    .ok_or_else(|| "missing params.workspace".to_owned())?;
-                let workspace = self.state.workspaces.iter().find(|workspace| workspace.id == workspace_id)
-                    .ok_or_else(|| "workspace not found".to_owned())?;
-                let mut pane_ids = Vec::new();
-                workspace.root.leaves(&mut pane_ids);
-                let surfaces = pane_ids.into_iter()
-                    .filter_map(|pane| self.state.panes.get(&pane))
-                    .flat_map(|pane| pane.surfaces.iter())
-                    .filter_map(|id| self.state.surfaces.get(id))
-                    .map(|surface| {
-                        let terminal = match surface.kind { SurfaceKind::Terminal(id) => Some(id), _ => None };
-                        json!({"id": surface.id, "title": surface.title, "kind": surface.kind, "terminal": terminal, "attention": surface.attention, "agent": surface.agent})
-                    }).collect::<Vec<_>>();
-                Ok(json!(surfaces))
-            },
-            "surface.read" | "surface.search" => {
-                let surface = request.params.get("id").and_then(Value::as_str).and_then(|value| uuid::Uuid::parse_str(value).ok()).or_else(|| {
-                    self.state.active_workspace().and_then(|workspace| self.state.panes.get(&workspace.active_pane)).and_then(|pane| pane.active_surface())
-                }).ok_or_else(|| "no surface selected".to_owned())?;
-                let backend = self.surface_backends.get(&surface).ok_or_else(|| "surface is not a document or log".to_owned())?;
-                if request.method == "surface.read" {
-                    Ok(json!({"text": backend.render_text()}))
-                } else {
-                    let query = request.params.get("query").and_then(Value::as_str).ok_or_else(|| "missing params.query".to_owned())?;
-                    Ok(json!(backend.search(query).into_iter().map(|item| json!({"line": item.line, "text": item.text})).collect::<Vec<_>>()))
-                }
-            }
-            "surface.activate" => request
-                .params
-                .get("id")
-                .and_then(Value::as_str)
-                .and_then(|value| uuid::Uuid::parse_str(value).ok())
-                .ok_or_else(|| "invalid params.id".to_owned())
-                .and_then(|surface: SurfaceId| {
-                    self.activate_surface_id(surface).map_err(|error| error.to_string())?;
-                    Ok(json!({"ok": true}))
-                }),
-            "ssh.connect" | "ssh.status" | "ssh.exec" | "ssh.cancel" => {
-                let surface = request.params.get("surface_id").and_then(Value::as_str)
-                    .ok_or_else(|| "SSH operations require an explicit surface_id UUID".to_owned())?;
-                uuid::Uuid::parse_str(surface).map_err(|_| "invalid surface_id UUID".to_owned())?;
-                let mut params = request.params.clone();
-                if params.get("surface").is_some_and(|value| value.as_str() != Some(surface)) {
-                    return Err("surface and surface_id disagree".into());
-                }
-                params["surface"] = surface.into();
-                rpc_target_pane_in_state(&self.state, &params)?;
-                let terminal = self.terminal_for_params(&params)?;
-                let runtime = self.terminals.get(&terminal).ok_or_else(|| "target terminal is not running".to_owned())?;
-                runtime.session.ssh_request(&request.method, request.params.clone())
-            }
-            "screen.read" => {
-                let terminal = self.terminal_for_params(&request.params)?;
-                let runtime = self.terminals.get(&terminal).ok_or_else(|| "target terminal is not running".to_owned())?;
-                let include_scrollback = request
-                    .params
-                    .get("scrollback")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false);
-                let lines = optional_screen_lines(&request.params)?;
-                let mut text = if include_scrollback {
-                    runtime
-                        .session
-                        .export_history()
-                        .ok_or_else(|| "timed out reading terminal scrollback".to_owned())?
-                } else {
-                    runtime.snapshot.to_plain_text()
-                };
-                if let Some(lines) = lines {
-                    text = tail_lines(&text, lines);
-                }
-                let snapshot = &runtime.snapshot;
-                Ok(json!({
-                    "text": text,
-                    "revision": runtime.snapshot_revision,
-                    "cols": snapshot.cols,
-                    "rows": snapshot.rows,
-                    "cursor": snapshot.cursor.as_ref().map(|cursor| json!({
-                        "column": cursor.x,
-                        "row": cursor.y,
-                        "visible": cursor.visible,
-                    })),
-                    "scrollback_rows": snapshot.scrollback_rows,
-                    "viewport_offset": snapshot.viewport_offset,
-                    "at_bottom": snapshot.viewport_offset == 0,
-                    "truncated_top": !include_scrollback && snapshot.screen_row_origin > 0,
-                    "includes_scrollback": include_scrollback,
-                }))
-            }
-            "send" | "send.line" => {
-                let text = request.params.get("text").and_then(Value::as_str).ok_or_else(|| "missing params.text".to_owned())?;
-                let terminal = self.terminal_for_params(&request.params)?;
-                let runtime = self.terminals.get(&terminal).ok_or_else(|| "target terminal is not running".to_owned())?;
-                let command = if request.method == "send.line" {
-                    SessionCommand::PasteLine(text.to_owned())
-                } else if request
-                    .params
-                    .get("paste")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false)
-                {
-                    SessionCommand::Paste(text.to_owned())
-                } else {
-                    SessionCommand::Input(text.as_bytes().to_vec())
-                };
-                runtime.session.send(command).map_err(|error| error.to_string())?;
-                Ok(json!({"ok": true}))
-            }
-            "terminal.search" => {
-                let query = request.params.get("query").and_then(Value::as_str).ok_or_else(|| "missing params.query".to_owned())?.to_owned();
-                let direction = request.params.get("direction").and_then(Value::as_i64).unwrap_or(1) as isize;
-                let terminal = self.terminal_for_params(&request.params)?;
-                let runtime = self.terminals.get(&terminal).ok_or_else(|| "terminal is not running".to_owned())?;
-                runtime.session.send(SessionCommand::Search { query, direction }).map_err(|e| e.to_string())?;
-                Ok(json!({"ok": true}))
-            }
-            "terminal.clear" => {
-                let terminal = self.terminal_for_params(&request.params)?;
-                let runtime = self.terminals.get(&terminal).ok_or_else(|| "terminal is not running".to_owned())?;
-                runtime.session.send(SessionCommand::ClearScrollback).map_err(|e| e.to_string())?;
-                Ok(json!({"ok": true}))
-            }
-            "terminal.scroll" => {
-                let lines = request.params.get("lines").and_then(Value::as_i64).unwrap_or(0) as isize;
-                let terminal = self.terminal_for_params(&request.params)?;
-                let runtime = self.terminals.get(&terminal).ok_or_else(|| "terminal is not running".to_owned())?;
-                runtime.session.send(SessionCommand::Scroll(lines)).map_err(|e| e.to_string())?;
-                Ok(json!({"ok": true}))
-            }
-            "surface.new" => {
-                let focus = request
-                    .params
-                    .get("focus")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true);
-                let options = parse_terminal_create_options(&request.params)?;
-                let (workspace, pane) = self.rpc_target_pane(&request.params)?;
-                self.rpc_create_surface(workspace, pane, options, focus)
-            }
-            "surface.markdown" | "surface.logs" => {
-                let path = request.params.get("path").and_then(Value::as_str)
-                    .ok_or_else(|| "missing params.path".to_owned())?;
-                let focus = request.params.get("focus").and_then(Value::as_bool).unwrap_or(true);
-                let (workspace, pane) = self.rpc_target_pane(&request.params)?;
-                self.rpc_open_text_surface(
-                    workspace,
-                    pane,
-                    std::path::Path::new(path),
-                    request.method == "surface.logs",
-                    focus,
-                )
-            },
-            "surface.close" => {
-                let surface = optional_uuid_param(&request.params, "id")?
-                    .ok_or_else(|| "missing params.id".to_owned())?;
-                if !self.state.surfaces.contains_key(&surface) {
-                    return Err("surface not found".into());
-                }
-                let closed = self.remove_surface_by_id(surface);
-                self.resize_terminals();
-                self.rebuild_scene();
-                Ok(json!({
-                    "closed": usize::from(closed),
-                    "closed_ids": if closed { vec![surface] } else { Vec::new() },
-                    "confirmation_required": false,
-                }))
-            }
-            "surface.close-others" => {
-                let anchor = optional_uuid_param(&request.params, "anchor")?
-                    .ok_or_else(|| "missing params.anchor".to_owned())?;
-                let pane = self
-                    .state
-                    .panes
-                    .values()
-                    .find(|pane| pane.surfaces.contains(&anchor))
-                    .ok_or_else(|| "anchor surface not found".to_owned())?;
-                let targets = wmcterm_core::plan_close_others(&pane.surfaces, anchor)
-                    .map_err(|error| error.to_string())?;
-                let closed_ids = targets
-                    .iter()
-                    .copied()
-                    .filter(|surface| self.remove_surface_by_id(*surface))
-                    .collect::<Vec<_>>();
-                self.resize_terminals();
-                self.rebuild_scene();
-                Ok(json!({
-                    "anchor": anchor,
-                    "closed": closed_ids.len(),
-                    "closed_ids": closed_ids,
-                    "pending_ids": Vec::<SurfaceId>::new(),
-                    "confirmation_required": false,
-                }))
-            }
-            "notify" => {
-                let title = request
-                    .params
-                    .get("title")
-                    .and_then(Value::as_str)
-                    .unwrap_or("wmcterm")
-                    .to_owned();
-                let body = request
-                    .params
-                    .get("body")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_owned();
-                let terminal = self.terminal_for_params(&request.params)?;
-                self.notify_terminal(terminal, &body);
-                if let Some(last) = self.state.notifications.last_mut() {
-                    last.title = title;
-                }
-                self.rebuild_scene();
-                Ok(json!({"ok": true}))
-            }
-            "notification.list" => Ok(json!(self.state.notifications)),
-            "notification.mark" => {
-                let notification = request
-                    .params
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .and_then(|value| uuid::Uuid::parse_str(value).ok())
-                    .ok_or_else(|| "invalid params.id".to_owned())?;
-                let read = request
-                    .params
-                    .get("read")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true);
-                if !self
-                    .state
-                    .notifications
-                    .iter()
-                    .any(|item| item.id == notification)
-                {
-                    return Err("notification not found".into());
-                }
-                self.set_notification_read(notification, read);
-                self.rebuild_scene();
-                Ok(json!({"ok": true}))
-            }
-            "agent.approval.register" => {
-                if request.params["request"]["kind"] == "input" { return Err("use agent.input.register for input requests".into()); }
-                self.register_agent_approval(&request.params)
-            },
-            "agent.input.register" => self.register_agent_input(&request.params),
-            "agent.input.poll" => self.poll_agent_input(&request.params),
-            "agent.input.reconcile" => self.reconcile_claude_input(&request.params),
-            "agent.approval.poll" => self.poll_agent_approval(&request.params),
-            "agent.request.list" => self
-                .pending_agent_requests
-                .list()
-                .map(|requests| json!(requests))
-                .map_err(|error| error.to_string()),
-            "agent.request.reply" | "agent.request.cancel" => {
-                let request_id = request
-                    .params
-                    .get("request_id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| "missing params.request_id".to_owned())?;
-                let pending_request = self
-                    .pending_agent_requests
-                    .get(request_id)
-                    .map_err(|error| error.to_string())?;
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|value| value.as_millis() as u64)
-                    .unwrap_or_default();
-                let outcome = if request.method == "agent.request.cancel" {
-                    self.pending_agent_requests.cancel(
-                        request_id,
-                        request
-                            .params
-                            .get("reason")
-                            .and_then(Value::as_str)
-                            .unwrap_or("cancelled"),
-                        now,
-                    )
-                } else {
-                    let resolution = request
-                        .params
-                        .get("resolution")
-                        .cloned()
-                        .map(serde_json::from_value::<AgentResolution>)
-                        .transpose()
-                        .map_err(|error| error.to_string())?
-                        .unwrap_or_default();
-                    if let Some(form) = self.agent_input_forms.get(request_id) {
-                        if pending_request.is_some() && self.poll_agent_input(&json!({"request_id": request_id}))?["status"] != "pending" { return Err("stale input request".into()); }
-                        if resolution.approved != Some(false) && resolution.choice_id.as_deref() != Some("deny") {
-                            form.response(Some(resolution.text.as_deref().ok_or("input reply requires resolution.text")?))?;
-                        }
-                    }
-                    if resolution.choice_id.as_deref() == Some("strict") && pending_request.as_ref().is_some_and(|request| !request.choices.iter().any(|choice| choice.id == "strict")) { return Err("strict review is not available for this request".into()); }
-                    self.pending_agent_requests
-                        .resolve(request_id, resolution, now)
-                }
-                .map_err(|error| error.to_string())?;
-                let reply = match outcome {
-                    CompleteOutcome::Completed(reply) => {
-                        if let Some(request) = pending_request.as_ref() {
-                            self.conclude_agent_request_state(request);
-                        } else if let Ok(surface) = uuid::Uuid::parse_str(&reply.surface_id) {
-                            self.sync_surface_agent_request_state(surface);
-                        }
-                        reply
-                    }
-                    CompleteOutcome::AlreadyCompleted(reply) => reply,
-                };
-                if request_id.starts_with("approval:")
-                    && let Some(action) = completed_approval_action(&reply)
-                {
-                    self.remember_agent_approval_result(request_id.to_owned(), action);
-                }
-                self.rebuild_scene();
-                Ok(json!(reply))
-            }
-            "agent.codex.claim" => self.claim_codex_launch(&request.params),
-            "agent.codex.register" => self.register_codex_launch(&request.params),
-            "agent.codex.ready" => self.codex_launch_ready(&request.params),
-            "agent.codex.turn" => self.codex_turn_event(&request.params),
-            "agent.codex.child" => self.codex_child(&request.params),
-            "agent.codex.child-mode" => self.codex_child_mode(&request.params),
-            "agent.codex.stopped" => self.codex_launch_stopped(&request.params),
-            "agent.update" => {
-                let claude_hook = request
-                    .params
-                    .get("claude_hook")
-                    .cloned()
-                    .map(serde_json::from_value::<ClaudeHookEvent>)
-                    .transpose()
-                    .map_err(|error| error.to_string())?;
-                let codex_hook = request
-                    .params
-                    .get("codex_hook")
-                    .cloned()
-                    .map(serde_json::from_value::<CodexSubagentHookEvent>)
-                    .transpose()
-                    .map_err(|error| error.to_string())?;
-                let codex_session_end = request
-                    .params
-                    .get("codex_session_end")
-                    .map(|value| {
-                        value
-                            .as_str()
-                            .filter(|session| !session.trim().is_empty())
-                            .map(str::to_owned)
-                            .ok_or_else(|| "invalid codex_session_end".to_owned())
-                    })
-                    .transpose()?;
-                serde_json::from_value::<AgentEvent>(request.params.clone())
-                    .map_err(|e| e.to_string())
-                    .and_then(|event| {
-                    let terminal = if codex_hook.is_some() || codex_session_end.is_some() || request.params.get("codex_tool_hook").is_some() {
-                        let (terminal, _) = self.codex_agent_update_route(&request.params)?;
-                        self.validate_agent_event_route(terminal, &request.params)?;
-                        terminal
-                    } else {
-                        self.terminal_for_params(&request.params)?
-                    };
-                    if let Some(hook) = codex_hook.as_ref() {
-                        let state = self.record_codex_subagent_hook(terminal, hook)?;
-                        self.rebuild_scene();
-                        return Ok(json!({
-                            "state": state,
-                            "codex_subagents": self.codex_subagents.len()
-                        }));
-                    }
-                    if let Some(session_id) = codex_session_end.as_deref() {
-                        self.validate_codex_session(terminal, session_id)?;
-                    }
-                    let mut tool_tracker = None;
-                    let event = if request.params.get("codex_tool_hook").is_some() {
-                        let Some((tracker, projected)) = self.project_codex_tool_hook(terminal, &request.params, &event)? else {
-                            return Ok(json!({"ignored": true}));
-                        };
-                        tool_tracker = Some(tracker);
-                        projected
-                    } else {
-                        event
-                    };
-                    if let Some(hook) = claude_hook.as_ref() {
-                        validate_claude_hook_directories(hook)?;
-                        if hook.agent_id.is_some() && matches!(hook.kind, ClaudeHookKind::SessionStart | ClaudeHookKind::SessionEnd) {
-                            return Err("Claude child hooks cannot start or end the root session".into());
-                        }
-                        if hook.to_agent_event() != event {
-                            return Err("Claude hook does not match its projected Agent event".into());
-                        }
-                        if hook.kind != ClaudeHookKind::SessionStart {
-                            self.validate_claude_hook(terminal, hook)?;
-                        }
-                    }
-                    if !self.record_agent_event(terminal, &request.params, &event)? {
-                        if let Some(session_id) = codex_session_end.as_deref() {
-                            self.end_codex_subagent_session(terminal, session_id)?;
-                        }
-                        return Ok(json!({"ignored": true}));
-                    }
-                    if let Some(tracker) = tool_tracker {
-                        self.codex_tool_hooks.insert(terminal, tracker);
-                    } else if matches!(&event, AgentEvent::SessionStart { .. } | AgentEvent::Stop { .. } | AgentEvent::TurnComplete { .. } | AgentEvent::TurnFailed { .. })
-                        || (matches!(&event, AgentEvent::ToolUse { .. }) && request.params["codex_hook_event"] == "UserPromptSubmit")
-                    {
-                        let session = self.agent_sessions.get(&self.surface_for_terminal(terminal).ok_or("surface not found")?).and_then(|session| session.session_id.as_deref()).unwrap_or_default();
-                        let lifecycle = &self.terminals[&terminal].lifecycle_id;
-                        let timestamp = request.params["hook_started_at_unix_ns"].as_u64().unwrap_or_default();
-                        self.codex_tool_hooks.entry(terminal).or_default().reset(session, lifecycle, timestamp);
-                        if matches!(&event, AgentEvent::Stop { .. } | AgentEvent::TurnComplete { .. } | AgentEvent::TurnFailed { .. }) {
-                            self.codex_tool_hooks.get_mut(&terminal).unwrap().close();
-                        }
-                    }
-                    if request.params.get("hook_executable").is_some() {
-                        self.last_hook_delivery.insert(terminal, json!({
-                            "executable": request.params.get("hook_executable"),
-                            "started_at_unix_ns": request.params.get("hook_started_at_unix_ns"),
-                            "received_at_unix_ms": unix_time_ms(),
-                            "event": request.params.get("event")
-                        }));
-                    }
-                    let metadata_only = claude_hook.as_ref().is_some_and(|hook| matches!(hook.kind, ClaudeHookKind::CwdChanged | ClaudeHookKind::DirectoryAdded | ClaudeHookKind::ElicitationResult));
-                    let state = if metadata_only {
-                        self.state.surfaces.get(&self.surface_for_terminal(terminal).ok_or("surface not found")?).and_then(|surface| surface.agent.as_ref()).map(|agent| agent.state).unwrap_or_default()
-                    } else {
-                        self.apply_agent_event(terminal, event)
-                    };
-                    if let Some(hook) = claude_hook.as_ref() {
-                        self.record_claude_hook(terminal, hook)?;
-                    }
-                    if let Some(session_id) = codex_session_end.as_deref() {
-                        self.end_codex_subagent_session(terminal, session_id)?;
-                    }
-                    self.rebuild_scene();
-                    Ok(json!({
-                        "state": state,
-                        "claude_subagents": self.claude_subagents.len(),
-                        "codex_subagents": self.codex_subagents.len()
-                    }))
-                })
-            }
-            "pane.focus" => request
-                .params
-                .get("id")
-                .and_then(Value::as_str)
-                .and_then(|v| uuid::Uuid::parse_str(v).ok())
-                .ok_or_else(|| "invalid params.id".to_owned())
-                .and_then(|pane| {
-                    self.state
-                        .execute(AppCommand::Pane(PaneCommand::Focus { id: pane }))
-                        .map_err(|e| e.to_string())
-                        .map(|_| {
-                            self.rebuild_scene();
-                            json!({"ok": true})
-                        })
-                }),
-            _ => Err(format!("unknown method: {}", request.method)),
-        }
-        })();
-        match result {
-            Ok(value) => Response::success(id, value),
-            Err(error) => Response::error(id, -32601, error),
-        }
-    }
 }
 
 impl ApplicationHandler<UserEvent> for WmctermApplication {
@@ -13215,6 +11408,10 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         let now = std::time::Instant::now();
+        if let Some(mut persistence) = self.session_persistence.take() {
+            persistence.tick(self);
+            self.session_persistence = Some(persistence);
+        }
         self.flush_pending_unmodified_tab();
         self.reload_config_if_changed();
         if self.expire_agent_requests() {
@@ -13224,13 +11421,7 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
             self.refresh_workspace_metadata();
             self.last_metadata_refresh = std::time::Instant::now();
         }
-        let mut document_changed = false;
-        for backend in self.surface_backends.values_mut() {
-            match backend.refresh() {
-                Ok(changed) => document_changed |= changed,
-                Err(error) => tracing::warn!(%error, "refreshing document surface failed"),
-            }
-        }
+        let document_changed = self.document_refresh.poll(&mut self.surface_backends);
         if document_changed {
             self.rebuild_scene();
         }
@@ -15727,17 +13918,30 @@ fn spawn_event_bridge(
     events: flume::Receiver<SessionEvent>,
     pending: Arc<Mutex<VecDeque<TaggedEvent>>>,
     wake_pending: Arc<AtomicBool>,
-    proxy: EventLoopProxy<UserEvent>,
+    proxy: AppEventProxy,
+    ready: Arc<std::sync::Condvar>,
+    stopped: Arc<AtomicBool>,
 ) {
     thread::Builder::new()
         .name(format!("wmcterm-event-{terminal}"))
         .spawn(move || {
             while let Ok(event) = events.recv() {
                 let mut queue = pending.lock().expect("PTY event queue poisoned");
+                while queue.len() >= 4096 && !stopped.load(Ordering::Acquire) {
+                    queue = ready
+                        .wait_timeout(queue, std::time::Duration::from_millis(20))
+                        .expect("PTY event queue poisoned")
+                        .0;
+                }
+                if stopped.load(Ordering::Acquire) {
+                    return;
+                }
                 enqueue_terminal_event(&mut queue, terminal, event);
                 drop(queue);
-                if !wake_pending.swap(true, Ordering::AcqRel) {
-                    let _ = proxy.send_event(UserEvent::TerminalWake);
+                if !wake_pending.swap(true, Ordering::AcqRel)
+                    && proxy.send_event(UserEvent::TerminalWake).is_err()
+                {
+                    return;
                 }
             }
         })
@@ -18032,6 +16236,12 @@ mod tests {
         notices.insert(terminal, TerminalNotice::Error("PTY closed".into()));
         assert!(!clear_recoverable_terminal_notice(&mut notices, terminal));
         assert!(terminal_notice_is_error(notices.get(&terminal).unwrap()));
+        notices.insert(terminal, TerminalNotice::InputRejected);
+        assert!(!clear_recoverable_terminal_notice(&mut notices, terminal));
+        assert!(matches!(
+            notices.get(&terminal),
+            Some(TerminalNotice::InputRejected)
+        ));
     }
 
     #[test]
@@ -19742,18 +17952,6 @@ mod tests {
 
     #[test]
     fn codex_agent_update_rpc_is_strict_and_new_session_reclaims_old_subagents() {
-        let mut builder = EventLoop::<UserEvent>::with_user_event();
-        #[cfg(target_os = "linux")]
-        {
-            use winit::platform::x11::EventLoopBuilderExtX11;
-            builder.with_any_thread(true);
-        }
-        #[cfg(windows)]
-        {
-            use winit::platform::windows::EventLoopBuilderExtWindows;
-            builder.with_any_thread(true);
-        }
-        let event_loop = builder.build().unwrap();
         let state = AppState::new("rpc-test", env::current_dir().unwrap());
         let surface = *state.surfaces.keys().next().unwrap();
         let terminal = match state.surfaces[&surface].kind {
@@ -19763,7 +17961,7 @@ mod tests {
         let mut commands = HashMap::new();
         commands.insert(terminal, "exit".into());
         let mut app = WmctermApplication::new_configured(
-            event_loop.create_proxy(),
+            AppEventProxy::Headless,
             Config::default(),
             Some(state),
             commands,

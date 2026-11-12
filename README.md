@@ -199,6 +199,20 @@ RPC 为 `ssh.connect/status/exec/cancel`，都要求 `surface_id` UUID。`connec
 
 ## CLI 和 IPC
 
+控制服务最多同时处理 16 个连接，请求帧上限为 1 MiB，响应帧上限为 32 MiB，
+读写无进展超时为 5 秒。不完整连接不会阻塞其他请求或 GUI 退出。
+`wmcterm capabilities` 返回这些限制。终端输入队列按条数和字节数限制；
+满载时明确拒绝输入并报告警告，关闭终端不等待队列排空。
+
+Markdown 和日志文件每秒在后台刷新。日志每批最多读取 1 MiB，持续增长的文件
+按实际读取字节推进位置；每行最多保留 64 KiB，历史文本最多保留 8 MiB，
+同时遵守保留行数限制。超长行保留前缀，未完成行也受相同字节限制。
+大日志文件会分多轮读取。
+
+运行期间每 5 秒检查并后台保存变化后的会话状态，每 60 秒异步获取滚动历史。
+正常退出会保存最终状态；异常终止后恢复最近一次成功保存的检查点，最近尚未
+保存的变化仍可能丢失。
+
 GUI 通过 `wmcterm.sock` 提供 JSON-RPC。在 Windows 上，该路径是一个端点文件，
 其中包含实例动态分配的回环地址；传输层不会占用固定的全局端口。示例：
 
@@ -607,6 +621,7 @@ scripts/package-release.sh
 # Debian/Ubuntu 依赖：xvfb xdotool imagemagick xclip
 scripts/ui-smoke.sh
 scripts/runtime-control-smoke.sh
+xvfb-run -a python3 scripts/session-checkpoint-smoke.py target/debug/wmcterm
 python3 scripts/codex-permissions-smoke.py
 python3 scripts/codex-release-smoke.py
 # Checked with Codex 0.163.0; launch and restore tests never start model turns:

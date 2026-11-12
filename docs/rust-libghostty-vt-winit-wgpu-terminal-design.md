@@ -124,6 +124,43 @@ configured keybindings retain precedence.
 
 ## Persisted State
 
+The application checks session changes every five seconds and writes checkpoints
+on a single worker with a one-job queue. Terminal histories are requested
+asynchronously every sixty seconds. Final shutdown requests histories concurrently
+with a shared 500 ms deadline, then waits for its final save after earlier jobs.
+Cached histories survive metadata-only checkpoints. Writes use unique sibling
+temporary files, sync contents, atomically replace the destination and sync its
+parent directory on Unix. Failed checkpoints are retried.
+
+## Runtime Resource Boundaries (2026-11-11)
+
+IPC accepts at most sixteen concurrent connections, with five-second socket
+read/write inactivity timeouts, 1 MiB request frames and 32 MiB response frames.
+Connection handlers do not block the accept loop or server shutdown. Frame
+limits include the newline. Windows authentication lines are limited to 128 bytes.
+
+PTY reader and event queues each retain at most 64 chunks; terminal events retain
+64 messages. Input queues retain at most 128 commands and 16 MiB of payload at
+each actor boundary, including PTY writes in progress. Shutdown uses independent
+atomic state and interrupts backpressure waits. Raw terminal output is preserved
+under backpressure; excess input is rejected rather than partially enqueued.
+The UI bridge retains at most 4096 events and coalesces adjacent snapshots for
+the same terminal. Actionable Agent events are never evicted to make room.
+
+Document refresh uses one worker and bounded request/result queues, with fair
+scheduling once per second. UI-side filter edits survive in-flight log refreshes.
+Each log batch reads at most 1 MiB from the captured file extent and advances by
+actual bytes read. Partial lines and stored lines are limited to 64 KiB; retained
+text is limited to 8 MiB as well as the configured line count.
+
+Application responsibilities are separated into `rpc`, `agent_coordinator`,
+`document_refresh`, `session_persistence` and `terminal_runtime` modules.
+Closing surfaces, panes and workspaces shares terminal runtime cleanup, including
+hook guards, input ownership and cancellation of requests for the closed lifecycle.
+Business regression tests use a headless event proxy; GUI smoke tests retain winit.
+
+## Managed Resume Compatibility
+
 Foreground Agent detection matches executable names and Node/Bun CLI scripts,
 and excludes management commands (updates, authentication, help, diagnostics,
 and MCP/plugin administration). Session, resume, and execution commands remain
