@@ -23,6 +23,7 @@ pub struct Config {
     pub sidebar: SidebarConfig,
     pub workspace: WorkspaceConfig,
     pub agent: AgentConfig,
+    pub notifications: NotificationsConfig,
     pub theme: ThemeConfig,
     pub keybindings: HashMap<String, String>,
 }
@@ -37,6 +38,7 @@ impl Default for Config {
             sidebar: SidebarConfig::default(),
             workspace: WorkspaceConfig::default(),
             agent: AgentConfig::default(),
+            notifications: NotificationsConfig::default(),
             theme: ThemeConfig::default(),
             keybindings: HashMap::from([
                 ("ctrl+shift+p".into(), "command_palette".into()),
@@ -228,6 +230,18 @@ impl Default for WorkspaceConfig {
 #[serde(default)]
 pub struct AgentConfig {
     pub notifications: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, rename_all = "kebab-case")]
+pub struct NotificationsConfig {
+    pub retention_days: u64,
+}
+
+impl Default for NotificationsConfig {
+    fn default() -> Self {
+        Self { retention_days: 7 }
+    }
 }
 
 impl Default for AgentConfig {
@@ -1012,6 +1026,9 @@ mod tests {
         assert_eq!(value.terminal.font_family, "Maple Mono");
         assert_eq!(value.sidebar.width, 300);
         assert!(value.agent.notifications);
+        assert_eq!(value.notifications.retention_days, 7);
+        let custom: Config = toml::from_str("[notifications]\nretention-days = 14").unwrap();
+        assert_eq!(custom.notifications.retention_days, 14);
         assert!(value.navigation.visible);
         assert_eq!(value.navigation.position, NavigationPosition::Bottom);
         assert_eq!(

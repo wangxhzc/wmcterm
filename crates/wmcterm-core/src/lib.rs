@@ -951,6 +951,16 @@ impl AppState {
         }
         self.notifications.push(notification);
     }
+
+    pub fn expire_notifications(&mut self, now_unix_ms: u64, retention_days: u64) -> bool {
+        let retention_ms = retention_days.saturating_mul(86_400_000);
+        let previous_len = self.notifications.len();
+        self.notifications.retain(|notification| {
+            now_unix_ms.saturating_sub(notification.created_at_unix_ms) < retention_ms
+                || notification.created_at_unix_ms > now_unix_ms
+        });
+        self.notifications.len() != previous_len
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1499,6 +1509,38 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn notification_retention_handles_boundary_unread_and_future_timestamps() {
+        let mut state = AppState::default();
+        let workspace = state.workspaces[0].id;
+        let surface = *state.surfaces.keys().next().unwrap();
+        let now = 10 * 86_400_000;
+        for (created_at_unix_ms, read) in [
+            (0, true),
+            (now - 7 * 86_400_000, false),
+            (now - 7 * 86_400_000 + 1, false),
+            (now + 1, false),
+        ] {
+            state.push_notification(Notification {
+                id: Uuid::new_v4(),
+                workspace,
+                surface,
+                title: "test".into(),
+                body: String::new(),
+                attention: AttentionState::NeedsInput,
+                created_at_unix_ms,
+                read,
+            });
+        }
+        assert!(state.expire_notifications(now, 7));
+        assert_eq!(state.notifications.len(), 2);
+        assert!(!state.expire_notifications(now, 7));
+        assert!(!state.expire_notifications(now, u64::MAX));
+        assert!(state.expire_notifications(now, 0));
+        assert_eq!(state.notifications.len(), 1);
+        assert_eq!(state.notifications[0].created_at_unix_ms, now + 1);
+    }
 
     #[test]
     fn close_others_plan_always_preserves_anchor() {

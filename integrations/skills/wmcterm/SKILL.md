@@ -343,6 +343,11 @@ mouse and keyboard closes still warn before terminating live processes.
 
 ## Agent state and notifications
 
+Ordinary notifications expire by creation time after seven days by default,
+including unread entries. Configure `[notifications] retention-days` to change
+retention; zero clears notifications up to the current time. Pending actionable
+approval and input requests retain their independent lifetimes.
+
 Let installed Agent Hooks report lifecycle state. For explicit updates, use
 `wmcterm agent-event JSON`. Notify with
 `wmcterm notify --surface "$WMCTERM_SURFACE_ID" --title TITLE --body BODY` only

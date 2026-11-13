@@ -1134,6 +1134,7 @@ struct WmctermApplication {
     navigation_hover: Option<NavigationHover>,
     notification_hover_started: Option<(usize, std::time::Instant)>,
     notification_marquee_line: usize,
+    last_notification_cleanup: Option<std::time::Instant>,
     last_titlebar_click: Option<(std::time::Instant, (f32, f32))>,
     document_scroll: HashMap<SurfaceId, usize>,
     metadata_refresh_in_flight: bool,
@@ -1365,6 +1366,7 @@ impl WmctermApplication {
             navigation_hover: None,
             notification_hover_started: None,
             notification_marquee_line: 0,
+            last_notification_cleanup: None,
             last_titlebar_click: None,
             document_scroll: HashMap::new(),
             metadata_refresh_in_flight: false,
@@ -1806,6 +1808,7 @@ impl WmctermApplication {
                     self.terminal_font_size = config.terminal.font_size.clamp(8.0, 40.0);
                     self.language = Language::resolve(config.ui.language);
                     self.config = config;
+                    self.last_notification_cleanup = None;
                     self.keybindings = keybindings;
                     if let Some(renderer) = &mut self.renderer {
                         renderer.set_transparent(self.config.window.opacity < 1.0);
@@ -8277,13 +8280,21 @@ impl WmctermApplication {
                         color: if active { theme_selection } else { theme_hover },
                     });
                 }
-                if active {
+                let agent_priority = self.workspace_agent_priority(row.index);
+                let agent_color = match agent_priority {
+                    5 => theme_red,
+                    4 => theme_yellow,
+                    3 => theme_blue,
+                    2 => theme_green,
+                    _ => theme_subtext,
+                };
+                if active || agent_priority > 0 {
                     rectangles.push(RectBlock {
                         left: row.bounds.x + 6.0,
                         top: row.bounds.y + 1.0,
                         width: 3.0,
                         height: row.bounds.height - 2.0,
-                        color: theme_blue,
+                        color: if active { theme_blue } else { theme_subtext },
                     });
                 }
                 rectangles.push(RectBlock {
@@ -8312,7 +8323,6 @@ impl WmctermApplication {
                 let text_width =
                     (row.bounds.x + row.bounds.width - right_padding - text_left).max(1.0);
                 let text_columns = (text_width / (14.0 * 0.6)).max(1.0) as usize;
-                let agent_priority = self.workspace_agent_priority(row.index);
                 let subagent_count = self.workspace_claude_subagent_count(row.index);
                 let mut agent_state = if subagent_count == 0 {
                     self.agent_state_text(agent_priority).to_owned()
@@ -8335,13 +8345,6 @@ impl WmctermApplication {
                     }
                 }
                 let show_agent = agent_priority > 0;
-                let agent_color = match agent_priority {
-                    5 => theme_red,
-                    4 => theme_yellow,
-                    3 => theme_blue,
-                    2 => theme_green,
-                    _ => theme_subtext,
-                };
                 if let Some(label) = unread_label {
                     let badge = ui::Bounds {
                         x: row.bounds.x + 16.0,
@@ -11414,6 +11417,28 @@ impl ApplicationHandler<UserEvent> for WmctermApplication {
         }
         self.flush_pending_unmodified_tab();
         self.reload_config_if_changed();
+        if self.last_notification_cleanup.is_none_or(|last| {
+            now.saturating_duration_since(last) >= std::time::Duration::from_secs(60)
+        }) {
+            self.last_notification_cleanup = Some(now);
+            if self
+                .state
+                .expire_notifications(unix_time_ms(), self.config.notifications.retention_days)
+            {
+                let surfaces: Vec<_> = self.state.surfaces.keys().copied().collect();
+                for surface in surfaces {
+                    self.sync_notification_attention(surface);
+                }
+                let last = self.state.notifications.len().saturating_sub(1);
+                self.notification_selection = self.notification_selection.min(last);
+                self.notification_scroll = self.notification_scroll.min(last);
+                self.notification_context_menu = None;
+                self.navigation_hover = None;
+                self.notification_hover_started = None;
+                self.notification_marquee_line = 0;
+                self.rebuild_scene();
+            }
+        }
         if self.expire_agent_requests() {
             self.rebuild_scene();
         }

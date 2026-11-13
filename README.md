@@ -446,6 +446,19 @@ Codex 0.150.0 把向已运行命令发送输入表示为同一 app-server method
 
 ### 请求处理与关闭操作
 
+普通通知按创建时间自动清理，默认保留 7 天，包含已读和未读通知。启动后及运行期间
+每分钟检查过期记录，配置重载后重新检查；待处理的 Agent 审批和输入请求按各自的超时规则处理。
+可在用户配置中调整：
+
+```toml
+[notifications]
+retention-days = 7
+```
+
+`retention-days = 0` 会在下一次清理时移除截至当前时间的普通通知。
+工作区侧栏为未选中的 Agent 工作区显示中性灰色细线；选中工作区的左侧条统一使用
+浅蓝色。
+
 可操作的 Agent 请求使用独立的有界请求/回复通道。使用
 `wmcterm agent-request list` 查看请求，然后使用
 `agent-request reply ID --approve|--deny|--choice ID|--text TEXT` 或

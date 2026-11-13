@@ -55,6 +55,7 @@ impl WmctermApplication {
                     "log_line_bytes": wmcterm_surface::MAX_LOG_LINE_BYTES,
                 },
                 "session_checkpoints": { "interval_seconds": 5, "history_interval_seconds": 60 },
+                "notification_retention": { "days": self.config.notifications.retention_days, "default_days": 7 },
                 "context": {
                     "marker_env": "WMCTERM",
                     "workspace_env": "WMCTERM_WORKSPACE_ID",

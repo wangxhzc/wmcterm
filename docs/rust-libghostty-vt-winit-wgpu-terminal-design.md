@@ -369,6 +369,15 @@ Shift+right click opens the local terminal menu.
 
 ### Notifications and Mode Metadata
 
+Ordinary notification retention defaults to seven days, configured with
+`[notifications] retention-days`. On startup, configuration reload, and every
+sixty seconds, the UI event loop removes expired read and
+unread entries, reconciles surface attention through the shared request-state
+reducer, and clamps notification selection and scrolling. Pending actionable
+requests keep their independent deadlines. Sidebar rows containing Agent
+metadata use a neutral gray leading rail when inactive. The selected workspace
+uses the existing blue rail; title and Agent label colors retain their usual styling.
+
 Claude input-wait telemetry observes state without registering an actionable
 request. Informational `notification` events preserve both reducer and core
 session state; only explicit quota resume activity marks the turn running.

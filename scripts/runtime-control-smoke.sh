@@ -66,6 +66,7 @@ xvfb-run -a --server-args="-screen 0 1280x800x24" sh -eu -c '
 
     "$binary" status >"$test_root/status.json"
     "$binary" capabilities >"$test_root/capabilities.json"
+    python3 -c "import json, sys; assert json.load(open(sys.argv[1]))[\"notification_retention\"] == {\"days\": 7, \"default_days\": 7}" "$test_root/capabilities.json"
     python3 -c "import json, sys; c=json.load(open(sys.argv[1])); assert c[\"transport_limits\"][\"request_bytes\"] == 1048576; assert c[\"document_refresh\"][\"background\"]; assert c[\"session_checkpoints\"][\"interval_seconds\"] == 5" "$test_root/capabilities.json"
     python3 -c "import json, sys; assert set(json.load(open(sys.argv[1]))[\"supported_agents\"]) == {\"codex\", \"claude\"}" "$test_root/capabilities.json"
     workspace_id=$(python3 -c \
