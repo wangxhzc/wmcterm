@@ -14,7 +14,12 @@ members = [
     "crates/wmcterm-session",
     "crates/wmcterm-surface",
 ]
+exclude = ["vendor/libghostty-vt-sys", "vendor/portable-pty"]
 resolver = "2"
+
+[patch.crates-io]
+libghostty-vt-sys = { path = "vendor/libghostty-vt-sys" }
+portable-pty = { path = "vendor/portable-pty" }
 
 [workspace.package]
 version = "0.1.0"

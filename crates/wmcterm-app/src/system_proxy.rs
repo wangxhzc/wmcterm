@@ -430,10 +430,29 @@ mod windows {
         {
             return None;
         }
-        value.last().is_some_and(|v| *v == 0).then(|| {
-            value.pop();
-        });
-        String::from_utf16(&value).ok()
+        decode_registry_string(&value[..size as usize / 2])
+    }
+
+    fn decode_registry_string(value: &[u16]) -> Option<String> {
+        // WinINet can store more than one terminator. A NUL in a child
+        // environment value would end that entry and can truncate the block.
+        let end = value
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(value.len());
+        String::from_utf16(&value[..end]).ok()
+    }
+
+    #[test]
+    fn wininet_registry_string_stops_at_first_nul() {
+        let value = "proxy.local:8080".encode_utf16().collect::<Vec<_>>();
+        for terminators in [vec![], vec![0], vec![0, 0], vec![0, 65, 0]] {
+            let bytes = [value.as_slice(), terminators.as_slice()].concat();
+            assert_eq!(
+                decode_registry_string(&bytes).as_deref(),
+                Some("proxy.local:8080")
+            );
+        }
     }
 
     #[test]

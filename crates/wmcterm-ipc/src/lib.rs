@@ -44,6 +44,7 @@ fn read_frame(reader: impl std::io::BufRead, limit: usize) -> std::io::Result<St
 struct ConnectionPermit(Arc<std::sync::atomic::AtomicUsize>);
 
 impl ConnectionPermit {
+    #[allow(deprecated)] // Keep fetch_update available on Rust 1.90.
     fn acquire(active: &Arc<std::sync::atomic::AtomicUsize>) -> Option<Self> {
         use std::sync::atomic::Ordering;
         active

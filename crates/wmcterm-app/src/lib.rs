@@ -256,11 +256,11 @@ fn safe_process_cwd(process_cwd: PathBuf) -> PathBuf {
         let executable = env::current_exe().ok();
         let executable_dir = executable.as_deref().and_then(Path::parent);
         let user_profile = env::var_os("USERPROFILE").map(PathBuf::from);
-        return safe_windows_startup_cwd(
+        safe_windows_startup_cwd(
             process_cwd,
             executable_dir,
             user_profile.as_deref().filter(|path| path.is_dir()),
-        );
+        )
     }
     #[cfg(not(windows))]
     {
@@ -7784,7 +7784,7 @@ impl WmctermApplication {
         #[cfg(windows)]
         {
             let _ = target;
-            return set_windows_clipboard_text(&text).map_err(|error| error.to_string());
+            set_windows_clipboard_text(&text).map_err(|error| error.to_string())
         }
         #[cfg(not(windows))]
         {
@@ -12025,10 +12025,43 @@ fn shell_quote_command(value: &str) -> String {
     }
 }
 
+#[cfg(windows)]
+fn windows_shell() -> std::ffi::OsString {
+    let program_files = env::var_os("ProgramW6432").or_else(|| env::var_os("ProgramFiles"));
+    let path = env::var_os("PATH");
+    let directories = program_files
+        .map(|directory| {
+            std::path::PathBuf::from(directory)
+                .join("PowerShell")
+                .join("7")
+        })
+        .into_iter()
+        .chain(path.as_deref().into_iter().flat_map(env::split_paths));
+    select_windows_shell(env::var_os("SHELL"), directories)
+}
+
+#[cfg(windows)]
+fn select_windows_shell(
+    configured: Option<std::ffi::OsString>,
+    directories: impl IntoIterator<Item = std::path::PathBuf>,
+) -> std::ffi::OsString {
+    configured
+        .filter(|shell| !shell.is_empty())
+        .or_else(|| {
+            directories
+                .into_iter()
+                .filter(|directory| directory.is_absolute())
+                .map(|directory| directory.join("pwsh.exe"))
+                .find(|executable| executable.is_file())
+                .map(std::path::PathBuf::into_os_string)
+        })
+        .unwrap_or_else(|| "powershell.exe".into())
+}
+
 fn terminal_command_spec(command: Option<&str>) -> CommandSpec {
     #[cfg(windows)]
     {
-        let shell = env::var_os("SHELL").unwrap_or_else(|| "powershell.exe".into());
+        let shell = windows_shell();
         let name = std::path::Path::new(&shell)
             .file_stem()
             .and_then(|name| name.to_str())
@@ -14172,7 +14205,7 @@ fn is_manual_agent_resume_command(command: &str) -> bool {
 fn manual_agent_resume_command(resume: &str) -> String {
     #[cfg(windows)]
     {
-        let shell = env::var_os("SHELL").unwrap_or_else(|| "powershell.exe".into());
+        let shell = windows_shell();
         let name = std::path::Path::new(&shell)
             .file_stem()
             .and_then(|name| name.to_str())
@@ -16930,6 +16963,24 @@ mod tests {
         ));
     }
 
+    #[cfg(windows)]
+    #[test]
+    fn windows_shell_prefers_explicit_shell_then_pwsh_then_windows_powershell() {
+        let directory = env::temp_dir().join(format!("wmcterm-shell-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&directory).unwrap();
+        let pwsh = directory.join("pwsh.exe");
+        std::fs::write(&pwsh, []).unwrap();
+        let explicit = select_windows_shell(Some("cmd.exe".into()), [directory.clone()]);
+        let preferred = select_windows_shell(None, [directory.clone()]);
+        let fallback = select_windows_shell(None, []);
+        std::fs::remove_file(&pwsh).unwrap();
+        std::fs::remove_dir(directory).unwrap();
+
+        assert_eq!(explicit, "cmd.exe");
+        assert_eq!(preferred, pwsh.as_os_str());
+        assert_eq!(fallback, "powershell.exe");
+    }
+
     #[test]
     fn managed_agent_launcher_encodes_explicit_safe_modes() {
         assert!(
@@ -18476,7 +18527,7 @@ mod tests {
         if home.is_dir() {
             assert_eq!(
                 resolve_existing_directory("~", &process).unwrap(),
-                home.canonicalize().unwrap()
+                wmcterm_config::normalize_windows_path(home.canonicalize().unwrap())
             );
         }
     }

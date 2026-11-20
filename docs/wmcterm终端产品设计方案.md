@@ -1786,9 +1786,9 @@ Programmability
 - Linux/macOS/Windows 进程抽象由 `portable-pty` 提供，终端解析和输入编码由
   `libghostty-vt` 提供；渲染由 `wgpu` 矩形和 `glyphon` 字形管线完成。
 - Windows 最低运行环境是 Windows 10 1809（build 17763），同时支持 Windows 11；
-  安装器和程序入口均拒绝更旧系统。Windows 默认启动系统内置的 Windows
-  PowerShell 5.1（`powershell.exe`），只有用户显式配置时才使用 PowerShell 7
- （`pwsh.exe`）或其他 shell。
+  安装器和程序入口均拒绝更旧系统。Windows 默认优先使用 PowerShell 7（`pwsh.exe`），
+  找不到时回退到 Windows PowerShell 5.1（`powershell.exe`）。
+  显式设置的 `SHELL` 优先。
 - Terminal 支持主/备用屏、scrollback、ANSI/SGR 颜色、鼠标协议、选择、搜索、
   Unicode 宽度、CJK/emoji/组合字符以及主题颜色查询；拖选越过内容区上下边界时
   会连续滚动，越界距离决定滚动速度，回到内容区或松开鼠标后立即停止。

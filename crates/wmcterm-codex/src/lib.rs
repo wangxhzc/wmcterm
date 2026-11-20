@@ -2993,14 +2993,12 @@ mod tests {
         fs::create_dir_all(project.join(".codex")).unwrap();
         let config = root.join("home/config.toml");
         fs::create_dir_all(config.parent().unwrap()).unwrap();
-        fs::write(
-            &config,
-            format!(
-                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
-                project.parent().unwrap().display()
-            ),
-        )
-        .unwrap();
+        let mut document = DocumentMut::new();
+        let parent = project.parent().unwrap().to_string_lossy();
+        document["projects"] = table();
+        document["projects"][parent.as_ref()] = table();
+        document["projects"][parent.as_ref()]["trust_level"] = value("trusted");
+        fs::write(&config, document.to_string()).unwrap();
 
         assert_eq!(
             project_trust_state_at(&project, &config).unwrap(),
@@ -3031,7 +3029,10 @@ mod tests {
         trust_project_at(&project, &config).unwrap();
         let updated = fs::read_to_string(&config).unwrap();
         assert!(updated.starts_with("# keep this comment\nmodel = \"gpt-test\"\n"));
-        assert!(updated.contains(&format!("[projects.\"{}\"]", project.display())));
+        assert_eq!(
+            project_trust_state_at(&project, &config).unwrap(),
+            ProjectTrustState::Trusted
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;

@@ -398,6 +398,30 @@ PTY. Root SessionStart sequence checks run before mode-cache mutation.
 `xvfb-run -a node scripts/claude-notifications-smoke.mjs` verifies notification
 state and mode transitions through a GUI with temporary config and RPC socket.
 
+## Windows shell selection
+
+Windows GUI terminals and manual Agent resume use the same shell selection.
+An explicit `SHELL` takes precedence. Otherwise the app finds `pwsh.exe` in the
+standard PowerShell 7 installation directory or on the executable search path,
+then falls back to the system's `powershell.exe` if PowerShell 7 is unavailable.
+
+WinINet registry strings are decoded up to the first UTF-16 NUL. Trailing
+terminators must stay out of proxy environment values because ConPTY passes
+them in a NUL-delimited Windows environment block.
+
+## Windows GNU native build
+
+The workspace patches `libghostty-vt-sys` 0.2.1 locally. On Windows GNU,
+its build script passes the GNU target to Zig explicitly and exposes the
+static Ghostty archive under the MinGW name. The archive uses libgcc's stack
+probe at link time. Native builds and the Windows installer build use the same
+Cargo configuration.
+
+The local `portable-pty` 0.9.0 patch disables ConPTY cursor inheritance.
+Each surface starts with its own VT cursor, and a surface closed immediately
+after spawn can shut down before an inherited-cursor query would be answered.
+The PTY reader continues draining Windows output while the pseudoconsole closes.
+
 ## Validation
 
 The following checks cover the implementation contracts described above. Run

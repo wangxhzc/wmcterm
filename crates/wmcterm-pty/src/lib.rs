@@ -197,6 +197,7 @@ impl PtySession {
         })
     }
 
+    #[allow(deprecated)] // Keep fetch_update available on Rust 1.90.
     pub fn send(&self, command: PtyCommand) -> Result<(), flume::SendError<PtyCommand>> {
         if matches!(command, PtyCommand::Shutdown) {
             self.stopped.store(true, Ordering::Release);
@@ -277,6 +278,9 @@ fn run_actor(
                 Ok(0) => break,
                 Ok(read) => {
                     if output_tx.send(buffer[..read].to_vec()).is_err() {
+                        // ClosePseudoConsole can flush output while the actor is dropping.
+                        #[cfg(windows)]
+                        let _ = std::io::copy(&mut reader, &mut std::io::sink());
                         break;
                     }
                 }

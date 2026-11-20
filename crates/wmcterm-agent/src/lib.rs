@@ -1843,7 +1843,7 @@ fn json_hook_fragment(
 fn agent_shell_command(agent: AgentKind, arguments: &[String]) -> String {
     #[cfg(windows)]
     {
-        return windows_agent_hook_command(agent, arguments);
+        windows_agent_hook_command(agent, arguments)
     }
     #[cfg(not(windows))]
     {

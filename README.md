@@ -22,9 +22,9 @@
   必须支持 ConPTY；Windows 安装程序和可执行文件都会拒绝更早的系统版本。
 - 从源码构建时需要 Rust 1.90 或更高版本。
 
-在 Windows 上，默认 shell 是系统自带的 Windows PowerShell 5.1 可执行文件
-`powershell.exe`。通过 `SHELL` 显式选择时仍支持 PowerShell 7（`pwsh.exe`），
-但不会假定 Windows 10 已安装它。
+在 Windows 上，默认 shell 优先使用已安装的 PowerShell 7（`pwsh.exe`），
+找不到时回退到系统自带的 Windows PowerShell 5.1（`powershell.exe`）。
+显式设置的 `SHELL` 优先。
 
 wmcterm 会为新建或恢复的 Shell、Codex 和 Claude 读取当前桌面代理：Linux 支持
 GNOME 与 KDE 的静态手动代理，Windows 读取当前用户的 WinINet 设置。代理缓存每
@@ -636,6 +636,9 @@ Codex、Claude 等 TUI 开启鼠标协议时，滚轮、悬停和鼠标按钮优
 URL 通过外部系统应用程序打开；核心模型保留 Browser Surface 占位类型。
 
 ## 构建、验证与打包
+
+源码构建需要将 Zig 0.15.2 加入 `PATH`。Windows GNU 构建使用 MinGW-w64，
+Zig 会以相同的 GNU ABI 编译 Ghostty VT。
 
 无头 VT 快照工具可用于检查终端解析输出：
 

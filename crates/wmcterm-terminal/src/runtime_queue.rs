@@ -31,6 +31,7 @@ impl RuntimeControl {
             _ => 0,
         }
     }
+    #[allow(deprecated)] // Keep fetch_update available on Rust 1.90.
     pub(super) fn reserve(&self, command: &SessionCommand) -> bool {
         let bytes = Self::weight(command);
         let accepted = self
